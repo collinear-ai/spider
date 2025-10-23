@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tinker-data"
+version = "0.0.1"
+description = "Lightweight synthetic data generation client"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "datasets>=2.14.0",
+    "pyarrow>=12.0.0",
+    "pandas>=2.0.0",
+    "pydantic>=2.5.0",
+    "pyYAML>=6.0",
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "ruff>=0.1.4",
+    "mypy>=1.6.0",
+]
+
+[project.scripts]
+tinker-data = "tinker_data.cli:app"
+
+[tool.ruff]
+line-length = 100
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+plugins = ["pydantic.mypy"]
