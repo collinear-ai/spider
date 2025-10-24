@@ -5,7 +5,7 @@ Lightweight synthetic data generation framework with a single client interface.
 ## Python API
 
 ```python
-from tinker_data import SyntheticDataClient
+from spider import SyntheticDataClient
 
 client = SyntheticDataClient.from_config("config/basic.yaml")
 client.run()
@@ -14,7 +14,7 @@ client.run()
 ### CLI
 
 ```bash
-tinker-data run --config configs/basic.yaml
+spider run --config configs/basic.yaml
 ```
 
 ### Config Snapshot
@@ -22,7 +22,6 @@ tinker-data run --config configs/basic.yaml
 ```yaml
 model:
     name: Qwen/Qwen3-8B
-    backend: vllm
     parameters:
         max_tokens: 1024
 sources:

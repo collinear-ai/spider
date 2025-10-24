@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "tinker-data"
+name = "spider"
 version = "0.0.1"
 description = "Lightweight synthetic data generation client"
 readme = "README.md"
@@ -27,7 +27,7 @@ dev = [
 ]
 
 [project.scripts]
-tinker-data = "tinker_data.cli:app"
+spider = "spider.cli:app"
 
 [tool.ruff]
 line-length = 100
