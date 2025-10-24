@@ -1,4 +1,4 @@
-# Tinker for Data
+# Spider
 
 Lightweight synthetic data generation framework with a single client interface.
 
@@ -37,3 +37,9 @@ output:
 ```
 
 Python API and CLI share the same schema. CLI flags will override config values once implemented.
+
+### TODOs
+
+- [ ] Finish generation and output workflow
+- [ ] Implement backend connection to remote server
+- [ ] Enable advance preprocessing logic such as filtering
