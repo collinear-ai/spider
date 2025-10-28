@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional
 from pydantic import AnyHttpUrl, BaseModel, Field, model_validator
 
 class SourceType(str, Enum):
-    INLINE_UPLOAD = "inline_upload"
     HF_DATASET = "hf_dataset"
     REMOTE_URI = "remote_uri"
 
@@ -46,8 +45,6 @@ class SourceConfig(BaseModel):
         elif self.type == SourceType.REMOTE_URI:
             if not self.uri:
                 raise ValueError("`uri` is required when type='remote_uri'")
-        elif self.type == SourceType.INLINE_UPLOAD:
-            pass
         else:
             raise ValueError(f"Unsupported source type: {self.type}")
         return self
