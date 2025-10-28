@@ -1,3 +1,4 @@
-from .client import SyntheticDataClient
+from .client import SpiderClient
 
-__all__ = ["SyntheticDataClient"]
+__version__ = "0.0.1"
+__all__ = ["SpiderClient", "__version__"]

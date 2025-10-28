@@ -23,6 +23,19 @@ dependencies = [
     "vllm>=0.2.3",
     "requests>=2.31.0"
 ]
+authors = [
+    { name = "Muyu He", email = "muyu@collinear.ai" }
+]
+license = { file = "LICENSE" }
+keywords = ["llm", "ml", "data"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent"
+]
 
 [project.optional-dependencies]
 dev = [
@@ -42,3 +55,6 @@ line-length = 100
 python_version = "3.10"
 strict = true
 plugins = ["pydantic.mypy"]
+
+[tool.hatch.build.targets.sdist]
+include = ["spider", "README.md", "LICENSE", "pyproject.toml"]

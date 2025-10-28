@@ -1,1 +1,3 @@
 design.md
+dist/
+*.egg-info/
