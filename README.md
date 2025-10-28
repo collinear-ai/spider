@@ -5,40 +5,54 @@ Lightweight synthetic data generation framework with a single client interface.
 ## Python API
 
 ```python
-from spider import SyntheticDataClient
+from spider.client import SpiderClient
 
-client = SyntheticDataClient.from_config("config/basic.yaml")
-client.run()
+client = SpiderClient.from_config("config/qwen3-8B-ocr2.yaml")
+submission = client.submit_job()
+job_id = submission["job_id"]
+
+status = client.poll_job(job_id, interval=30.0)
+if status["status"] == "completed":
+    client.download_result(job_id, destionation="./artifacts/result.jsonl")
 ```
 
-### CLI
+### CLI (planned)
 
 ```bash
-spider run --config configs/basic.yaml
+spider submit --config configs/qwen3-8B-ocr2.yaml
 ```
 
 ### Config Snapshot
 
 ```yaml
-model:
-    name: Qwen/Qwen3-8B
-    parameters:
-        max_tokens: 1024
-sources:
-    type: jsonl
-    path: data/questions.jsonl
-    field: question
-generation:
-    duplications: 3
-output:
-    format: parquet
-    desination: outputs/qwen3-8b-rollouts.parquet
+job:
+    model:
+        provider: vllm
+        name: Qwen/Qwen3-8B
+        parameters:
+            max_tokens: 1024
+            temperature: 0.7
+    sources:
+        -   type: hf_dataset
+            name: opencodereasoning
+            dataset: nvidia/OpenCodeReasoning-2
+            split: python
+            field: question
+    generation:
+        parameters:
+            temperature: 0.8
+            top_9: 0.9
+    output:
+        mode: return
+        format: jsonl
+        local_path: ./artifacts/result.jsonl
 ```
 
 Python API and CLI share the same schema. CLI flags will override config values once implemented.
 
 ### TODOs
 
-- [ ] Finish generation and output workflow
 - [ ] Implement backend connection to remote server
-- [ ] Enable advance preprocessing logic such as filtering
+- [ ] Implement batching and streaming generation in the remote endpoint
+- [ ] Integrate Tinker for server-side on-policy distillation 
+- [ ] Enable server-side filtering logic for data
