@@ -75,24 +75,30 @@ class SpiderClient:
 
     def poll_job(
         self, job_id: str, *, interval: float = 5.0, timeout: Optional[float] = None,
-        on_update: Optional[Callable[Dict[str, Any], None]] = None
+        on_update: Optional[Callable[Dict[str, Any], None]] = None, wait_for_completion: bool = False,
     ) -> Dict[str, Any]:
-        start_time = time.monotonic()
         terminal_states = {"completed", "failed", "cancelled"}
+        deadline = (time.monotonic() + timeout) if timeout is not None else None
 
-        while True:
+        status = self.get_job_status(job_id)
+        if on_update:
+            on_update(status)
+
+        state = str(status.get("status", "")).lower()
+        if not wait_for_completion or state in terminal_states:
+            return status
+            
+        while state not in terminal_states:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"Job {job_id} did not complete within {timeout} seconds")
+
+            time.sleep(max(interval, 0.1))
             status = self.get_job_status(job_id)
             if on_update:
-                on_update(status)
-            
-            state = str(status.get("status", "")).lower()
-            if state in terminal_states:
-                return status
+                on_update(status)    
+            state = str(status.get("status", "")).lower()   
 
-            if timeout is not None and (time.monotonic() - start_time) > timeout:
-                raise TimeoutError(f"Job {job_id} did not complete within {timeout} seconds")
-        
-            time.sleep(max(interval, 0.1))
+        return status 
 
     def _ensure_client(self) -> httpx.Client:
         if self._client is None:
