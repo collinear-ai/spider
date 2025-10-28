@@ -16,7 +16,7 @@ class JobExecutionError(Exception):
 
 @dataclass
 class JobExecutionResult:
-    artifact_path: Path
+    artifacts_path: Path
     metrics: Dict[str, Any] = field(default_factory=dict)
     messages: List[str] = field(default_factory=list)
 
@@ -31,18 +31,21 @@ def run_generation_job(
     if not prompts:
         artifact_path.write_text("", encoding="utf-8")
         return JobExecutionResult(
-            artifact_path=artifact_path,
+            artifacts_path=artifact_path,
             metrics={"records": 0},
             messages=["No prompts found; nothing generated."]
         )
 
     try:
-        generations = backend.generate(
+        generations = list(backend.generate(
             prompts,
             parameters=job.generation.parameters
-        )
+        ))
     except Exception as exc:
         raise JobExecutionError(f"Generation pipeline failed: {exc}") from exc
+
+    if len(generations) != len(prompts):
+        raise JobExecutionError(f"Generation count mismatch, expected {len(prompts)} but received {len(generations)}")
 
     record_count = write_jsonl(artifact_path, prompts, generations)
     metrics = {"records": record_count, **backend.metrics()}
@@ -59,7 +62,7 @@ def run_generation_job(
     metadata_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     return JobExecutionResult(
-        artifact_path=artifact_path,
+        artifacts_path=artifact_path,
         metrics=metrics,
         messages=["Generation pipeline completed."]
     )

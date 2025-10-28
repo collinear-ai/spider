@@ -7,7 +7,7 @@ from enum import Enum
 from pathlib import Path
 from uuid import uuid4
 from fastapi import BackgroundTasks, FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 
 from spider.config import JobConfig
@@ -32,7 +32,7 @@ class JobRecord(BaseModel):
     updated_at: datetime
     artifacts_path: Optional[str] = None
     error_message: Optional[str] = None
-    messages: List[str] = []
+    messages: List[str] = Field(default_factory=list)
     metrics: Dict[str, Any] = Field(default_factory=dict)
 
 _JOB_STORE: Dict[str, JobRecord] = {}
@@ -108,18 +108,30 @@ async def download_result(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     if not record.artifacts_path:
         raise HTTPException(status_code=404, detail="Result not available yet")
-    payload_text = Path(record.artifacts_path).read_text(encoding="utf-8")
-    try:
-        artifact = json.loads(payload_text)
-    except json.JSONDecodeError:
-        artifact = {"raw": payload_text}
-    return JSONResponse(
-        content={
-            "job_id": job_id, 
-            "payload": record.status,
-            "metrics": record.metrics,
-            "error": record.error_message,
-            "artifact": artifact,
-        },
-        media_type="application/json",
-    )
+    artifact_path = Path(record.artifacts_path)
+    if not artifact_path.exists():
+        raise HTTPException(status_code=404, detail="Artifact not found on disk")
+
+    artifact_records = []
+    with artifact_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                artifact_records.append(json.loads(line))
+            except json.JSONDecodeError:
+                artifact_records.append({"raw": line})
+    
+    response_payload = {
+        "job_id": job_id, 
+        "status": record.status,
+        "submitted_at": record.submitted_at,
+        "updated_at": record.updated_at,
+        "messages": record.messages,
+        "metrics": record.metrics,
+        "error": record.error_message,
+        "artifact_path": record.artifacts_path,
+        "artifact": artifact_records
+    }
+    return JSONResponse(jsonable_encoder(response_payload))

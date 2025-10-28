@@ -34,7 +34,7 @@ class VLLMBackend:
 
         sampling = SamplingParams(**parameters)
         outputs = self._llm.generate(chat_prompts, sampling_params=sampling)
-        completions = List[str] = []
+        completions: List[str] = []
         for output in outputs:
             text = output.outputs[0].text if output.outputs else ""
             completions.append(text)

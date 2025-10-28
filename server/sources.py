@@ -18,12 +18,17 @@ def collect_prompts(sources: Sequence[SourceConfig]) -> List[str]:
 def _load_hf_dataset(source: SourceConfig) -> List[str]:
     from datasets import load_dataset
 
+    options = dict(source.options or {})
+    split = options.pop("split", source.split)
+    load_kwargs = {
+        "path": source.dataset,
+        "split": split,
+        "streaming": source.streaming,
+    }
+    if source.revision:
+        load_kwargs["revision"] = source.revision
     dataset = load_dataset(
-        path=source.dataset,
-        split=source.split,
-        streaming=source.streaming,
-        revision=source.revision.
-        **source.options,
+        **load_kwargs, **options
     )
     prompts: List[str] = []
     for example in dataset:
