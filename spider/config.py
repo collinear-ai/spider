@@ -16,6 +16,14 @@ class SourceConfig(BaseModel):
         default=None,
         description="HF dataset repo ID when type='hf_dataset'"
     )
+    config_name: Optional[str] = Field(
+        default=None,
+        description="HF dataset config name"
+    )
+    split: Optional[str] = Field(
+        default="train",
+        description="HF dataset split name"
+    )
     field: Optional[str] = Field(
         default=None,
         description="Field to extract from each record when using an HF dataset"
@@ -51,7 +59,7 @@ class SourceConfig(BaseModel):
 
 class GenerationConfig(BaseModel):
     duplications: int = Field(default=1, ge=1)
-    max_batch_size: int = Field(default=8, ge=1)
+    max_batch_size: Optional[int] = Field(default=None, ge=1)
     seed: Optional[int] = Field(default=None)
     parameters: Dict[str, Any] = Field(
         default_factory=dict,
