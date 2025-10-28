@@ -1,0 +1,22 @@
+server:
+  base_url: "http://127.0.0.1:9000"
+  request_timeout: 120
+  verify_tls: false
+job:
+  model: 
+    provider: vllm
+    name: "Qwen/Qwen3-8B"
+    parameters:
+      tensor_parallel_size: 1
+  source:
+    dataset: "Agent-Ark/Toucan-1.5M"
+    config_name: "Kimi-K2"
+    split: "train[0:10]"
+    field: "question"
+  generation:
+    parameters:
+      temperature: 0.7
+      top_p: 0.9
+      max_tokens: 256
+  output:
+    mode: "return"
