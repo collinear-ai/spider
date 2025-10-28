@@ -6,9 +6,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
-from spider.config import JobConfig, SourceConfig, SourceType
+from spider.config import JobConfig
 from .backends.factory import create_backend
-from .sources import resolve_sources
+from .sources import collect_prompts
+from .writers import write_jsonl
 
 class JobExecutionError(Exception):
     pass
@@ -25,17 +26,26 @@ def run_generation_job(
     workspace.mkdir(parents=True, exist_ok=True)
     artifact_path = workspace / "result.jsonl"
 
-    try:
-        record_count, metrics = _generate_records(
-            backend=backend,
-            sources=sources,
-            job=job,
-            output_path=artifact_path,
+    backend = create_backend(job.model)
+    prompts = collect_prompts(job,sources)
+    if not prompts:
+        artifact_path.write_text("", encoding="utf-8")
+        return JobExecutionResult(
+            artifact_path=artifact_path,
+            metrics={"records": 0},
+            messages=["No prompts found; nothing generated."]
         )
-    except JobExecutionError:
-        raise
+
+    try:
+        generations = backend.generate(
+            prompts,
+            parameters=job.generation.parameters
+        )
     except Exception as exc:
         raise JobExecutionError(f"Generation pipeline failed: {exc}") from exc
+
+    record_count = write_jsonl(artifact_path, prompts, generations)
+    metrics = {"records": record_count, **backend.metrics()}
 
     payload = {
         "job_id": job_id,
@@ -50,25 +60,6 @@ def run_generation_job(
 
     return JobExecutionResult(
         artifact_path=artifact_path,
-        metrics={"records": record_count, **metrics},
+        metrics=metrics,
         messages=["Generation pipeline completed."]
     )
-
-def _generate_records(
-    *, backend, sources: Sequence[Sequence[str]], job: JobConfig, output_path: Path
-) -> tuple[int, Dict[str, Any]]:
-    from .writers import write_jsonl
-
-    prompts: List[str] = []
-    for source_batch in sources:
-        prompts.extend(source_batch)
-
-    if not prompts:
-        return 0, {}
-    
-    generations = backend.generate(
-        prompts, parameters=job.generation.parameters
-    )
-
-    record_count = write_jsonl(output_path, prompts, generations)
-    return record_count, backend.metrics()
