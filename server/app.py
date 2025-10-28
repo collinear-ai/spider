@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from spider.config import JobConfig
@@ -31,6 +32,7 @@ class JobRecord(BaseModel):
     submitted_at: datetime
     updated_at: datetime
     artifacts_path: Optional[str] = None
+    remote_artifact: Optional[str] = None
     error_message: Optional[str] = None
     messages: List[str] = Field(default_factory=list)
     metrics: Dict[str, Any] = Field(default_factory=dict)
@@ -58,6 +60,7 @@ def _execute_job(job_id: str) -> None:
     try:
         result = run_generation_job(job_id, record.job, workspace=ARTIFACT_ROOT / job_id)
         record.artifacts_path = str(result.artifacts_path)
+        record.remote_artifact = result.remote_artifact
         record.metrics = result.metrics
         if result.messages:
             record.messages.extend(result.messages)
@@ -78,16 +81,7 @@ async def get_job(job_id: str):
     record = _JOB_STORE.get(job_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    return {
-        "job_id": job_id, 
-        "status": record.status, 
-        "submitted_at": record.submitted_at,
-        "updated_at": record.updated_at, 
-        "messages": record.messages, 
-        "error": record.error_message,
-        "artifacts_path": record.artifacts_path,
-        "metrics": record.metrics,
-    }
+    return _serialize_job(job_id, record)
 
 @app.post("/v1/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str):
@@ -122,16 +116,22 @@ async def download_result(job_id: str):
                 artifact_records.append(json.loads(line))
             except json.JSONDecodeError:
                 artifact_records.append({"raw": line})
-    
-    response_payload = {
-        "job_id": job_id, 
+
+    payload = _serialize_job(job_id, record)
+    payload["artifact_path"] = record.artifacts_path
+    payload["artifact"] = artifact_records
+    return JSONResponse(jsonable_encoder(payload))
+
+
+def _serialize_job(job_id: str, record: JobRecord) -> Dict[str, Any]:
+    return {
+        "job_id": job_id,
         "status": record.status,
         "submitted_at": record.submitted_at,
         "updated_at": record.updated_at,
         "messages": record.messages,
-        "metrics": record.metrics,
         "error": record.error_message,
-        "artifact_path": record.artifacts_path,
-        "artifact": artifact_records
+        "artifacts_path": record.artifacts_path,
+        "remote_artifact": record.remote_artifact,
+        "metrics": record.metrics,
     }
-    return JSONResponse(jsonable_encoder(response_payload))

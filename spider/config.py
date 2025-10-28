@@ -2,7 +2,7 @@ from __future__ import annotations
 import json, yaml
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from pydantic import AnyHttpUrl, BaseModel, Field, model_validator
 
 class SourceType(str, Enum):
@@ -10,17 +10,15 @@ class SourceType(str, Enum):
     REMOTE_URI = "remote_uri"
 
 class SourceConfig(BaseModel):
-    type: SourceType
-    name: str = Field(..., description="Unique id for the data source within a job")
-    dataset: Optional[str] = Field(
-        default=None,
-        description="HF dataset repo ID when type='hf_dataset'"
+    dataset: str = Field(
+        ...,
+        description="HF dataset repo ID"
     )
     config_name: Optional[str] = Field(
         default=None,
         description="HF dataset config name"
     )
-    split: Optional[str] = Field(
+    split: str = Field(
         default="train",
         description="HF dataset split name"
     )
@@ -36,25 +34,15 @@ class SourceConfig(BaseModel):
         default=False,
         description="Whether to stream the dataset instead of download"
     )
-    uri: Optional[str] = Field(
-        default=None,
-        description="Remote URI fetch when type='remote_uri'"
-    )
     options: Dict[str, Any] = Field(
         default_factory=dict,
-        description="Extra backend-specific options for this source"
+        description="Extra dataset loading options"
     )
 
     @model_validator(mode="after")
     def validate_source(self) -> "SourceConfig":
-        if self.type == SourceType.HF_DATASET:
-            if not self.dataset:
-                raise ValueError("`dataset` is required when type='hf_dataset'")
-        elif self.type == SourceType.REMOTE_URI:
-            if not self.uri:
-                raise ValueError("`uri` is required when type='remote_uri'")
-        else:
-            raise ValueError(f"Unsupported source type: {self.type}")
+        if not self.dataset:
+            raise ValueError("`dataset` is required")
         return self
 
 class GenerationConfig(BaseModel):
@@ -118,7 +106,7 @@ class OutputConfig(BaseModel):
 
 class JobConfig(BaseModel):
     model: ModelConfig
-    sources: List[SourceConfig]
+    source: SourceConfig
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     metadata: Dict[str, Any] = Field(

@@ -30,7 +30,7 @@ def run_generation_job(
 
     _ensure_tensor_parallel(job)
     backend = create_backend(job.model)
-    prompts = collect_prompts(job.sources)
+    prompts = collect_prompts(job.source)
     batch_size = _resolve_batch_size(job, prompts)
     if not prompts:
         artifact_path.write_text("", encoding="utf-8")
@@ -128,6 +128,7 @@ def _base_metadata(job_id: str, job: JobConfig) -> Dict[str, Any]:
     return {
         "job_id": job_id,
         "model": job.model.model_dump(exclude_none=True),
+        "source": job.source.model_dump(exclude_none=True),
         "output": job.output.model_dump(exclude_none=True),
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "records": 0,

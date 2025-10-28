@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 from huggingface_hub import HfApi, HfFolder, upload_file
+from huggingface_hub.utils import HfHubHTTPError
 
 from spider.config import HFUploadConfig
 
@@ -22,7 +23,7 @@ def publish_to_hub(
     try:
         api.create_repo(**repo_kwargs, exist_ok=True)
     except Exception as exc:
-        raise HFUploadError(f"Failed to ensure HF repo {repo_id}: {exc}") from exc
+        raise _wrap_hf_error(f"Failed to ensure HF repo {repo_id}", exc) from exc
     
     prefix = f"{config.config_name.strip()}/" if config.config_name else ""
     artifact_remote = f"{prefix}result.jsonl"
@@ -48,7 +49,7 @@ def publish_to_hub(
             token=token,
         )
     except Exception as exc:
-        raise HFUploadError(f"Failed to upload artifacts for job {job_id}: {exc}") from exc
+        raise _wrap_hf_error(f"Failed to upload artifacts for job {job_id}", exc) from exc
 
     return f"https://huggingface.co/datasets/{repo_id}/blob/main/{artifact_remote}"
 
@@ -59,3 +60,10 @@ def _resolve_token(config: HFUploadConfig) -> str:
     if token:
         return token
     raise HFUploadError("Hugging Face token must be supplied via config or `huggingface-cli login`")
+
+def _wrap_hf_error(prefix: str, exc: Exception) -> HFUploadError:
+    if isinstance(exc, HfHubHTTPError):
+        status = getattr(getattr(exc, "response", None), "status_code", "unknown")
+        detail = exc.message or str(exc)
+        return HFUploadError(f"{prefix} (status {status}): {detail}")
+    return HFUploadError(f"{prefix}: {exc}")
