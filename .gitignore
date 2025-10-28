@@ -2,3 +2,5 @@ design.md
 dist/
 *.egg-info/
 __pycache__/
+artifacts/
+.artifacts/
