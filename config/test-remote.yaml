@@ -1,0 +1,21 @@
+server:
+  base_url: "http://k8s-default-muyutest-02d8ef196c-86971f5b74d104c2.elb.us-east-1.amazonaws.com"
+  request_timeout: 120
+  verify_tls: false
+job:
+  model: 
+    provider: vllm
+    name: "Qwen/Qwen3-0.6B"
+    parameters:
+      tensor_parallel_size: 1
+  source:
+    dataset: "RiddleHe/OpenCodeReasoning-2-questions-dedup-34k-sample-1024"
+    split: "train[0:10]"
+    field: "question"
+  generation:
+    parameters:
+      temperature: 0.7
+      top_p: 0.9
+      max_tokens: 256
+  output:
+    mode: "return"
