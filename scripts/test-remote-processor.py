@@ -1,16 +1,17 @@
 import re
+from typing import Iterable, Dict, Any, List
 
 from spider.client import SpiderClient
 from spider.config import AppConfig
 
-def strip_think_tags(record: Iterable[Dict[str, Any]]) -> Iterable[Dict[str, Any]]:
+def strip_think_tags(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     _THINK_TAG_PATTERN = re.compile(r"</?think>")
     cleaned = []
     for record in records:
         updated = dict(record)
         value = updated.get("completion")
         if isinstance(value, str):
-            updated[field] = _THINK_TAG_PATTERN.sub("", value)
+            updated["completion"] = _THINK_TAG_PATTERN.sub("", value)
         cleaned.append(updated)
     return cleaned
 
