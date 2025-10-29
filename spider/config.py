@@ -105,10 +105,10 @@ class OutputConfig(BaseModel):
         return self
 
 class ProcessorConfig(BaseModel):
-    module: str = Field(..., description="Python module path exposing the processor callable")
-    name: str = Field(..., description="Processor callable name within the module")
-    kwargs: Dict[str, Any] = Field(default_factory=dict, description="Keyword arguments forwarded to the processor")
-
+    name: str = Field(..., description="processor callable name")
+    source: str = Field(..., description="Python source text defining the processor callable")
+    kwargs: Dict[str, Any] = Field(default_factory=dict, description="Kwargs forwarded to the processor")
+    
 class JobConfig(BaseModel):
     model: ModelConfig
     source: SourceConfig

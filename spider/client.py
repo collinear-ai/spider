@@ -2,15 +2,21 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, Optional, Union, Callable, List
-import httpx, time
+import httpx, time, inspect, textwrap
 
 from .config import AppConfig
 
 class SpiderClient:
-    def __init__(self, config: AppConfig, *, client: Optional[httpx.Client] = None):
+    def __init__(
+        self, config: AppConfig, *, client: Optional[httpx.Client] = None,
+        processor: Optional[callable[[Iterable[Dict[str, Any]]], Iterable[Dict[str, Any]]]] = None,
+        processor_kwargs: Optional[Dict[str, Any]] = None,
+    ):
         self._config = config
         self._client: Optional[httpx.Client] = client
         self._owns_client = client is None
+        self._processor = processor
+        self._processor_kwargs = dict(processor_kwargs or {})
 
     def __enter__(self) -> "SpiderClient":
         self._ensure_client()
@@ -38,6 +44,9 @@ class SpiderClient:
         payload = self._config.job.model_dump(exclude_none=True)
         if job_overrides:
             payload = self._deep_merge(payload, job_overrides)
+
+        if self._processor is not None:
+            payload["processor"] = self._serialize_processor()
 
         response = self._ensure_client().post("/v1/jobs", json=payload)
         response.raise_for_status()
@@ -133,3 +142,20 @@ class SpiderClient:
             else:
                 result[key] = value
         return result
+
+    def _serialize_processor(self) -> Dict[str, Any]:
+        if self._processor is None:
+            raise ValueError("Processor callable is not set")
+        name = getattr(self._processor, "__name__", None)
+        if not name:
+            raise ValueError("Processor callable must have a __name__ attribute")
+        try:
+            source = inspect.getsource(self._processor)
+        except (OSError, TypeError) as exc:
+            raise ValueError("Unable to retrieve source for processor callable") from exc
+        source = textwrap.dedent(source)
+        return {
+            "name": name,
+            "source": source,
+            "kwargs": dict(self._processor_kwargs)
+        }
