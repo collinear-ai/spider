@@ -228,11 +228,18 @@ def _detect_available_gpus() -> int:
     return 1
 
 def _base_metadata(job_id: str, job: JobConfig) -> Dict[str, Any]:
+    output_config = job.output.model_dump(exclude_none=True)
+    hf_config = output_config.get("hf")
+    if isinstance(hf_config, dict) and "token" in hf_config:
+        hf_config = dict(hf_config)
+        hf_config.pop("token", None)
+        output_config["hf"] = hf_config
+
     return {
         "job_id": job_id,
         "model": job.model.model_dump(exclude_none=True),
         "source": job.source.model_dump(exclude_none=True),
-        "output": job.output.model_dump(exclude_none=True),
+        "output": output_config,
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "records": 0,
         "metrics": {"records": 0}

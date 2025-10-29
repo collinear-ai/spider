@@ -10,7 +10,7 @@ job:
       tensor_parallel_size: 1
   source:
     dataset: "RiddleHe/OpenCodeReasoning-2-questions-dedup-34k-sample-1024"
-    split: "train[0:10]"
+    split: "train[0:4]"
     field: "question"
   generation:
     parameters:
