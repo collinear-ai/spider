@@ -4,9 +4,10 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable, Iterable
+from types import MappingProxyType
 
-from spider.config import JobConfig, OutputMode
+from spider.config import JobConfig, OutputMode, ProcessorConfig
 from .backends.factory import create_backend
 from .sources import collect_prompts
 from .writers import JSONLBatchWriter
@@ -46,6 +47,8 @@ def run_generation_job(
     payload = _base_metadata(job_id, job)
     _write_metadata(metadata_path, payload, records_written)
 
+    processor = _resolve_processor(job.processor) if job.processor else None
+
     try:
         with JSONLBatchWriter(artifact_path) as writer:
             for chunk_start in range(0, len(prompts), batch_size):
@@ -58,7 +61,16 @@ def run_generation_job(
                         f"Generation count mismatch within batch: "
                         f"expected {len(chunk)}, received {len(chunk_generations)}"
                     )
-                writer.write_batch(chunk, chunk_generations)
+                
+                records = _pair_records(chunk, chunk_generations)
+                if processor:
+                    try:
+                        processed = processor(records)
+                    except Exception as exc:
+                        raise JobExecutionError(f"Processor failed: {exc}") from exc
+                    records = list(processed)
+
+                writer.write_records(records)
                 records_written = writer.count
 
                 batch_metrics = dict(backend.metrics() or {})
@@ -96,6 +108,41 @@ def run_generation_job(
         metrics=metrics,
         messages=["Generation pipeline completed."]
     )
+
+def _pair_records(prompts: Iterable[str], generations: Iterable[str]) -> List[Dict[str, Any]]:
+    paired = []
+    for prompt, completion in zip(prompts, generations):
+        paired.append({"prompt": prompt, "completion": completion})
+    return paired
+
+def _resolve_processor(spec: Optional[ProcessorConfig]) -> Optional[Callable[[Iterable[Dict[str, Any]]], Iterable[Dict[str, Any]]]]:
+    import ast, math, numpy as np, pandas as pd, random, re
+    if spec is None:
+        return None
+    safe_builtins = MappingProxyType({
+        "len": len, "enumerate": enumerate, "range": range, "min": min, "max": max,
+        "sum": sum, "any": any, "all": all, "sorted": sorted, "zip": zip, "map": map,
+        "filter": filter, "list": list, "dict": dict, "set": set, "tuple": tuple
+    })
+    globals_dict = {
+        "__builtins__": safe_builtins, "ast": ast, "math": math, "np": np, "pd": pd, 
+        "random": random, "re": re
+    }
+    locals_dict = {}
+    try:
+        compiled = compile(spec.source, "<processor>", "exec")
+        exec[compiled, globals_dict, locals_dict]
+    except Exception as exc:
+        raise JobExecutionError(f"Failed to load processor source: {exc}") from exc
+    
+    func = locals_dict.get(spec.name)
+    if not callable(func):
+        raise JobExecutionError(f"Processor source did not define the expected callable")
+    
+    def wrapped(records: Iterable[Dict[str, Any]]) -> Iterable[Dict[str, Any]]:
+        return func(records, **spec.kwargs)
+    
+    return wrapped
 
 def _resolve_batch_size(job: JobConfig, prompts: List[str]) -> int:
     requested = job.generation.max_batch_size
