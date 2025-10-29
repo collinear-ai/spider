@@ -1,7 +1,7 @@
 import json
 from itertools import zip_longest
 from pathlib import Path
-from typing import Iterable, Iterator, Tuple
+from typing import Iterable, Iterator, Tuple, Dict
 
 _MISSING = object()
 
