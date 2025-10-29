@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import json
+import json, os
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Callable, Iterable
+from typing import Any, Dict, List, Optional, Callable, Iterable, Tuple
 from types import MappingProxyType
 
 from spider.config import JobConfig, OutputMode, ProcessorConfig
@@ -47,39 +48,49 @@ def run_generation_job(
     payload = _base_metadata(job_id, job)
     _write_metadata(metadata_path, payload, records_written)
 
-    processor = _resolve_processor(job.processor) if job.processor else None
-
     try:
+        processor = _resolve_processor(job.processor) if job.processor else None
+        pending = {}
+        next_index = 0
+
         with JSONLBatchWriter(artifact_path) as writer:
-            for chunk_start in range(0, len(prompts), batch_size):
-                chunk = prompts[chunk_start : chunk_start + batch_size]
-                chunk_generations = backend.generate(
-                    chunk, parameters=job.generation.parameters
-                )
-                if len(chunk_generations) != len(chunk):
-                    raise JobExecutionError(
-                        f"Generation count mismatch within batch: "
-                        f"expected {len(chunk)}, received {len(chunk_generations)}"
+            executor_context = (
+                ThreadPoolExecutor(max_workers=_processing_worker_count()) 
+                if processor else None
+            )
+
+            try:
+                for batch_index, chunk_start in enumerate(range(0, len(prompts), batch_size)):
+                    chunk = prompts[chunk_start : chunk_start + batch_size]
+                    chunk_generations = backend.generate(
+                        chunk, parameters=job.generation.parameters
                     )
-                
-                records = _pair_records(chunk, chunk_generations)
-                if processor:
-                    try:
-                        processed = processor(records)
-                    except Exception as exc:
-                        raise JobExecutionError(f"Processor failed: {exc}") from exc
-                    records = list(processed)
+                    if len(chunk_generations) != len(chunk):
+                        raise JobExecutionError(
+                            f"Generation count mismatch within batch: "
+                            f"expected {len(chunk)}, received {len(chunk_generations)}"
+                        )
+                    if processor and executor_context:
+                        future = executor_context.submit(_process_batch, chunk, chunk_generations, processor)
+                    else:
+                        future = _immediate_future(_pair_records(chunk, chunk_generations))
 
-                writer.write_records(records)
-                records_written = writer.count
+                    batch_metrics = dict(backend.metrics() or {})
+                    pending[batch_index] = (future, batch_metrics)
+                    next_index = _drain_ready_batches(
+                        pending, next_index, writer, aggregated_metrics, payload,
+                        metadata_path, block=False
+                    )
+                next_index = _drain_ready_batches(
+                    pending, next_index, writer, aggregated_metrics, payload,
+                    metadata_path, block=True
+                )
+            finally:
+                if executor_context:
+                    executor_context.shutdown(wait=True)
+            
+            records_written = writer.count
 
-                batch_metrics = dict(backend.metrics() or {})
-                for key, value in batch_metrics.items():
-                    if isinstance(value, (int, float)):
-                        aggregated_metrics[key] = aggregated_metrics.get(key, 0.0) + float(value)
-
-                payload["metrics"] = _summarize_metrics(records_written, aggregated_metrics)
-                _write_metadata(metadata_path, payload, records_written)
     except Exception as exc:
         raise JobExecutionError(f"Generation pipeline failed: {exc}") from exc
 
@@ -131,7 +142,7 @@ def _resolve_processor(spec: Optional[ProcessorConfig]) -> Optional[Callable[[It
     locals_dict = {}
     try:
         compiled = compile(spec.source, "<processor>", "exec")
-        exec[compiled, globals_dict, locals_dict]
+        exec(compiled, globals_dict, locals_dict)
     except Exception as exc:
         raise JobExecutionError(f"Failed to load processor source: {exc}") from exc
     
@@ -143,6 +154,49 @@ def _resolve_processor(spec: Optional[ProcessorConfig]) -> Optional[Callable[[It
         return func(records, **spec.kwargs)
     
     return wrapped
+
+def _process_batch(
+    prompts: Iterable[str], generations: Iterable[str], 
+    processor: Callable[[Iterable[Dict[str, Any]]], Iterable[Dict[str, Any]]]
+) -> List[Dict[str, Any]]:
+    records = _pair_records(prompts, generations)
+    processed = processor(records)
+    return list(processed)
+
+def _drain_ready_batches(
+    pending: Dict[int, Tuple[Future[List[Dict[str, Any]]], Dict[str, Any]]],
+    next_index: int, writer: JSONLBatchWriter, aggregated_metrics: Dict[str, float],
+    payload: Dict[str, Any], metadata_path: Path, *, block: bool
+) -> int:
+    while next_index in pending:
+        future, batch_metrics = pending[next_index]
+        if not block and not future.done():
+            break
+        try:
+            records = future.result()
+        except Exception as exc:
+            raise JobExecutionError(f"Processor failed: {exc}") from exc
+        writer.write_records(records)
+
+        for key, value in batch_metrics.items():
+            if isinstance(value, (int, float)):
+                aggregated_metrics[key] = aggregated_metrics.get(key, 0.0) + float(value)
+        
+        payload["metrics"] = _summarize_metrics(writer.count, aggregated_metrics)
+        _write_metadata(metadata_path, payload, writer.count)
+
+        del pending[next_index]
+        next_index += 1
+    return next_index
+
+def _processing_worker_count() -> int:
+    cpu_total = os.cpu_count() or 1
+    return max(1, min(4, cpu_total // 2 or 1))
+
+def _immediate_future(result: Iterable[Dict[str, Any]]) -> Future[List[Dict[str, Any]]]:
+    future = Future()
+    future.set_result(list(result))
+    return future
 
 def _resolve_batch_size(job: JobConfig, prompts: List[str]) -> int:
     requested = job.generation.max_batch_size
