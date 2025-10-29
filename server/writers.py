@@ -24,20 +24,16 @@ class JSONLBatchWriter:
     def count(self) -> int:
         return self._count
 
-    def write_batch(self, prompts: Iterable[str], generations: Iterable[str]) -> int:
+    def write_records(self, records: Iterable[Dict[str, object]]) -> int:
         if self._handle is None:
             raise RuntimeError("JSONLBatchWriter must be used as a context manager")
         written = 0
-        for prompt, completion in zip_longest(prompts, generations, fillvalue=_MISSING):
-            if prompt is _MISSING or completion is _MISSING:
-                raise ValueError("Prompts and generations must have the same length")
-            payload = json.dumps({"prompt": prompt, "response": completion}, ensure_ascii=False)
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError("Records must be a mapping")
+            payload = json.dumps(record, ensure_ascii=False)
             self._handle.write(payload + "\n")
             written += 1
         self._handle.flush()
         self._count += written
         return written
-
-def iter_pairs(prompts: Iterable[str], generations: Iterable[str]) -> Iterator[Tuple[str, str]]:
-    for prompt, completion in zip(prompts, generations):
-        yield prompt, completion
