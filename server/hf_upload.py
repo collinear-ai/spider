@@ -27,7 +27,6 @@ def publish_to_hub(
     
     prefix = f"{config.config_name.strip()}/" if config.config_name else ""
     artifact_remote = f"{prefix}result.jsonl"
-    metadata_remote = f"{prefix}metadata.json"
 
     if not artifact.exists():
         raise HFUploadError(f"Artifact file not found at {artifact}")
@@ -37,13 +36,6 @@ def publish_to_hub(
         upload_file(
             path_or_fileobj=str(artifact),
             path_in_repo=artifact_remote,
-            repo_id=repo_id,
-            repo_type="dataset",
-            token=token,
-        )
-        upload_file(
-            path_or_fileobj=str(metadata),
-            path_in_repo=metadata_remote,
             repo_id=repo_id,
             repo_type="dataset",
             token=token,
