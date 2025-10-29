@@ -64,6 +64,6 @@ def _resolve_token(config: HFUploadConfig) -> str:
 def _wrap_hf_error(prefix: str, exc: Exception) -> HFUploadError:
     if isinstance(exc, HfHubHTTPError):
         status = getattr(getattr(exc, "response", None), "status_code", "unknown")
-        detail = exc.message or str(exc)
+        detail = getattr(exc, "message", None) or str(exc)
         return HFUploadError(f"{prefix} (status {status}): {detail}")
     return HFUploadError(f"{prefix}: {exc}")
