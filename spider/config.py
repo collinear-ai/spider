@@ -104,11 +104,17 @@ class OutputConfig(BaseModel):
             raise ValueError(f"Unsupported output mode: {self.mode}")
         return self
 
+class ProcessorConfig(BaseModel):
+    module: str = Field(..., description="Python module path exposing the processor callable")
+    name: str = Field(..., description="Processor callable name within the module")
+    kwargs: Dict[str, Any] = Field(default_factory=dict, description="Keyword arguments forwarded to the processor")
+
 class JobConfig(BaseModel):
     model: ModelConfig
     source: SourceConfig
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
+    processor: Optional[ProcessorConfig] = Field(default=None)
     metadata: Dict[str, Any] = Field(
         default_factory=dict,
         description="Arbitrary metadata to attach to the job request"
