@@ -133,7 +133,8 @@ def _resolve_processor(spec: Optional[ProcessorConfig]) -> Optional[Callable[[It
     safe_builtins = MappingProxyType({
         "len": len, "enumerate": enumerate, "range": range, "min": min, "max": max,
         "sum": sum, "any": any, "all": all, "sorted": sorted, "zip": zip, "map": map,
-        "filter": filter, "list": list, "dict": dict, "set": set, "tuple": tuple,
+        "filter": filter, "list": list, "dict": dict, "set": set, "tuple": tuple, "str": str,
+        "int": int, "float": float, "bool": bool,
         "isinstance": isinstance, "type": type
     })
     globals_dict = {
