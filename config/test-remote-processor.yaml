@@ -5,12 +5,12 @@ server:
 job:
   model: 
     provider: vllm
-    name: "Qwen/Qwen3-0.6B"
+    name: "Qwen/Qwen2.5-7B-Instruct"
     parameters:
       tensor_parallel_size: 1
   source:
     dataset: "RiddleHe/OpenCodeReasoning-2-questions-dedup-34k-sample-1024"
-    split: "train[0:4]"
+    split: "train[0:12]"
     field: "question"
   generation:
     parameters:
@@ -22,5 +22,6 @@ job:
     hf:
       repo_id: RiddleHe/spider-rollouts-opencodereasoning-2
       token: 
+      private: false
   metadata:
     experiment: "test-remote-processor"

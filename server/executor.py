@@ -94,7 +94,7 @@ def run_generation_job(
     except Exception as exc:
         raise JobExecutionError(f"Generation pipeline failed: {exc}") from exc
 
-    filtered_records = max(0, len(prompts) - record_written)
+    filtered_records = max(0, len(prompts) - records_written)
     metrics = _summarize_metrics(records_written, aggregated_metrics)
     if filtered_records:
         metrics["filtered_records"] = filtered_records

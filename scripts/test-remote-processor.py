@@ -20,7 +20,6 @@ def filter_rows(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if closing_marker == -1:
             continue
         code = value[code_start:closing_marker].lstrip("\r\n").rstrip()
-        code = match.group(1).strip()
         try:
             ast.parse(code)
         except SyntaxError:
