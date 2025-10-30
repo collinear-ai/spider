@@ -58,3 +58,10 @@ plugins = ["pydantic.mypy"]
 
 [tool.hatch.build.targets.sdist]
 include = ["spider", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "spider",
+    "server",
+    "server/lib/tinker-cookbook/tinker-cookbook",
+]
