@@ -15,7 +15,6 @@ def filter_rows(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
         start_marker = lower_value.rfind("```python")
         if start_marker == -1:
             continue
-        code = match.group(1).strip()
         code_start = start_marker + len("```python")
         closing_marker = value.find("```", code_start)
         if closing_marker == -1:
@@ -26,7 +25,8 @@ def filter_rows(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
             ast.parse(code)
         except SyntaxError:
             continue
-        updated["completion"] = code
+        updated["completion"] = value
+        updated["code"] = code
         filtered.append(updated)
     return filtered
 
