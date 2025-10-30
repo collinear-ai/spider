@@ -1,23 +1,38 @@
-import re
+import re, ast
 from typing import Iterable, Dict, Any, List
 
 from spider.client import SpiderClient
 from spider.config import AppConfig
 
-def strip_think_tags(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    _THINK_TAG_PATTERN = re.compile(r"</?think>")
-    cleaned = []
+def filter_rows(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    filtered = []
     for record in records:
         updated = dict(record)
         value = updated.get("completion")
-        if isinstance(value, str):
-            updated["completion"] = _THINK_TAG_PATTERN.sub("", value)
-        cleaned.append(updated)
-    return cleaned
+        if not isinstance(value, str):
+            continue
+        lower_value = value.lower()
+        start_marker = lower_value.rfind("```python")
+        if start_marker == -1:
+            continue
+        code = match.group(1).strip()
+        code_start = start_marker + len("```python")
+        closing_marker = value.find("```", code_start)
+        if closing_marker == -1:
+            continue
+        code = value[code_start:closing_marker].lstrip("\r\n").rstrip()
+        code = match.group(1).strip()
+        try:
+            ast.parse(code)
+        except SyntaxError:
+            continue
+        updated["completion"] = code
+        filtered.append(updated)
+    return filtered
 
 def main() -> None:
     config = AppConfig.load("config/test-remote-processor.yaml")
-    with SpiderClient(config=config, processor=strip_think_tags) as client:
+    with SpiderClient(config=config, processor=filter_rows) as client:
         submission = client.submit_job()
         job_id = submission["job_id"]
         print(f"Job submitted: {job_id}")

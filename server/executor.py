@@ -94,10 +94,10 @@ def run_generation_job(
     except Exception as exc:
         raise JobExecutionError(f"Generation pipeline failed: {exc}") from exc
 
-    if records_written != len(prompts):
-        raise JobExecutionError(f"Generation count mismatch, expected {len(prompts)} but received {records_written}")
-
+    filtered_records = max(0, len(prompts) - record_written)
     metrics = _summarize_metrics(records_written, aggregated_metrics)
+    if filtered_records:
+        metrics["filtered_records"] = filtered_records
     payload["metrics"] = metrics
     _write_metadata(metadata_path, payload, records_written)
     
