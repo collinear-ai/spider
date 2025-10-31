@@ -9,19 +9,8 @@ description = "Lightweight synthetic data generation client"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "datasets>=2.14.0",
-    "pyarrow>=12.0.0",
-    "pandas>=2.0.0",
-    "pydantic>=2.5.0",
-    "pyYAML>=6.0",
-    "typer>=0.9.0",
-    "rich>=13.0.0",
-    "httpx>=0.25.0",
-    "fastapi>=0.104.0",
-    "uvicorn[standard]>=0.23.0",
-    "python-multipart>=0.0.6",
-    "vllm>=0.2.3",
-    "requests>=2.31.0"
+    "pydantic",
+    "pyYAML",
 ]
 authors = [
     { name = "Muyu He", email = "muyu@collinear.ai" }
@@ -38,11 +27,63 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=7.4.0",
-    "pytest-asyncio>=0.21.0",
-    "ruff>=0.1.4",
-    "mypy>=1.6.0",
+client = [
+    "httpx",
+    "requests",
+    "typer",
+    "rich"
+]
+server = [
+    "datasets",
+    "pyarrow",
+    "pandas",
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+    "vllm",
+    "huggingface_hub",
+    "chz",
+    "numpy",
+    "termcolor",
+    "tinker",
+    "torch",
+    "transformers",
+    "blobfile",
+    "inspect-ai",
+    "anyio",
+    "pylatexenc",
+    "sympy",
+    "textarena",
+    "math-verify",
+    "scipy",
+]
+all = [
+    "httpx",
+    "requests",
+    "typer",
+    "rich",
+    "datasets",
+    "pyarrow",
+    "pandas",
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+    "vllm",
+    "huggingface_hub",
+    "chz",
+    "numpy",
+    "termcolor",
+    "tinker",
+    "torch",
+    "transformers",
+    "blobfile",
+    "inspect-ai",
+    "anyio",
+    "pylatexenc",
+    "sympy",
+    "textarena",
+    "math-verify",
+    "scipy",
 ]
 
 [project.scripts]
