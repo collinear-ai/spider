@@ -2,7 +2,7 @@ from __future__ import annotations
 import json, yaml
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Literal
 from pydantic import AnyHttpUrl, BaseModel, Field, model_validator
 
 class SourceType(str, Enum):
@@ -45,6 +45,28 @@ class SourceConfig(BaseModel):
             raise ValueError("`dataset` is required")
         return self
 
+class OnPolicyConfig(BaseModel):
+    teacher: str = Field(..., description="Teacher model to compute KL")
+    api_key: Optional[str] = Field(default=None, description="API key for Tinker")
+    learning_rate: float = Field(default=1e-4, gt=0.0)
+    groups_per_batch: int = Field(default=512, ge=1)
+    group_size: int = Field(default=4, ge=1)
+    max_tokens: int = Field(default=4096, ge=1)
+    lora_rank: int = Field(default=32, ge=1)
+    num_substeps: int = Field(default=1, ge=1)
+    kl_penalty_coef: float = Field(default=1.0)
+    kl_discount_factor: float = Field(default=0.0)
+    loss_fn: Literal["importance_sampling", "ppo"] = Field(
+        default="importance_sampling",
+        description="Loss for updating the student model"
+    )
+    compute_post_kl: bool = Field(
+        default=False,
+        description="Whether to compute post-kl metrics after each step"
+    )
+    eval_every: int = Field(default=20, ge=0)
+    save_every: int = Field(default=20, ge=0)
+
 class GenerationConfig(BaseModel):
     duplications: int = Field(default=1, ge=1)
     max_batch_size: Optional[int] = Field(default=None, ge=1)
@@ -53,6 +75,20 @@ class GenerationConfig(BaseModel):
         default_factory=dict,
         description="Sampler parameters forwarded to the remote backend"
     )
+    on_policy: bool = Field(
+        default=False,
+        description="Enable on-policy training"
+    )
+    on_policy_options: Optional[OnPolicyConfig] = Field(
+        default=None,
+        description="Config for on-policy distillation workflow"
+    )
+
+    @model_validator(mode="after")
+    def validate_on_policy(self) -> "GenerationConfig":
+        if self.on_policy and not self.on_policy_options:
+            raise ValueError("`on_policy_options` is required when `policy` is true")
+        return self
 
 class ModelConfig(BaseModel):
     provider: str = Field(..., description="Identifier for the remote inference provider")

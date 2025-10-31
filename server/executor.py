@@ -13,6 +13,7 @@ from .backends.factory import create_backend
 from .sources import collect_prompts
 from .writers import JSONLBatchWriter
 from .hf_upload import HFUploadError, publish_to_hub
+from .on_policy import run_on_policy_job
 
 class JobExecutionError(Exception):
     pass
@@ -28,6 +29,13 @@ def run_generation_job(
     job_id: str, job: JobConfig, *, workspace: Path
 ) -> JobExecutionResult:
     workspace.mkdir(parents=True, exist_ok=True)
+    if job.generation.on_policy:
+        return run_on_policy_job(job_id, job, workspace=workspace)
+    return _run_off_policy_job(job_id, job, workspace=workspace)
+
+def _run_off_policy_job(
+    job_id: str, job: JobConfig, *, workspace: Path
+) -> JobExecutionResult:
     artifact_path = workspace / "result.jsonl"
 
     _ensure_tensor_parallel(job)
