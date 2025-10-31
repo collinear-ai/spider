@@ -25,9 +25,14 @@ logger = logging.getLogger(__name__)
 
 class PromptListDatasetBuilder(RLDatasetBuilder):
     def __init__(
-        self, *, prompts: List[str], dataset_name: str,
-        groups_per_batch: int, group_size: int,
-        renderer_name: str, model_name_for_tokenizer: str,
+        self, 
+        *, 
+        prompts: List[str], 
+        dataset_name: str,
+        groups_per_batch: int, 
+        group_size: int,
+        renderer_name: str, 
+        model_name_for_tokenizer: str,
     ) -> None:
         self._prompts = prompts
         self._dataset_name = dataset_name
@@ -53,42 +58,29 @@ class PromptListDatasetBuilder(RLDatasetBuilder):
 
 @contextmanager
 def _temporary_api_key(api_key: str | None):
-    pass
+    if not api_key:
+        yield
+        return
 
-def build_sampling_params(
-    *, max_tokens: int, generation_parameters: Mapping[str, object],
-) -> tinker.SamplingParams:
-    allowed = {"temperature", "top_p"}
-    kwargs = {}
-    for key in allowed:
-        kwargs[key] = generation_parameters.get(key)
-    return tinker.SamplingParams(max_tokens=max_tokens, **kwargs)
+    previous = os.environ.get("TINKER_API_KEY")
+    if previous == api_key:
+        yield
+        return
 
-async def _emit_student_generations(
-    *, prompts: Iterable[str], sampling_client: tinker.SamplingClient,
-    tokenizer, sampling_params: tinker.SamplingParams,
-    writer: JSONLBatchWriter, metadata_payload: Dict[str, object],
-    metdata_path: Path, summarize_metrics, write_metadata,
-) -> None:
-    for prompt in prompts:
-        prompt_ids = tokenizer.encode(prompt)
-        model_input = tinker.ModelInput.from_ints(prompt_ids)
-        result = await sampling_client.sample_async(
-            prompt=model_input, sampling_params=sampling_params,
-            num_samples=1,
-        )
-        if not result.sequences:
-            continue
-        completion = tokenizer.decode(result.sequences[0].tokens)
-        writer.write_records([{
-            "prompt": prompt,
-            "completion": completion,
-        }])
-        metadata_payload["metrics"] = summarize_metrics(writer.count, {})
-        write_metadata(metadata_path, metadata_payload, writer.count)
+    os.environ["TINKER_API_KEY"] = api_key
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TINKER_API_KEY", None)
+        else:
+            os.environ["TINKER_API_KEY"] = previous
 
 def run_on_policy_job(
-    job_id: str, job: JobConfig, *, workspace: Path
+    job_id: str, 
+    job: JobConfig, 
+    *, 
+    workspace: Path
 ):
     from .executor import (
         JobExecutionResult,
@@ -104,8 +96,12 @@ def run_on_policy_job(
     student_model = job.model.name
     if not student_model:
         raise JobExecutionError("job.model.name must be provided")
+
+    artifact_path = workspace / "result.jsonl"
+    metadata_path = workspace / "metadata.json"
     
-    prompts = collect_prompts(job_id, job)
+    prompts = collect_prompts(job.source)
+    payload = _base_metadata(job_id, job)
     payload["generation_mode"] = "on_policy"
     sanitized_options = options.model_dump(exclude_none=True).copy()
     sanitized_options.pop("api_key", None)
@@ -125,7 +121,7 @@ def run_on_policy_job(
     renderer_name = model_info.get_recommended_renderer_name(student_model)
     dataset_builder = PromptListDatasetBuilder(
         prompts=prompts,
-        dataset_name-job.source.dataset or "prompts",
+        dataset_name=(job.source.dataset or "prompts"),
         groups_per_batch=options.groups_per_batch,
         group_size=options.group_size,
         renderer_name=renderer_name,
@@ -174,58 +170,23 @@ def run_on_policy_job(
     )
     if not checkpoint or "sampler_path" not in checkpoint:
         raise JobExecutionError("On-policy training did not produce a sampler checkpoint")
-    sampler_path = checkpoint["sampler_path"]
-    logger.info("Sampling student outputs from checkpoint %s", sampler_path)
 
-    tokenizer = get_tokenizer(student_model)
-    sampling_params = _build_sampling_params(
-        max_tokens=options.max_tokens,
-        generation_parameters=job.generation.parameters,
-    )
-    with JSONLBatchWriter(artifact_path) as writer:
-        with _temporary_api_key(options.api_key):
-            service_client = tinker.ServiceClient()
-            sampling_client = service_client.create_sampling_client(model_path=sampler_path)
-            try:
-                asyncio.run(
-                    _emit_student_generations(
-                        prompts=prompts,
-                        sampling_client=sampling_client,
-                        tokenizer=tokenizer,
-                        sampling_params=sampling_params,
-                        writer=writer,
-                        metadata_payload=payload,
-                        metadata_path=metadata_path,
-                        summarize_metrics=_summarize_metrics,
-                        write_metadata=_write_metadata,
-                    )
-                )
-            except Exception as exc:
-                rais JobExecutionError(f"Sampling student outputs failed: {exc}") from exc
-        records_written = writer.count
-
-    metrics = _summarize_metrics(
-        records_written, 
-        {"training_batches": float(checkpoint.get("batch", 0))},
-    )
+    artifact_path.write_text("", encoding="utf-8")
+    metrics = {
+        "records": 0,
+        "training_batches": float(checkpoint.get("batch", 0))
+    }
     payload["metrics"] = metrics
-    _write_metadata(metadata_path, payload, records_written)
-
-    hf_url = None
-    if job.output.mode == OutputMode.HF_UPLOAD and job.output.hf:
-        try:
-            hf_url = publish_to_hub(
-                job_id=job_id,
-                artifact=artifact_path,
-                metadata=metadata_path,
-                config=job.output.hf
-            )
-        except HFUploadError as exc:
-            raise JobExecutionError(str(exc)) from exc
+    payload["training"] = {
+        "sampler_checkpoint": checkpoint.get("sampler_path"),
+        "state_checkpoint": checkpoint.get("state_path"),
+        "last_batch": checkpoint.get("batch"),
+        "teacher_model": options.teacher,
+    }
+    _write_metadata(metadata_path, payload, 0)
 
     return JobExecutionResult(
         artifacts_path=artifact_path,
-        remote_artifact=hf_url,
         metrics=metrics,
         messages=["On-policy distillation completed."]
     )
