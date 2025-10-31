@@ -107,6 +107,9 @@ def _run_off_policy_job(
 
     except Exception as exc:
         raise JobExecutionError(f"Generation pipeline failed: {exc}") from exc
+    
+    finally:
+        _shutdown_backend(job_id, backend)
 
     filtered_records = max(0, len(prompts) - records_written)
     metrics = _summarize_metrics(records_written, aggregated_metrics)
@@ -274,3 +277,11 @@ def _summarize_metrics(records: int, aggregated: Dict[str, float]) -> Dict[str, 
     for key, value in aggregated.items():
         metrics[key] = int(value) if float(value).is_integer() else value
     return metrics
+
+def _shutdown_backend(job_id: str, backend: Any) -> None:
+    close = getattr(backend, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception as exc:
+            logger.warning("Job %s: backend shutdown raised %s", job_id, exc)

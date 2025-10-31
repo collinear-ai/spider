@@ -46,3 +46,9 @@ class VLLMBackend:
 
     def metrics(self) -> Dict[str, object]:
         return dict(self._last_metrics)
+
+    def close(self) -> None:
+        engine = getattr(self._llm, "llm_engine", None)
+        if engine is not None and hasattr(engine, "shutdown"):
+            engine.shutdown()
+        self._llm = None
