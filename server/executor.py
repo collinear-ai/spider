@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json, os
+import json, os, logging
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -14,6 +14,8 @@ from .sources import collect_prompts
 from .writers import JSONLBatchWriter
 from .hf_upload import HFUploadError, publish_to_hub
 from .on_policy import run_on_policy_job
+
+logger = logging.getLogger(__name__)
 
 class JobExecutionError(Exception):
     pass
@@ -30,7 +32,9 @@ def run_generation_job(
 ) -> JobExecutionResult:
     workspace.mkdir(parents=True, exist_ok=True)
     if job.generation.on_policy:
+        logger.info("Job %s: starting on-policy distillation", job_id)
         return run_on_policy_job(job_id, job, workspace=workspace)
+    logger.info("Job %s: starting off-policy generation pipeline", job_id)
     return _run_off_policy_job(job_id, job, workspace=workspace)
 
 def _run_off_policy_job(
@@ -42,6 +46,8 @@ def _run_off_policy_job(
     backend = create_backend(job.model)
     prompts = collect_prompts(job.source)
     batch_size = _resolve_batch_size(job, prompts)
+    logger.info("Job %s: collected %d prompts for generation", job_id, len(prompts))
+
     if not prompts:
         artifact_path.write_text("", encoding="utf-8")
         return JobExecutionResult(
@@ -121,6 +127,12 @@ def _run_off_policy_job(
         except HFUploadError as exc:
             raise JobExecutionError(str(exc)) from exc
 
+    logger.info(
+        "Job %s: generation complete; wrote %d records (filtered=%d)",
+        job_id,
+        records_written,
+        filtered_records
+    )
     return JobExecutionResult(
         artifacts_path=artifact_path,
         remote_artifact=hf_url,

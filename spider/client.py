@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, Optional, Union, Callable, List
-import httpx, time, inspect, textwrap
+import httpx, time, inspect, textwrap, sys
 
 from .config import AppConfig
 
@@ -83,8 +83,13 @@ class SpiderClient:
             return path
 
     def poll_job(
-        self, job_id: str, *, interval: float = 5.0, timeout: Optional[float] = None,
-        on_update: Optional[Callable[Dict[str, Any], None]] = None, wait_for_completion: bool = False,
+        self, 
+        job_id: str, 
+        *, 
+        interval: float = 5.0, 
+        timeout: Optional[float] = None,
+        on_update: Optional[Callable[[Dict[str, Any]], None]] = None, 
+        wait_for_completion: bool = False,
     ) -> Dict[str, Any]:
         terminal_states = {"completed", "failed", "cancelled"}
         deadline = (time.monotonic() + timeout) if timeout is not None else None

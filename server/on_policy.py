@@ -101,6 +101,13 @@ def run_on_policy_job(
     metadata_path = workspace / "metadata.json"
     
     prompts = collect_prompts(job.source)
+    logger.info(
+        "Job %s: on-policy distillation for student=%s collected %d prompts",
+        job_id,
+        student_model,
+        len(prompts)
+    )
+
     payload = _base_metadata(job_id, job)
     payload["generation_mode"] = "on_policy"
     sanitized_options = options.model_dump(exclude_none=True).copy()
@@ -112,6 +119,8 @@ def run_on_policy_job(
         artifact_path.write_text("", encoding="utf-8")
         payload["metrics"] = {"records": 0}
         _write_metadata(metadata_path, payload, 0)
+
+        logger.info("Job %s: no prompts found. skipping on-policy distillation.", job_id)
         return JobExecutionResult(
             artifacts_path=artifact_path,
             metrics={"records": 0},
@@ -137,6 +146,14 @@ def run_on_policy_job(
 
     training_dir = workspace / "training"
     training_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "Job %s: starting Tinker training (teacher=%s, prompts=%d) logs=%s",
+        job_id,
+        options.teacher,
+        len(prompts),
+        training_dir
+    )
+
     train_config = train_on_policy.Config(
         learning_rate=options.learning_rate,
         dataset_configs=[dataset_config],
@@ -158,6 +175,8 @@ def run_on_policy_job(
         save_every=options.save_every,
         load_checkpoint_path=None,
     )
+
+    _configure_tinker_logging()
 
     with _temporary_api_key(options.api_key):
         try:
@@ -185,8 +204,26 @@ def run_on_policy_job(
     }
     _write_metadata(metadata_path, payload, 0)
 
+    logger.info(
+        "Job %s: training finished at batch=%s, sampler=%s",
+        job_id,
+        checkpoint.get("batch"),
+        checkpoint.get("sampler_path")
+    )
     return JobExecutionResult(
         artifacts_path=artifact_path,
         metrics=metrics,
         messages=["On-policy distillation completed."]
     )
+
+def _configure_tinker_logging() -> None:
+    stream_formatter = logging.Formatter("[tinker] %(message)s")
+    for name in ("tinker", "tinker_cookbook"):
+        tinker_logger = logging.getLogger(name)
+        tinker_logger.setLevel(logging.INFO)
+        if not any(getattr(handler, "_spider_tinker", False) for handler in tinker_logger.handlers):
+            handler = logging.StreamHandler()
+            handler.setLevel(logging.INFO)
+            handler.setFormatter(stream_formatter)
+            handler._spider_tinker = True
+            tinker_logger.addHandler(handler)
