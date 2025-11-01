@@ -1,0 +1,108 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "spider"
+version = "0.0.1"
+description = "Lightweight synthetic data generation client"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pydantic",
+    "pyYAML",
+]
+authors = [
+    { name = "Muyu He", email = "muyu@collinear.ai" }
+]
+license = { file = "LICENSE" }
+keywords = ["llm", "ml", "data"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent"
+]
+
+[project.optional-dependencies]
+client = [
+    "httpx",
+    "requests",
+    "typer",
+    "rich"
+]
+server = [
+    "datasets",
+    "pyarrow",
+    "pandas",
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+    "vllm",
+    "huggingface_hub",
+    "chz",
+    "numpy",
+    "termcolor",
+    "tinker",
+    "torch",
+    "transformers",
+    "blobfile",
+    "inspect-ai",
+    "anyio",
+    "pylatexenc",
+    "sympy",
+    "textarena",
+    "math-verify",
+    "scipy",
+]
+all = [
+    "httpx",
+    "requests",
+    "typer",
+    "rich",
+    "datasets",
+    "pyarrow",
+    "pandas",
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+    "vllm",
+    "huggingface_hub",
+    "chz",
+    "numpy",
+    "termcolor",
+    "tinker",
+    "torch",
+    "transformers",
+    "blobfile",
+    "inspect-ai",
+    "anyio",
+    "pylatexenc",
+    "sympy",
+    "textarena",
+    "math-verify",
+    "scipy",
+]
+
+[project.scripts]
+spider = "spider.cli:app"
+
+[tool.ruff]
+line-length = 100
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[tool.hatch.build.targets.sdist]
+include = ["spider", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "spider",
+    "server",
+    "server/lib/tinker-cookbook/tinker-cookbook",
+]

@@ -1,0 +1,28 @@
+server:
+  base_url: 
+  api_key: 
+  request_timeout: 120
+  verify_tls: false
+job:
+  model: 
+    provider: vllm
+    name: "Qwen/Qwen2.5-7B-Instruct"
+    parameters:
+      tensor_parallel_size: 1
+  source:
+    dataset: "RiddleHe/OpenCodeReasoning-2-questions-dedup-34k-sample-1024"
+    split: "train[0:12]"
+    field: "question"
+  generation:
+    parameters:
+      temperature: 0.7
+      top_p: 0.9
+      max_tokens: 8192
+  output:
+    mode: "upload_hf"
+    hf:
+      repo_id: RiddleHe/spider-rollouts-opencodereasoning-2-qwen2.5-7b
+      token: 
+      private: false
+  metadata:
+    experiment: "test-remote-processor"
