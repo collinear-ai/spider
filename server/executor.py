@@ -23,6 +23,8 @@ class JobExecutionError(Exception):
 @dataclass
 class JobExecutionResult:
     artifacts_path: Path
+    metadata_path: Optional[Path] = None
+    upload_source: Optional[Path] = None
     remote_artifact: Optional[str] = None
     metrics: Dict[str, Any] = field(default_factory=dict)
     messages: List[str] = field(default_factory=list)
@@ -41,9 +43,25 @@ def run_generation_job(
                 "On-policy jobs require `output.mode: upload_hf` with a populated `output.hf.repo_id`"
             )
         logger.info("Job %s: starting on-policy distillation", job_id)
-        return run_on_policy_job(job_id, job, workspace=workspace)
-    logger.info("Job %s: starting off-policy generation pipeline", job_id)
-    return _run_off_policy_job(job_id, job, workspace=workspace)
+        result = run_on_policy_job(job_id, job, workspace=workspace)
+    else:
+        logger.info("Job %s: starting off-policy generation pipeline", job_id)
+        result = _run_off_policy_job(job_id, job, workspace=workspace)
+
+    if job.output.mode == OutputMode.HF_UPLOAD and job.output.hf:
+        artifact_source = result.upload_source or result.artifacts_path
+        metadata_path = result.metadata_path or (workspace / "metadata.json")
+        try:
+            remote = publish_to_hub(
+                job_id=job_id,
+                artifact=artifact_surce,
+                metdata=metadata_path,
+                config=job.output.hf
+            )
+        except HFUploadError as exc:
+            raise JobExecutionError(str(exc)) from exc
+        result.remote_artifact = remote
+    return result
 
 def _run_off_policy_job(
     job_id: str, job: JobConfig, *, workspace: Path
@@ -125,18 +143,6 @@ def _run_off_policy_job(
         metrics["filtered_records"] = filtered_records
     payload["metrics"] = metrics
     _write_metadata(metadata_path, payload, records_written)
-    
-    hf_url = None
-    if job.output.mode == OutputMode.HF_UPLOAD and job.output.hf:
-        try:
-            hf_url = publish_to_hub(
-                job_id=job_id,
-                artifact=artifact_path,
-                metadata=metadata_path,
-                config=job.output.hf
-            )
-        except HFUploadError as exc:
-            raise JobExecutionError(str(exc)) from exc
 
     logger.info(
         "Job %s: generation complete; wrote %d records (filtered=%d)",
@@ -146,7 +152,8 @@ def _run_off_policy_job(
     )
     return JobExecutionResult(
         artifacts_path=artifact_path,
-        remote_artifact=hf_url,
+        metadata_path=metadata_path,
+        upload_source=artifact_path,
         metrics=metrics,
         messages=["Generation pipeline completed."]
     )

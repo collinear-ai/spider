@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import asyncio, logging, os
+import asyncio, logging, os, shutil
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping
+from typing import Dict, List, Mapping, Tuple
 
 import tinker
-from spider.config import JobConfig, OutputMode
+from spider.config import JobConfig
 from tinker_cookbook import checkpoint_utils, model_info, renderers
 from tinker_cookbook.distillation import train_on_policy
 from tinker_cookbook.distillation.datasets import (
@@ -17,7 +17,6 @@ from tinker_cookbook.distillation.datasets import (
 from tinker_cookbook.rl.types import RLDataset, RLDatasetBuilder
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
-from .hf_upload import HFUploadError, publish_to_hub
 from .sources import collect_prompts
 from .writers import JSONLBatchWriter
 
@@ -190,7 +189,14 @@ def run_on_policy_job(
     if not checkpoint or "sampler_path" not in checkpoint:
         raise JobExecutionError("On-policy training did not produce a sampler checkpoint")
 
-    artifact_path.write_text("", encoding="utf-8")
+    hf_payload_dir, manifest = _prepare_hf_payload(
+        training_dir=training_dir,
+        checkpoint=checkpoint,
+        workspace=workspace,
+    )
+    if not manifest:
+        raise JobExecutionError("On-policy training did not produce uploadable checkpoint artifacts")
+    
     metrics = {
         "records": 0,
         "training_batches": float(checkpoint.get("batch", 0))
@@ -202,7 +208,23 @@ def run_on_policy_job(
         "last_batch": checkpoint.get("batch"),
         "teacher_model": options.teacher,
     }
+    payload["hf_upload"] = {
+        "repo_id": job.output.hf.repo_id if job.output.hf else None,
+        "relative_dir": hf_payload_dir.relative_to(workspace).as_posix(),
+        "manifest": manifest,
+    }
     _write_metadata(metadata_path, payload, 0)
+
+    summary_record = {
+        "job_id": job_id,
+        "metrics": metrics,
+        "hf_manifest": manifest,
+        "hf_payload_dir": hf_payload_dir.relative_to(workspace).as_posix(),
+    }
+    if job.output.hf:
+        summary_record["hf_repo_id"] = job.output.hf.repo_id
+    with JSONLBatchWriter(artifact_path) as writer:
+        writer.write(summary_record)
 
     logger.info(
         "Job %s: training finished at batch=%s, sampler=%s",
@@ -212,6 +234,8 @@ def run_on_policy_job(
     )
     return JobExecutionResult(
         artifacts_path=artifact_path,
+        metadata_path=metadata_path,
+        upload_source=hf_payload_dir,
         metrics=metrics,
         messages=["On-policy distillation completed."]
     )
@@ -227,3 +251,42 @@ def _configure_tinker_logging() -> None:
             handler.setFormatter(stream_formatter)
             handler._spider_tinker = True
             tinker_logger.addHandler(handler)
+
+def _prepare_hf_payload(
+    *,
+    training_dir: Path,
+    checkpoint: Mapping[str, object],
+    workspace: Path,
+) -> Tuple[Path, Dict[str, str]]:
+    payload_dir = workspace / "hf_upload"
+    if payload_dir.exists():
+        shutil.rmtree(payload_dir)
+    payload_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = {}
+    for label, key in (("sampler", "sampler_path"), ("state", "state_path")):
+        copied = _copy_checkpoint_artifact(checkpoint.get(key), payload_dir)
+        if copied:
+            manifest[label] = copied
+
+    checkpoints_index = training_dir / "checkpoints.jsonl"
+    if checkpoints_index.exists():
+        shutil.copy2(checkpoints_index, payload_dir / "checkpoints.jsonl")
+        manifest["checkpoints_index"] = "checkpoints.jsonl"
+
+    return payload_dir, manifest
+
+def _copy_checkpoint_artifact(path_value: object, dest_root: Path) -> str | None:
+    if not isinstance(path_value, str) or not path_value:
+        return None
+    src = Path(path_value)
+    if not src.exists():
+        logger.warning('Checkpoint artifact missing: %s', src)
+        return None
+    dest = dest_root / src.name
+    if src.is_dir():
+        shutil.copytree(src, dest, dirs_exist_ok=True)
+    else:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+    return dest.relative_to(dest_root).as_posix()
