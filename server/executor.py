@@ -32,6 +32,14 @@ def run_generation_job(
 ) -> JobExecutionResult:
     workspace.mkdir(parents=True, exist_ok=True)
     if job.generation.on_policy:
+        if (
+            job.output.mode != OutputMode.HF_UPLOAD
+            or not job.output.hf
+            or not job.output.hf_repo_id.strip()
+        ):
+            raise JobExecutionError(
+                "On-policy jobs require `output.mode: upload_hf` with a populated `output.hf.repo_id`"
+            )
         logger.info("Job %s: starting on-policy distillation", job_id)
         return run_on_policy_job(job_id, job, workspace=workspace)
     logger.info("Job %s: starting off-policy generation pipeline", job_id)

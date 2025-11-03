@@ -87,7 +87,7 @@ class GenerationConfig(BaseModel):
     @model_validator(mode="after")
     def validate_on_policy(self) -> "GenerationConfig":
         if self.on_policy and not self.on_policy_options:
-            raise ValueError("`on_policy_options` is required when `policy` is true")
+            raise ValueError("`on_policy_options` is required when `on_policy` is true")
         return self
 
 class ModelConfig(BaseModel):
@@ -155,6 +155,16 @@ class JobConfig(BaseModel):
         default_factory=dict,
         description="Arbitrary metadata to attach to the job request"
     )
+
+    @model_validator(mode="after")
+    def validate_on_policy_output(self) -> "JobConfig":
+        if not self.generation.on_policy:
+            return self
+        if self.output.mode != OutputMode.HF_UPLOAD:
+            raise ValueError("`output.mode` must be `upload_hf` when `generation.on_policy` is true")
+        if not self.output.hf or not self.output.hf.repo_id.strip():
+            raise ValueError("`output.hf.repo_id` is required when `generation.on_policy` is true")
+        return self
 
 class ServerConfig(BaseModel):
     base_url: AnyHttpUrl
