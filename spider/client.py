@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional, Union, Callable, List
-import httpx, time, inspect, textwrap, sys
+from typing import Any, Dict, Optional, Union, Callable, List, Tuple
+import httpx, time, inspect, textwrap, sys, json
 
 from .config import AppConfig
 
@@ -52,8 +52,9 @@ class SpiderClient:
         response.raise_for_status()
         return response.json()
 
-    def get_job_status(self, job_id: str) -> Dict[str, Any]:
-        response = self._ensure_client().get(f"/v1/jobs/{job_id}")
+    def get_job_status(self, job_id: str, *, since: Optional[int] = None) -> Dict[str, Any]:
+        params = {"since": since} if since is not None else None
+        response = self._ensure_client().get(f"/v1/jobs/{job_id}", params=params)
         response.raise_for_status()
         return response.json()
 
@@ -90,11 +91,20 @@ class SpiderClient:
         timeout: Optional[float] = None,
         on_update: Optional[Callable[[Dict[str, Any]], None]] = None, 
         wait_for_completion: bool = False,
+        stream_events: bool = True,
     ) -> Dict[str, Any]:
         terminal_states = {"completed", "failed", "cancelled"}
         deadline = (time.monotonic() + timeout) if timeout is not None else None
 
-        status = self.get_job_status(job_id)
+        follow_events = (wait_for_completion and stream_events)
+        event_offset = 0 if follow_events else None
+        truncated_notified = False
+
+        status = self.get_job_status(job_id, since=event_offset)
+        if follow_events:
+            event_offset, truncated_notified = self._handle_events(
+                status, stream_events, event_offset, truncated_notified
+            )
         if on_update:
             on_update(status)
 
@@ -107,12 +117,64 @@ class SpiderClient:
                 raise TimeoutError(f"Job {job_id} did not complete within {timeout} seconds")
 
             time.sleep(max(interval, 0.1))
-            status = self.get_job_status(job_id)
+            status = self.get_job_status(job_id, since=event_offset)
+            if follow_events:
+                event_offset, truncated_notified = self._handle_events(
+                    status, stream_events, event_offset, truncated_notified
+                )
             if on_update:
                 on_update(status)    
             state = str(status.get("status", "")).lower()   
 
         return status 
+
+    def _handle_events(
+        self,
+        status: Dict[str, Any],
+        stream_events: bool,
+        current_offset: Optional[int],
+        truncated_notified: bool,
+    ) -> Tuple[Optional[int], bool]:
+        events = status.get("events")
+        if isinstance(events, list):
+            for event in events:
+                self._dispatch_event(dict(event), stream_events)
+        truncated = bool(status.get("events_truncated"))
+        if truncated and not truncated_notified:
+            notice = {
+                "level": "WARNING",
+                "message": "Some earlier job events are no longer available.",
+                "code": "events.truncated",
+            }
+            self._dispatch_event(notice, stream_events)
+            truncated_notified = True
+        next_offset = status.get("events_next_offset")
+        if isinstance(next_offset, int):
+            current_offset = next_offset
+        elif isinstance(events, list) and events:
+            last_offset = events[-1].get("offset")
+            if isinstance(last_offset, int):
+                current_offset = last_offset + 1
+        return current_offset, truncated_notified
+
+    def _dispatch_event(
+        self,
+        event: Dict[str, Any],
+        stream_events: bool
+    ) -> None:
+        if not stream_events:
+            return
+        timestamp = event.get("timestamp")
+        level = event.get("level", "INFO")
+        message = event.get("message", "")
+        data = event.get("data")
+        if timestamp:
+            line = f"{timestamp} [{level}] {message}"
+        else:
+            line = f"[{level}] {message}"
+        if data:
+            line = f"{line} {json.dumps(data)}"
+        print(line, file=sys.stdout, flush=True)
 
     def _ensure_client(self) -> httpx.Client:
         if self._client is None:

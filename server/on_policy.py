@@ -18,6 +18,7 @@ from tinker_cookbook.rl.types import RLDataset, RLDatasetBuilder
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
 from .sources import collect_prompts
+from . import events
 from .writers import JSONLBatchWriter
 
 logger = logging.getLogger(__name__)
@@ -106,6 +107,11 @@ def run_on_policy_job(
         student_model,
         len(prompts)
     )
+    events.emit(
+        "Collected prompts for on-policy distillation.",
+        code="on_policy.prompts_collected",
+        data={"total_prompts": len(prompts)}
+    )
 
     payload = _base_metadata(job_id, job)
     payload["generation_mode"] = "on_policy"
@@ -120,6 +126,11 @@ def run_on_policy_job(
         _write_metadata(metadata_path, payload, 0)
 
         logger.info("Job %s: no prompts found. skipping on-policy distillation.", job_id)
+        events.emit(
+            "No prompts found for on-policy distillation.",
+            level="warning",
+            code="on_policy.no_prompts",
+        )
         return JobExecutionResult(
             artifacts_path=artifact_path,
             metrics={"records": 0},
@@ -151,6 +162,11 @@ def run_on_policy_job(
         options.teacher,
         len(prompts),
         training_dir
+    )
+    events.emit(
+        "Starting on-policy distillation training.",
+        code="on_policy.training_start",
+        data={"teacher": options.teacher}
     )
 
     train_config = train_on_policy.Config(
@@ -231,6 +247,11 @@ def run_on_policy_job(
         job_id,
         checkpoint.get("batch"),
         checkpoint.get("sampler_path")
+    )
+    events.emit(
+        "On-policy distillation completed.",
+        code="on_policy.completed",
+        data={"training_batches": metrics["training_batches"]}
     )
     return JobExecutionResult(
         artifacts_path=artifact_path,

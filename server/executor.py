@@ -10,6 +10,7 @@ from types import MappingProxyType
 
 from spider.config import JobConfig, OutputMode, ProcessorConfig
 from .backends.factory import create_backend
+from . import events
 from .sources import collect_prompts
 from .writers import JSONLBatchWriter
 from .hf_upload import HFUploadError, publish_to_hub
@@ -43,9 +44,11 @@ def run_generation_job(
                 "On-policy jobs require `output.mode: upload_hf` with a populated `output.hf.repo_id`"
             )
         logger.info("Job %s: starting on-policy distillation", job_id)
+        events.emit("Launching on-policy distillation pipeline.", code="job.pipeline", data={"mode": "on_policy"})
         result = run_on_policy_job(job_id, job, workspace=workspace)
     else:
         logger.info("Job %s: starting off-policy generation pipeline", job_id)
+        events.emit("Launching off-policy generation pipeline.", code="job.pipeline", data={"mode": "off_policy"})
         result = _run_off_policy_job(job_id, job, workspace=workspace)
 
     if job.output.mode == OutputMode.HF_UPLOAD and job.output.hf:
@@ -54,13 +57,18 @@ def run_generation_job(
         try:
             remote = publish_to_hub(
                 job_id=job_id,
-                artifact=artifact_surce,
-                metdata=metadata_path,
+                artifact=artifact_source,
+                metadata=metadata_path,
                 config=job.output.hf
             )
         except HFUploadError as exc:
             raise JobExecutionError(str(exc)) from exc
         result.remote_artifact = remote
+        events.emit(
+            "Published artifacts to remote storage.",
+            code="artifact.uploaded",
+            data={"remote_artifact": remote}
+        )
     return result
 
 def _run_off_policy_job(
@@ -73,9 +81,19 @@ def _run_off_policy_job(
     prompts = collect_prompts(job.source)
     batch_size = _resolve_batch_size(job, prompts)
     logger.info("Job %s: collected %d prompts for generation", job_id, len(prompts))
+    events.emit(
+        "Collected prompts for generation.",
+        code="generation.prompts_collected",
+        data={"total_prompts": len(prompts)}
+    )
 
     if not prompts:
         artifact_path.write_text("", encoding="utf-8")
+        events.emit(
+            "No prompts found for generation.",
+            level="warning",
+            code="generation.no_prompts",
+        )
         return JobExecutionResult(
             artifacts_path=artifact_path,
             metrics={"records": 0},
@@ -149,6 +167,11 @@ def _run_off_policy_job(
         job_id,
         records_written,
         filtered_records
+    )
+    events.emit(
+        "Generation completed.",
+        code="generation.completed",
+        data={"records_written": records_written, "filtered_records": filtered_records}
     )
     return JobExecutionResult(
         artifacts_path=artifact_path,
