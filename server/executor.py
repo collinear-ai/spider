@@ -38,7 +38,7 @@ def run_generation_job(
         if (
             job.output.mode != OutputMode.HF_UPLOAD
             or not job.output.hf
-            or not job.output.hf_repo_id.strip()
+            or not job.output.hf.repo_id.strip()
         ):
             raise JobExecutionError(
                 "On-policy jobs require `output.mode: upload_hf` with a populated `output.hf.repo_id`"

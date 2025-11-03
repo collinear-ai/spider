@@ -177,7 +177,7 @@ class ServerConfig(BaseModel):
         default=None,
         description="API key used to authenticate with the remote server"
     )
-    verify_tls: bool = Field(default=True, description="Whether to verify TLS certificates")
+    verify_tls: bool = Field(default=False, description="Whether to verify TLS certificates")
     request_timeout: float = Field(
         default=30.0,
         ge=1.0,
