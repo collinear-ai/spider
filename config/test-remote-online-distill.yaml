@@ -29,6 +29,10 @@ job:
       eval_every: 5
       save_every: 20
   output:
-    mode: "return"
+    mode: "upload_hf"
+    hf:
+      repo_id: RiddleHe/qwen3-8B-on-policy-distill-teacher-qwen3-30B-A3B-OCR2-8-examples
+      repo_type: "model"
+      private: false
   metadata:
     experiment: "test-remote-online-distill"
