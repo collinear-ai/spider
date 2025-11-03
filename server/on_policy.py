@@ -240,7 +240,7 @@ def run_on_policy_job(
     if job.output.hf:
         summary_record["hf_repo_id"] = job.output.hf.repo_id
     with JSONLBatchWriter(artifact_path) as writer:
-        writer.write_records(summary_record)
+        writer.write_records([summary_record])
 
     logger.info(
         "Job %s: training finished at batch=%s, sampler=%s",
