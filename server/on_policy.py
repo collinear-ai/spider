@@ -292,6 +292,8 @@ def _prepare_hf_payload(
         if copied:
             manifest[label] = copied
 
+    _ensure_lora_artifacts(payload_dir, manifest)
+
     checkpoints_index = training_dir / "checkpoints.jsonl"
     if checkpoints_index.exists():
         shutil.copy2(checkpoints_index, payload_dir / "checkpoints.jsonl")
@@ -308,7 +310,10 @@ def _copy_checkpoint_artifact(path_value: object, dest_root: Path) -> str | None
         except Exception as exc:
             logger.warning("Failed to download remote checkpoint artifact %s: %s", path_value, exc)
             return None
-        return dest.relative_to(dest_root).as_posix() if dest else None
+        if not dest:
+            return None
+        finalized = _extract_artifact_if_archive(dest)
+        return finalized.relative_to(dest_root).as_posix() if dest else None
 
     src = Path(path_value)
     if not src.exists():
@@ -320,7 +325,8 @@ def _copy_checkpoint_artifact(path_value: object, dest_root: Path) -> str | None
     else:
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
-    return dest.relative_to(dest_root).as_posix()
+    finalized = _extract_artifact_if_archive(dest)
+    return finalized.relative_to(dest_root).as_posix()
 
 def _is_remote_uri(path: str) -> bool:
     parsed = urlparse(path)
@@ -348,7 +354,7 @@ def _download_remote_artifact(uri: str, dest_root: Path) -> Path | None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         with blobfile.BlobFile(uri, "rb") as src, dest.open("wb") as dst:
             shutil.copyfileobj(src, dst)
-    return dest
+    return _extract_artifact_if_archive(dest)
 
 def _download_remote_directory(uri: str, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
@@ -397,6 +403,40 @@ def _download_tinker_artifact(uri: str, dest_root: Path) -> Path | None:
 
     candidate = target_dir / artifact_path
     if candidate.exists():
-        return candidate
+        return _extract_artifact_if_archive(candidate)
 
-    return target_dir if any(target_dir.iterdir()) else None
+    return _extract_artifact_if_archive(target_dir) if any(target_dir.iterdir()) else None
+
+def _extract_artifact_if_archive(path: Path) -> Path:
+    return path
+
+def _ensure_lora_artifacts(payload_dir: Path, manifest: Dict[str, str]) -> None:
+    weight_files = sorted(
+        p.relative_to(payload_dir).as_posix()
+        for p in payload_dir.rglob("*.safetensors")
+        if p.is_file()
+    )
+    if weight_files:
+        manifest.setdefault("weights", weight_files[0])
+    else:
+        logger.warning("No .safetensors files found in HF payload directory %s", payload_dir)
+
+    adapter_config = _find_adapter_config(payload_dir)
+    if adapter_config:
+        manifest.setdefault("adapter_config", adapter_config.relative_to(payload_dir).as_posix())
+    else:
+        logger.warning("No adapter config found in HF payload directory %s", payload_dir)
+
+def _find_adapter_config(payload_dir: Path) -> Path | None:
+    candidate_names = (
+        "adapter_config.json", 
+        "adapter_config.yaml",
+        "config.json",
+    )
+    for name in candidate_names:
+        candidate = payload_dir / name
+        if candidate.exists():
+            return candidate
+    for candidate in payload_dir.rglob("adapter_config.json"):
+        return candidate
+    return None
