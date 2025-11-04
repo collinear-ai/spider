@@ -4,6 +4,8 @@ import asyncio, logging, os, shutil
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Mapping, Tuple
+from urllib.parse import urlparse
+import blobfile
 
 import tinker
 from spider.config import JobConfig
@@ -300,6 +302,14 @@ def _prepare_hf_payload(
 def _copy_checkpoint_artifact(path_value: object, dest_root: Path) -> str | None:
     if not isinstance(path_value, str) or not path_value:
         return None
+    if _is_remote_uri(path_value):
+        try:
+            dest = _download_remote_artifact(path_value, dest_root)
+        except Exception as exc:
+            logger.warning("Failed to download remote checkpoint artifact %s: %s", path_value, exc)
+            return None
+        return dest.relative_to(dest_root).as_posix() if dest else None
+
     src = Path(path_value)
     if not src.exists():
         logger.warning('Checkpoint artifact missing: %s', src)
@@ -311,3 +321,82 @@ def _copy_checkpoint_artifact(path_value: object, dest_root: Path) -> str | None
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
     return dest.relative_to(dest_root).as_posix()
+
+def _is_remote_uri(path: str) -> bool:
+    parsed = urlparse(path)
+    if not parsed.scheme:
+        return False
+    if parsed.scheme == "file":
+        return False
+    if len(parsed.scheme) == 1 and parsed.scheme.isalpha():
+        return False
+    return True
+
+def _download_remote_artifact(uri: str, dest_root: Path) -> Path | None:
+    if _is_tinker_uri(uri):
+        return _download_tinker_artifact(uri, dest_root)
+
+    if not blobfile.exists(uri):
+        logger.warning("Remote checkpoint artifact missing: %s", uri)
+        return None
+    
+    name = Path(urlparse(uri).path.rstrip("/")).name or "artifact"
+    dest = dest_root / name
+    if blobfile.isdir(uri):
+        _download_remote_directory(uri, dest)
+    else:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with blobfile.BlobFile(uri, "rb") as src, dest.open("wb") as dst:
+            shutil.copyfileobj(src, dst)
+    return dest
+
+def _download_remote_directory(uri: str, dest: Path) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    for entry in blobfile.scandir(uri):
+        child_uri = f"{uri.rstrip('/')}/{entry.name}"
+        child_dest = dest / entry.name
+        if entry.is_dir():
+            _download_remote_directory(child_uri, child_dest)
+        else:
+            child_dest.parent.mkdir(parents=True, exist_ok=True)
+            with blobfile.BlobFile(child_uri, "rb") as src, child_dest.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+def _is_tinker_uri(uri: str) -> bool:
+    return urlparse(uri).scheme == "tinker"
+
+def _download_tinker_artifact(uri: str, dest_root: Path) -> Path | None:
+    parsed = urlparse(uri)
+    run_id = parsed.netloc.strip()
+    artifact_path = parsed.path.lstrip("/")
+    if not run_id or not artifact_path:
+        logger.warning("Malformed Tinker checkpoint URI: %s", uri)
+        return None
+    
+    service_client = tinker.ServiceClient()
+    rest_client = service_client.create_rest_client()
+
+    target_dir = dest_root / run_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    async def _download() -> None:
+        await rest_client.download_artifact_to_directory_async(
+            training_run_id=run_id,
+            artifact_path=artifact_path,
+            destination=str(target_dir)
+        )
+    
+    try:
+        asyncio.run(_download())
+    except RuntimeError as exc:
+        if "running event loop" in str(exc).lower():
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(_download())
+        else:
+            raise
+
+    candidate = target_dir / artifact_path
+    if candidate.exists():
+        return candidate
+
+    return target_dir if any(target_dir.iterdir()) else None
