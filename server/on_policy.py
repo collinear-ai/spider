@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio, logging, os, shutil
+import asyncio, logging, os, shutil, tarfile, urllib.request, zipfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Mapping, Tuple
@@ -381,34 +381,53 @@ def _download_tinker_artifact(uri: str, dest_root: Path) -> Path | None:
     
     service_client = tinker.ServiceClient()
     rest_client = service_client.create_rest_client()
-
-    target_dir = dest_root / run_id
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    async def _download() -> None:
-        await rest_client.download_artifact_to_directory_async(
-            training_run_id=run_id,
-            artifact_path=artifact_path,
-            destination=str(target_dir)
-        )
     
     try:
-        asyncio.run(_download())
-    except RuntimeError as exc:
-        if "running event loop" in str(exc).lower():
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(_download())
-        else:
-            raise
+        future = rest_client.get_checkpoint_archive_url_from_tinker_path(uri)
+        response = future.result(timeout=300)
+    except Exception as exc:
+        logger.warning("Failed to resolve Tinker checkpoint URL for %s: %s", uri, exc)
+        return None
 
-    candidate = target_dir / artifact_path
-    if candidate.exists():
-        return _extract_artifact_if_archive(candidate)
+    signed_url = getattr(response, "url", None)
+    if not signed_url:
+        logger.warning("Tinker checkpoint response missing signed URL for %s", uri)
+        return None
 
-    return _extract_artifact_if_archive(target_dir) if any(target_dir.iterdir()) else None
+    dest_root.mkdir(parents=True, exist_ok=True)
+    archive_path = dest_root / _checkpoint_archive_name(run_id, artifact_path)
+    try:
+        urllib.request.urlretrieve(signed_url, archive_path)
+    except Exception as exc:
+        logger.warning("Failed to download Tinker checkpoint archive %s: %s", uri, exc)
+        return None
+
+    try:
+        extracted = _extract_artifact_if_archive(archive_path)
+    except Exception as exc:
+        logger.warning("Failed to extract archive %s: %s", archive_path, exc)
+        return None
+
+    return extracted
 
 def _extract_artifact_if_archive(path: Path) -> Path:
-    return path
+    if not path.exists():
+        raise FileNotFoundError(f"Archive not found: {path}")
+    if not path.is_file() or \
+        not path.name.lower().endswith((".tar", ".tar.gz", ".zip")):
+        return path
+    
+    extract_dir = _derive_extract_dir(path)
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    if tarfile.is_tarfile(path):
+        with tarfile.open(path, mode="r:*") as archive:
+            _safe_extract_tar(archive, extract_dir)
+    elif zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path, mode="r") as archive:
+            _safe_extract_zip(archive, extract_dir)
+    else:
+        raise RuntimeError(f"Unsupported archive type: {path}")
 
 def _ensure_lora_artifacts(payload_dir: Path, manifest: Dict[str, str]) -> None:
     weight_files = sorted(
@@ -440,3 +459,36 @@ def _find_adapter_config(payload_dir: Path) -> Path | None:
     for candidate in payload_dir.rglob("adapter_config.json"):
         return candidate
     return None
+
+def _checkpoint_archive_name(run_id: str, artifact_path: str) -> str:
+    sanitized = artifact_path.strip().replace("/", "_") or "checkpoint"
+    if not sanitized.endswith((".tar", ".zip")):
+        sanitized = f"{sanitized}.tar"
+    return f"{run_id}_{sanitized}"
+
+def _derive_extract_dir(path: Path) -> Path:
+    suffixes = (".tar.gz", ".tgz", ".tar.xz", ".tar", ".zip")
+    base_name = path.name
+    for suffix in suffixes:
+        if base_name.endswith(suffix):
+            base_name = base_name[: -len(suffix)]
+            break
+    if not base_name:
+        base_name = "extracted"
+    return path.parent / base_name
+
+def _safe_extract_tar(archive: tarfile.TarFile, dest: Path) -> None:
+    dest_resolved = dest.resolve()
+    for member in archive.getmembers():
+        member_target = (dest_resolved / member.name).resolve(strict=False)
+        if not str(member_target).startswith(str(dest_resolved)):
+            raise RuntimeError(f"Unsafe member path detected in archive: {member.name}")
+    archive.extractall(dest_resolved)
+
+def _safe_extract_zip(archive: zipfile.ZipFile, dest: Path) -> None:
+    dest_resolved = dest.resolve()
+    for name in archive.namelist():
+        member_target = (dest_resolved / name).resolve(strict=False)
+        if not str(member_target).startswith(str(dest_resolved)):
+            raise RuntimeError(f"Unsafe member path detected in archive: {name}")
+    archive.extractall(dest_resolved)
