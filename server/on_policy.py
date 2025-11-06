@@ -287,10 +287,15 @@ def _prepare_hf_payload(
     payload_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = {}
-    for label, key in (("sampler", "sampler_path"), ("state", "state_path")):
-        copied = _copy_checkpoint_artifact(checkpoint.get(key), payload_dir)
-        if copied:
-            manifest[label] = copied
+    sampler_rel = _copy_checkpoint_artifact(checkpoint.get("sampler_path"), payload_dir)
+    if sampler_rel:
+        sampler_path = payload_dir / sampler_rel
+        if sampler_path.is_dir():
+            for child in sampler_path.iterdir():
+                shutil.move(child, payload_dir / child.name)
+            shutil.rmtree(sampler_path, ignore_errors=True)
+        else:
+            manifest["sampler"] = sampler_rel
 
     _ensure_lora_artifacts(payload_dir, manifest)
 
@@ -408,6 +413,8 @@ def _download_tinker_artifact(uri: str, dest_root: Path) -> Path | None:
         logger.warning("Failed to extract archive %s: %s", archive_path, exc)
         return None
 
+    if archive_path.exists() and archive_path.is_file():
+        archive_path.unlink()
     return extracted
 
 def _extract_artifact_if_archive(path: Path) -> Path:
@@ -428,6 +435,7 @@ def _extract_artifact_if_archive(path: Path) -> Path:
             _safe_extract_zip(archive, extract_dir)
     else:
         raise RuntimeError(f"Unsupported archive type: {path}")
+    return extract_dir
 
 def _ensure_lora_artifacts(payload_dir: Path, manifest: Dict[str, str]) -> None:
     weight_files = sorted(

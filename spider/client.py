@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional, Union, Callable, List, Tuple
+from typing import Any, Dict, Optional, Union, Callable, List, Tuple, Iterable
 import httpx, time, inspect, textwrap, sys, json
 
 from .config import AppConfig
