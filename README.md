@@ -14,7 +14,7 @@ pip install -e ".[server]"
 uvicorn server.app:app --host 0.0.0.0 --port 9000 --workers 1
 
 # install a client
-pip install -e ".[client]" (available for cpu machines)
+pip install -e ".[client]" # (available for cpu machines)
 ```
 
 ## Python client API
