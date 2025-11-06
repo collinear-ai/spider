@@ -67,6 +67,7 @@ job:
     mode: "upload_hf"
     hf:
       repo_id: collinear-ai/spider-rollouts-qwen2.5-7b-instruct-ocr2-ast-filter
+      repo_type: "dataset"
       token: 
       private: false
 ```
@@ -105,5 +106,10 @@ job:
       eval_every: 5
       save_every: 20
   output:
-    mode: "return"
+    mode: "upload_hf"
+    hf:
+      repo_id: RiddleHe/qwen3-8B-on-policy-distill-teacher-qwen3-30B-A3B-OCR2-8-examples
+      repo_type: "model"
+      private: false
+      token: 
 ```
