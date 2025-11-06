@@ -207,7 +207,7 @@ def run_on_policy_job(
         if not checkpoint or "sampler_path" not in checkpoint:
             raise JobExecutionError("On-policy training did not produce a sampler checkpoint")
 
-        hf_payload_dir, manifest = _prepare_hf_payload(
+        hf_payload_dir, manifest, checkpoints_index_text = _prepare_hf_payload(
             training_dir=training_dir,
             checkpoint=checkpoint,
             workspace=workspace,
@@ -226,6 +226,8 @@ def run_on_policy_job(
         "last_batch": checkpoint.get("batch"),
         "teacher_model": options.teacher,
     }
+    if checkpoints_index_text is not None:
+        payload["training"]["checkpoints_index_contents"] = checkpoints_index_text
     payload["hf_upload"] = {
         "repo_id": job.output.hf.repo_id if job.output.hf else None,
         "relative_dir": hf_payload_dir.relative_to(workspace).as_posix(),
@@ -280,7 +282,7 @@ def _prepare_hf_payload(
     training_dir: Path,
     checkpoint: Mapping[str, object],
     workspace: Path,
-) -> Tuple[Path, Dict[str, str]]:
+) -> Tuple[Path, Dict[str, str], str | None]:
     payload_dir = workspace / "hf_upload"
     if payload_dir.exists():
         shutil.rmtree(payload_dir)
@@ -289,22 +291,17 @@ def _prepare_hf_payload(
     manifest = {}
     sampler_rel = _copy_checkpoint_artifact(checkpoint.get("sampler_path"), payload_dir)
     if sampler_rel:
-        sampler_path = payload_dir / sampler_rel
-        if sampler_path.is_dir():
-            for child in sampler_path.iterdir():
-                shutil.move(child, payload_dir / child.name)
-            shutil.rmtree(sampler_path, ignore_errors=True)
-        else:
-            manifest["sampler"] = sampler_rel
-
-    _ensure_lora_artifacts(payload_dir, manifest)
+        manifest.update(_stage_lora_artifacts(payload_dir, sampler_rel))
 
     checkpoints_index = training_dir / "checkpoints.jsonl"
+    checkpoints_index_text = None
     if checkpoints_index.exists():
-        shutil.copy2(checkpoints_index, payload_dir / "checkpoints.jsonl")
-        manifest["checkpoints_index"] = "checkpoints.jsonl"
+        try:
+            checkpoints_index_text = checkpoints_index.read_text(encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Failed to read checkpoints index %s: %s", checkpoints_index, exc)
 
-    return payload_dir, manifest
+    return payload_dir, manifest, checkpoints_index_text
 
 def _copy_checkpoint_artifact(path_value: object, dest_root: Path) -> str | None:
     if not isinstance(path_value, str) or not path_value:
@@ -437,22 +434,35 @@ def _extract_artifact_if_archive(path: Path) -> Path:
         raise RuntimeError(f"Unsupported archive type: {path}")
     return extract_dir
 
-def _ensure_lora_artifacts(payload_dir: Path, manifest: Dict[str, str]) -> None:
-    weight_files = sorted(
-        p.relative_to(payload_dir).as_posix()
-        for p in payload_dir.rglob("*.safetensors")
-        if p.is_file()
-    )
-    if weight_files:
-        manifest.setdefault("weights", weight_files[0])
-    else:
-        logger.warning("No .safetensors files found in HF payload directory %s", payload_dir)
+def _stage_lora_artifacts(payload_dir: Path, extracted_rel: str) -> Dict[str, str]:
+    staged = {}
+    extracted_path = payload_dir / extracted_rel
+    if not extracted_path.exists():
+        return staged
 
-    adapter_config = _find_adapter_config(payload_dir)
-    if adapter_config:
-        manifest.setdefault("adapter_config", adapter_config.relative_to(payload_dir).as_posix())
+    if extracted_path.is_file:
+        raise RuntimeError
+    
+    weight_file = next((p for p in extracted_path.rglob("*.safetensors") if p.is_file()))
+    if weight_file:
+        weight_target = payload_dir / weight_file.name
+        if weight_target != weight_file:
+            shutil.move(weight_file, weight_target)
+        staged["weights"] = weight_target.relative_to(payload_dir).as_posix()
     else:
-        logger.warning("No adapter config found in HF payload directory %s", payload_dir)
+        logger.warning("No .safetensors file found in HF payload directory %s", extracted_path)
+
+    adapter_file = _find_adapter_config(extracted_path)
+    if adapter_file:
+        adapter_target = payload_dir / adapter_file.name
+        if adapter_target != adapter_file:
+            shutil.move(adapter_file, adapter_target)
+        staged["adapter_config"] = adapter_target.relative_to(payload_dir).as_posix()
+    else:
+        logger.warning("No adapter config found in HF payload directory %s", extracted_path)
+    
+    shutil.rmtree(extracted_path, ignore_errors=True)
+    return staged
 
 def _find_adapter_config(payload_dir: Path) -> Path | None:
     candidate_names = (
