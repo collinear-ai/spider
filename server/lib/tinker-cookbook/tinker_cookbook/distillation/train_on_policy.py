@@ -25,7 +25,7 @@ from tinker_cookbook.rl.types import (
     EnvGroupBuilder,
     TrajectoryGroup,
 )
-from tinker_cookbook.tokenizer_utils import Tokenizer
+from tinker_cookbook.tokenizer_utils import Tokenizer, get_tokenizer
 from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.misc_utils import safezip, timed
 from tinker_cookbook.utils.trace import scope, get_scope_context, trace_init
@@ -229,6 +229,7 @@ async def do_train_step_and_get_sampling_client(
     trajectory_groups_P: list[TrajectoryGroup],
     dataset_indices_P: List[int],
     teacher_clients: List[tinker.SamplingClient],
+    teacher_tokenizers: List[Tokenizer],
 ) -> tuple[tinker.SamplingClient, dict[str, Any]]:
     context = get_scope_context()
     context.attributes["step"] = i_batch
@@ -280,6 +281,7 @@ async def do_sync_training(
     evaluators: list[SamplingClientEvaluator],
     dataset: CompositeDataset,
     teacher_clients: List[tinker.SamplingClient],
+    teacher_tokenizers: List[Tokenizer],
     ml_logger: ml_log.Logger,
     tokenizer: Tokenizer,
 ):
@@ -339,6 +341,7 @@ async def do_sync_training(
             trajectory_groups_P,
             dataset_indices_P,
             teacher_clients,
+            teacher_tokenizers,
         )
 
         # Log metrics
@@ -398,6 +401,7 @@ async def main(
     # Create datasets and teacher sampling clients from configs
     datasets = []
     teacher_clients = []
+    teacher_tokenizers = []
     groups_per_batch_list = []
     evaluators = [evaluator() for evaluator in cfg.evaluator_builders]
 
@@ -421,6 +425,7 @@ async def main(
                 model_path=teacher_config.load_checkpoint_path,
             )
         teacher_clients.append(teacher_client)
+        teacher_tokenizers.append(get_tokenizer(teacher_config.base_model))
         logger.info(
             f"Created teacher sampling client for {teacher_config.base_model} "
             f"(checkpoint: {teacher_config.load_checkpoint_path})"
@@ -442,6 +447,7 @@ async def main(
         evaluators=evaluators,
         dataset=composite_dataset,
         teacher_clients=teacher_clients,
+        teacher_tokenizers=teacher_tokenizers,
         ml_logger=ml_logger,
         tokenizer=tokenizer,
     )
