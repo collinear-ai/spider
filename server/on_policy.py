@@ -441,7 +441,7 @@ def _stage_lora_artifacts(payload_dir: Path, extracted_rel: str) -> Dict[str, st
         return staged
 
     if extracted_path.is_file:
-        raise RuntimeError
+        raise RuntimeError(f"Expected checkpoint archive to extract into a directory, got file: {extracted_path}")
     
     weight_file = next((p for p in extracted_path.rglob("*.safetensors") if p.is_file()))
     if weight_file:
