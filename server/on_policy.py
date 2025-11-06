@@ -78,6 +78,10 @@ def _temporary_api_key(api_key: str | None):
         else:
             os.environ["TINKER_API_KEY"] = previous
 
+def _needs_gold_alignment(student_model: str, teacher_model: str) -> bool:
+    _ = (student_model, teacher_model)
+    return True
+
 def run_on_policy_job(
     job_id: str, 
     job: JobConfig, 
@@ -103,6 +107,7 @@ def run_on_policy_job(
     metadata_path = workspace / "metadata.json"
     
     prompts = collect_prompts(job.source)
+    use_gold_alignment = _needs_gold_alignment(student_model, options.teacher)
     logger.info(
         "Job %s: on-policy distillation for student=%s collected %d prompts",
         job_id,
@@ -119,6 +124,7 @@ def run_on_policy_job(
     payload["generation_mode"] = "on_policy"
     sanitized_options = options.model_dump(exclude_none=True).copy()
     sanitized_options.pop("api_key", None)
+    sanitized_options["use_gold_alignment"] = use_gold_alignment
     payload["on_policy"] = sanitized_options
     _write_metadata(metadata_path, payload, 0)
 
@@ -191,6 +197,7 @@ def run_on_policy_job(
         eval_every=options.eval_every,
         save_every=options.save_every,
         load_checkpoint_path=None,
+        use_gold_alignment=use_gold_alignment,
     )
 
     _configure_tinker_logging()

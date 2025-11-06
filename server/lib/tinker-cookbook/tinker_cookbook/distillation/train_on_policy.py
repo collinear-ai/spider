@@ -160,6 +160,8 @@ class Config:
     save_every: int = 20
     load_checkpoint_path: str | None = None
 
+    use_gold_alignment: bool = False
+
 
 @scope
 async def prepare_minibatch(
