@@ -201,20 +201,20 @@ def run_on_policy_job(
         except Exception as exc:
             raise JobExecutionError(f"On-policy distillation failed: {exc}") from exc
 
-    checkpoint = checkpoint_utils.get_last_checkpoint(
-        str(training_dir), required_key="sampler_path"
-    )
-    if not checkpoint or "sampler_path" not in checkpoint:
-        raise JobExecutionError("On-policy training did not produce a sampler checkpoint")
+        checkpoint = checkpoint_utils.get_last_checkpoint(
+            str(training_dir), required_key="sampler_path"
+        )
+        if not checkpoint or "sampler_path" not in checkpoint:
+            raise JobExecutionError("On-policy training did not produce a sampler checkpoint")
 
-    hf_payload_dir, manifest = _prepare_hf_payload(
-        training_dir=training_dir,
-        checkpoint=checkpoint,
-        workspace=workspace,
-    )
-    if not manifest:
-        raise JobExecutionError("On-policy training did not produce uploadable checkpoint artifacts")
-    
+        hf_payload_dir, manifest = _prepare_hf_payload(
+            training_dir=training_dir,
+            checkpoint=checkpoint,
+            workspace=workspace,
+        )
+        if not manifest:
+            raise JobExecutionError("On-policy training did not produce uploadable checkpoint artifacts")
+        
     metrics = {
         "records": 0,
         "training_batches": float(checkpoint.get("batch", 0))
