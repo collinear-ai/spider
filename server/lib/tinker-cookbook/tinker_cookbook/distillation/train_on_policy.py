@@ -73,10 +73,21 @@ async def incorporate_kl_penalty(
     """
     # Note: if your teacher has a different renderer than the student, you may want to modify
     #       the full_sequence_inputs_D to match the teacher's renderer.
-    full_sequence_inputs_D = [
-        datum.model_input.append_int(cast(int, datum.loss_fn_inputs["target_tokens"].data[-1]))
-        for datum in data_D
-    ]
+    if use_gold_alignment:
+        if student_texts is None or teacher_tokenizers is None:
+            raise ValueError("[tinker-cookbook.distillation.train_on_policy] GOLD alignment requires reconstructed student text and teacher tokenizers")
+        full_sequence_inputs_D = [
+            _student_text_to_teacher_input(
+                text=student_texts[i],
+                tokenizer=teacher_tokenizers[dataset_indices_D[i]]
+            )
+            for i in range(len(data_D))
+        ]
+    else:
+        full_sequence_inputs_D = [
+            datum.model_input.append_int(cast(int, datum.loss_fn_inputs["target_tokens"].data[-1]))
+            for datum in data_D
+        ]
     # Compute the teacher's logprobs for each element of the batch
     # Each datum uses its corresponding teacher sampling client
     teacher_logprobs_D = await asyncio.gather(
@@ -141,6 +152,14 @@ def _datum_to_student_token_ids(datum: tinker.Datum) -> List[int]:
     target_tokens = datum.loss_fn_inputs["target_tokens"].to_torch().tolist()
     prompt_tokens.extend(int(token) for token in target_tokens)
     return prompt_tokens
+
+def _student_text_to_teacher_input(*, text: str, tokenizer: Tokenizer) -> tinker.ModelInput:
+    teacher_token_ids = tokenizer.encode(
+        text,
+        add_special_tokens=False,
+        clean_up_tokenization_spaces=False,
+    )
+    return tinker.ModelInput.from_ints(tokens=teacher_token_ids)
 
 @chz.chz
 class Config:
