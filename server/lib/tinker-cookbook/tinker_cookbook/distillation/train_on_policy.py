@@ -232,6 +232,13 @@ def _compute_groupwise_reverse_kl(
         teacher_tokenizer,
         teacher_token_ids,
     )
+    logger.info(
+        "GOLD alignment: student_tokens=%d teacher_tokens=%d student_groups=%d teacher_groups=%d",
+        len(student_token_ids),
+        len(teacher_token_ids),
+        len(student_groups),
+        len(teacher_groups)
+    )
 
     reverse_kl = torch.zeros_like(student_logprobs)
     mask = torch.zeros_like(base_mask)
