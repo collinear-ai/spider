@@ -54,6 +54,11 @@ async def incorporate_kl_penalty(
     dataset_indices_D: List[int],
     kl_penalty_coef: float,
     kl_discount_factor: float,
+    *,
+    student_token_sequences: List[List[int]] | None = None,
+    student_texts: List[str] | None = None,
+    teacher_tokenizers: List[Tokenizer] | None = None,
+    use_gold_alignment: bool = False,
 ) -> Dict[str, float]:
     """
     Compute reverse KL between the student (log p) and the teacher model (log q), computed as
@@ -126,8 +131,16 @@ async def incorporate_kl_penalty(
         if mask_sum > 0:
             metrics[f"teacher_kl/dataset_{dataset_idx}"] = float(kl_sum / mask_sum)
 
+    if use_gold_alignment:
+        _ = (student_token_sequences, student_texts, teacher_tokenizers)
+
     return metrics
 
+def _datum_to_student_token_ids(datum: tinker.Datum) -> List[int]:
+    prompt_tokens = list(datum.model_input.to_ints())
+    target_tokens = datum.loss_fn_inputs["target_tokens"].to_torch().tolist()
+    prompt_tokens.extend(int(token) for token in target_tokens)
+    return prompt_tokens
 
 @chz.chz
 class Config:
@@ -172,6 +185,11 @@ async def prepare_minibatch(
     teacher_clients: List[tinker.SamplingClient],
     kl_penalty_coef: float,
     kl_discount_factor: float,
+    *,
+    student_token_sequences: List[List[int]] | None = None,
+    student_texts: List[str] | None = None,
+    teacher_tokenizers: List[Tokenizer] | None = None,
+    use_gold_alignment: bool = False,
 ) -> tuple[list[tinker.Datum], dict[str, Any]]:
     """Converts the trajectories into a minibatch, and provides metrics about the minibatch"""
 
@@ -193,6 +211,22 @@ async def prepare_minibatch(
             logger.info(colorize_example(datum, tokenizer, key="mask"))
             printed_datasets.add(dataset_idx)
 
+    student_token_sequences = None
+    student_texts = None
+    if use_gold_alignment:
+        student_token_sequences = []
+        student_texts = []
+        for datum in data_D:
+            token_ids = _datum_to_student_token_ids(datum)
+            student_token_sequences.append(token_ids)
+            student_texts.append(
+                tokenizer.decode(
+                    token_ids,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+            )
+
     # Incorporate KL penalty if configured
     if kl_penalty_coef > 0:
         with timed("compute_kl_penalty", metrics):
@@ -212,6 +246,10 @@ async def prepare_minibatch(
                 dataset_indices_D,
                 kl_penalty_coef,
                 kl_discount_factor,
+                student_token_sequences=student_token_sequences,
+                student_texts=student_texts,
+                teacher_tokenizers=teacher_tokenizers,
+                use_gold_alignment=use_gold_alignment,
             )
         metrics.update(kl_penalty_metrics)
 
@@ -243,6 +281,8 @@ async def do_train_step_and_get_sampling_client(
         teacher_clients,
         kl_penalty_coef=cfg.kl_penalty_coef,
         kl_discount_factor=cfg.kl_discount_factor,
+        teacher_tokenizers=teacher_tokenizers,
+        use_gold_alignment=cfg.use_gold_alignment,
     )
     metrics.update(prepare_minibatch_metrics)
 
