@@ -109,10 +109,11 @@ def run_on_policy_job(
     prompts = collect_prompts(job.source)
     use_gold_alignment = _needs_gold_alignment(student_model, options.teacher)
     logger.info(
-        "Job %s: on-policy distillation for student=%s collected %d prompts",
+        "Job %s: on-policy distillation for student=%s collected %d prompts, use_gold_alignment=%s",
         job_id,
         student_model,
-        len(prompts)
+        len(prompts),
+        use_gold_alignment
     )
     events.emit(
         "Collected prompts for on-policy distillation.",
