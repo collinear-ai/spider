@@ -92,6 +92,9 @@ async def incorporate_kl_penalty(
             )
             for i in range(len(data_D))
         ]
+        logger.info(
+            "GOLD: encoded teacher inputs for logprobs"
+        )
     else:
         full_sequence_inputs_D = [
             datum.model_input.append_int(cast(int, datum.loss_fn_inputs["target_tokens"].data[-1]))
@@ -125,6 +128,12 @@ async def incorporate_kl_penalty(
             teacher_completion_ids = _student_completion_to_teacher_tokens(
                 student_completion_texts[i],
                 teacher_tokenizer,
+            )
+            logger.info(
+                "GOLD: datum=%d student_tokens=%d teacher_tokens=%d",
+                i,
+                len(student_tokens),
+                len(teacher_completion_ids),
             )
 
             seq_len = min(len(teacher_completion_ids), int(teacher_tensor.shape[0]))
@@ -193,7 +202,6 @@ def _student_text_to_teacher_input(*, text: str, tokenizer: Tokenizer) -> tinker
     teacher_token_ids = tokenizer.encode(
         text,
         add_special_tokens=False,
-        clean_up_tokenization_spaces=False,
     )
     return tinker.ModelInput.from_ints(tokens=teacher_token_ids)
 
@@ -201,7 +209,6 @@ def _student_completion_to_teacher_tokens(text: str, tokenizer: Tokenizer) -> Li
     return tokenizer.encode(
         text,
         add_special_tokens=False,
-        clean_up_tokenization_spaces=False,
     )
 
 def _token_pieces(tokenizer: Tokenizer, token_ids: List[int]) -> List[str]:
@@ -211,7 +218,6 @@ def _token_pieces(tokenizer: Tokenizer, token_ids: List[int]) -> List[str]:
         cur = tokenizer.decode(
             token_ids[: idx + 1],
             skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
         )
         pieces.append(cur[len(prev):])
         prev = cur
@@ -394,7 +400,6 @@ async def prepare_minibatch(
                 tokenizer.decode(
                     completion_ids,
                     skip_special_tokens=False,
-                    clean_up_tokenization_spaces=False,
                 )
             )
             full_ids = list(datum.model_input.to_ints()) + completion_ids
@@ -402,9 +407,12 @@ async def prepare_minibatch(
                 tokenizer.decode(
                     full_ids,
                     skip_special_tokens=False,
-                    clean_up_tokenization_spaces=False,
                 )
             )
+        logger.info(
+            "GOLD: reconstructed student text (prompts=%d)",
+            len(student_full_texts)
+        )
 
     # Incorporate KL penalty if configured
     if kl_penalty_coef > 0:
