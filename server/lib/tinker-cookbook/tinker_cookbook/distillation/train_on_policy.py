@@ -55,8 +55,10 @@ async def incorporate_kl_penalty(
     kl_penalty_coef: float,
     kl_discount_factor: float,
     *,
-    student_token_sequences: List[List[int]] | None = None,
-    student_texts: List[str] | None = None,
+    student_completion_token_ids: List[List[int]] | None = None,
+    student_completion_texts: List[str] | None = None,
+    student_full_texts: List[str] | None = None,
+    student_tokenizer: Tokenizer | None = None,
     teacher_tokenizers: List[Tokenizer] | None = None,
     use_gold_alignment: bool = False,
 ) -> Dict[str, float]:
@@ -74,11 +76,18 @@ async def incorporate_kl_penalty(
     # Note: if your teacher has a different renderer than the student, you may want to modify
     #       the full_sequence_inputs_D to match the teacher's renderer.
     if use_gold_alignment:
-        if student_texts is None or teacher_tokenizers is None:
+        if (
+            student_full_texts is None
+            or student_completion_texts is None
+            or student_completion_token_ids is None
+            or student_tokenizer is None
+            or teacher_tokenizers is None
+        ):
             raise ValueError("[tinker-cookbook.distillation.train_on_policy] GOLD alignment requires reconstructed student text and teacher tokenizers")
+
         full_sequence_inputs_D = [
             _student_text_to_teacher_input(
-                text=student_texts[i],
+                text=student_full_texts[i],
                 tokenizer=teacher_tokenizers[dataset_indices_D[i]]
             )
             for i in range(len(data_D))
@@ -101,19 +110,51 @@ async def incorporate_kl_penalty(
     #   - q: teacher_logprobs
     sampled_logprobs_D = [datum.loss_fn_inputs["logprobs"].to_torch() for datum in data_D]
     float_masks = [datum.loss_fn_inputs["mask"].to_torch().float() for datum in data_D]
-    reverse_kl = [
-        (sampled_logprobs - torch.tensor(teacher_logprobs[1:])) * mask
-        for teacher_logprobs, sampled_logprobs, mask in safezip(
-            teacher_logprobs_D, sampled_logprobs_D, float_masks
-        )
-    ]
+    reverse_kl = []
+    effective_masks = []
+
+    for i, (teacher_logprobs, sampled_logprobs, mask) in enumerate(
+        safezip(teacher_logprobs_D, sampled_logprobs_D, float_masks)
+    ):
+        teacher_tensor = torch.tensor(teacher_logprobs[1:], dtype=sampled_logprobs.dtype)
+        mask_tensor = mask
+
+        if use_gold_alignment:
+            teacher_tokenizer = teacher_tokenizers[dataset_indices_D[i]]
+            student_tokens = student_completion_token_ids[i]
+            teacher_completion_ids = _student_completion_to_teacher_tokens(
+                student_completion_texts[i],
+                teacher_tokenizer,
+            )
+
+            seq_len = min(len(teacher_completion_ids), int(teacher_tensor.shape[0]))
+            if seq_len != len(teacher_completion_ids):
+                teacher_completion_ids = teacher_completion_ids[:seq_len]
+                teacher_tensor = teacher_tensor[:seq_len]
+
+            group_reverse_kl, group_mask = _compute_groupwise_reverse_kl(
+                student_tokenizer,
+                student_tokens,
+                sampled_logprobs,
+                teacher_tokenizer,
+                teacher_completion_ids,
+                teacher_tensor,
+                mask_tensor,
+            )
+            reverse_kl.append(group_reverse_kl)
+            effective_masks.append(group_mask)
+            continue
+
+        reverse_kl.append((sampled_logprobs - teacher_tensor) * mask_tensor)
+        effective_masks.append(mask_tensor)
+
     # Track per-dataset KL for logging
     # dataset_idx -> (sum of KL, sum of mask)
     per_dataset_kl: Dict[int, tuple[float, float]] = {}
 
     for i, datum in enumerate(data_D):
         # The advantage is the negative reverse KL. We can optionally apply a discount factor.
-        kl_advantages = -kl_penalty_coef * float_masks[i] * reverse_kl[i]
+        kl_advantages = -kl_penalty_coef * effective_masks[i] * reverse_kl[i]
         if kl_discount_factor > 0:
             kl_advantages = torch.tensor(
                 discounted_future_sum_vectorized(kl_advantages.numpy(), kl_discount_factor)
@@ -125,7 +166,7 @@ async def incorporate_kl_penalty(
         # Accumulate per-dataset KL
         dataset_idx = dataset_indices_D[i]
         kl_sum = reverse_kl[i].sum().item()
-        mask_sum = float_masks[i].sum().item()
+        mask_sum = effective_masks[i].sum().item()
         if dataset_idx not in per_dataset_kl:
             per_dataset_kl[dataset_idx] = (0.0, 0.0)
         prev_kl_sum, prev_mask_sum = per_dataset_kl[dataset_idx]
@@ -133,7 +174,7 @@ async def incorporate_kl_penalty(
 
     # Compute average reverse KL over the batch for logging purposes
     avg_logp_diff = sum([diff.sum() for diff in reverse_kl]) / sum(
-        [mask.sum() for mask in float_masks]
+        [mask.sum() for mask in effective_masks]
     )
 
     # Compute per-dataset metrics
@@ -142,16 +183,11 @@ async def incorporate_kl_penalty(
         if mask_sum > 0:
             metrics[f"teacher_kl/dataset_{dataset_idx}"] = float(kl_sum / mask_sum)
 
-    if use_gold_alignment:
-        _ = (student_token_sequences, student_texts, teacher_tokenizers)
-
     return metrics
 
-def _datum_to_student_token_ids(datum: tinker.Datum) -> List[int]:
-    prompt_tokens = list(datum.model_input.to_ints())
+def _datum_to_student_completion_ids(datum: tinker.Datum) -> List[int]:
     target_tokens = datum.loss_fn_inputs["target_tokens"].to_torch().tolist()
-    prompt_tokens.extend(int(token) for token in target_tokens)
-    return prompt_tokens
+    return [int(token) for token in target_tokens]
 
 def _student_text_to_teacher_input(*, text: str, tokenizer: Tokenizer) -> tinker.ModelInput:
     teacher_token_ids = tokenizer.encode(
@@ -160,6 +196,115 @@ def _student_text_to_teacher_input(*, text: str, tokenizer: Tokenizer) -> tinker
         clean_up_tokenization_spaces=False,
     )
     return tinker.ModelInput.from_ints(tokens=teacher_token_ids)
+
+def _student_completion_to_teacher_tokens(text: str, tokenizer: Tokenizer) -> List[int]:
+    return tokenizer.encode(
+        text,
+        add_special_tokens=False,
+        clean_up_tokenization_spaces=False,
+    )
+
+def _token_pieces(tokenizer: Tokenizer, token_ids: List[int]) -> List[str]:
+    pieces = []
+    prev = ""
+    for idx in range(len(token_ids)):
+        cur = tokenizer.decode(
+            token_ids[: idx + 1],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        pieces.append(cur[len(prev):])
+        prev = cur
+    return pieces
+
+def _compute_groupwise_reverse_kl(
+    student_tokenizer: Tokenizer,
+    student_token_ids: List[int],
+    student_logprobs: torch.Tensor,
+    teacher_tokenizer: Tokenizer,
+    teacher_token_ids: List[int],
+    teacher_logprobs: torch.Tensor,
+    base_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    student_groups, teacher_groups = _build_alignment_groups(
+        student_tokenizer,
+        student_token_ids,
+        teacher_tokenizer,
+        teacher_token_ids,
+    )
+
+    reverse_kl = torch.zeros_like(student_logprobs)
+    mask = torch.zeros_like(base_mask)
+
+    for s_group, t_group in zip(student_groups, teacher_groups):
+        teacher_indices = [idx for idx in t_group if idx < len(teacher_logprobs)]
+        student_indices = [idx for idx in s_group if idx < len(student_logprobs) and base_mask[idx] > 0]
+        if not teacher_indices or not student_indices:
+            continue
+
+        student_log_sum = student_logprobs[student_indices[0]]
+        for s_idx in student_indices[1:]:
+            student_log_sum = student_log_sum + student_logprobs[s_idx]
+            
+        teacher_log_sum = teacher_logprobs[teacher_indices[0]]
+        for t_idx in teacher_indices[1:]:
+            teacher_log_sum = teacher_log_sum + teacher_logprobs[t_idx]
+
+        delta = student_log_sum - teacher_log_sum
+        share = delta / len(student_indices)
+
+        for s_idx in student_indices:
+            reverse_kl[s_idx] = share
+            mask[s_idx] = base_mask[s_idx]
+
+    return reverse_kl, mask
+
+def _build_alignment_groups(
+    student_tokenizer: Tokenizer,
+    student_token_ids: List[int],
+    teacher_tokenizer: Tokenizer,
+    teacher_token_ids: List[int],
+) -> tuple[List[List[int]], List[List[int]]]:
+    student_pieces = _token_pieces(student_tokenizer, student_token_ids)
+    teacher_pieces = _token_pieces(teacher_tokenizer, teacher_token_ids)
+
+    student_groups = []
+    teacher_groups = []
+
+    i = j = 0
+    s_buf = t_buf = ""
+    cur_s = []
+    cur_t = []
+
+    def flush() -> None:
+        nonlocal s_buf, t_buf, cur_s, cur_t
+        if cur_s and cur_t:
+            student_groups.append(cur_s.copy())
+            teacher_groups.append(cur_t.copy())
+        s_buf = t_buf = ""
+        cur_s = []
+        cur_t = []
+
+    while i < len(student_pieces) or j < len(teacher_pieces):
+        if s_buf == t_buf and s_buf != "":
+            flush()
+            continue
+        if i < len(student_pieces) and (s_buf == "" or len(s_buf) <= len(t_buf)):
+            s_buf += student_pieces[i]
+            cur_s.append(i)
+            i += 1
+            continue
+        if j < len(teacher_pieces):
+            t_buf += teacher_pieces[j]
+            cur_t.append(j)
+            j += 1
+            continue
+        break
+
+    if s_buf == t_buf and s_buf != "":
+        flush()
+
+    return student_groups, teacher_groups
 
 @chz.chz
 class Config:
@@ -205,8 +350,6 @@ async def prepare_minibatch(
     kl_penalty_coef: float,
     kl_discount_factor: float,
     *,
-    student_token_sequences: List[List[int]] | None = None,
-    student_texts: List[str] | None = None,
     teacher_tokenizers: List[Tokenizer] | None = None,
     use_gold_alignment: bool = False,
 ) -> tuple[list[tinker.Datum], dict[str, Any]]:
@@ -230,17 +373,27 @@ async def prepare_minibatch(
             logger.info(colorize_example(datum, tokenizer, key="mask"))
             printed_datasets.add(dataset_idx)
 
-    student_token_sequences = None
-    student_texts = None
+    student_completion_token_ids = None
+    student_completion_texts = None
+    student_full_texts = None
     if use_gold_alignment:
-        student_token_sequences = []
-        student_texts = []
+        student_completion_token_ids = []
+        student_completion_texts = []
+        student_full_texts = []
         for datum in data_D:
-            token_ids = _datum_to_student_token_ids(datum)
-            student_token_sequences.append(token_ids)
-            student_texts.append(
+            completion_ids = _datum_to_student_completion_ids(datum)
+            student_completion_token_ids.append(completion_ids)
+            student_completion_texts.append(
                 tokenizer.decode(
-                    token_ids,
+                    completion_ids,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+            )
+            full_ids = list(datum.model_input.to_ints()) + completion_ids
+            student_full_texts.append(
+                tokenizer.decode(
+                    full_ids,
                     skip_special_tokens=False,
                     clean_up_tokenization_spaces=False,
                 )
@@ -265,8 +418,10 @@ async def prepare_minibatch(
                 dataset_indices_D,
                 kl_penalty_coef,
                 kl_discount_factor,
-                student_token_sequences=student_token_sequences,
-                student_texts=student_texts,
+                student_completion_token_ids=student_completion_token_ids,
+                student_completion_texts=student_completion_texts,
+                student_full_texts=student_full_texts,
+                student_tokenizer=tokenizer,
                 teacher_tokenizers=teacher_tokenizers,
                 use_gold_alignment=use_gold_alignment,
             )
