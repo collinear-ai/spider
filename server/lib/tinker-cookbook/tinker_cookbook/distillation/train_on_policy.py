@@ -188,8 +188,8 @@ async def incorporate_kl_penalty(
             if completion_start:
                 teacher_tensor = teacher_tensor[completion_start:]
 
-            student_logprobs = sampled_logprobs
-            student_mask = mask_tensor
+            student_logprobs = sampled_logprobs[mask_tensor > 0]
+            student_mask = mask_tensor[mask_tensor > 0]
             teacher_completion_ids = _student_completion_to_teacher_tokens(
                 student_completion_texts[i],
                 teacher_tokenizer,
@@ -272,13 +272,11 @@ async def incorporate_kl_penalty(
 def _datum_to_student_completion_ids(datum: tinker.Datum) -> List[int]:
     target_tokens = datum.loss_fn_inputs["target_tokens"].to_torch().tolist()
     mask = datum.loss_fn_inputs["mask"].to_torch().tolist()
-    start_idx = 0
-    for idx, value in enumerate(mask):
-        if float(value) > 0:
-            start_idx = idx
-            break
-    completion_slice = target_tokens[start_idx:]
-    return [int(token) for token in completion_slice]
+    return [
+        int(token)
+        for token, m in zip(target_tokens, mask, strict=True)
+        if float(m) > 0.0
+    ]
 
 def _student_text_to_teacher_input(*, text: str, tokenizer: Tokenizer) -> tinker.ModelInput:
     teacher_token_ids = tokenizer.encode(
