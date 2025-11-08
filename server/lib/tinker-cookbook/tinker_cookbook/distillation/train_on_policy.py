@@ -181,8 +181,7 @@ async def incorporate_kl_penalty(
 
         if use_gold_alignment:
             teacher_tokenizer = teacher_tokenizers[dataset_indices_D[i]]
-            student_tokens_full = student_sequence_token_ids[i]
-            student_start = student_completion_start_indices[i] if student_completion_start_indices else 0
+            student_tokens = student_sequence_token_ids[i]
             completion_start = teacher_completion_start_offsets[i] if teacher_completion_start_offsets else 0
             if completion_start >= teacher_tensor.shape[0]:
                 logger.warning(
@@ -195,27 +194,17 @@ async def incorporate_kl_penalty(
             if completion_start:
                 teacher_tensor = teacher_tensor[completion_start:]
 
-            if student_start >= len(student_tokens_full):
-                logger.warning(
-                    "GOLD: student completion start %d exceeds token len %d; clamping",
-                    student_start,
-                    len(student_tokens_full),
-                )
-                student_start = len(student_tokens_full)
-            student_tokens = student_tokens_full[student_start:]
-            student_logprobs = sampled_logprobs[student_start:]
-            student_mask = mask_tensor[student_start:]
+            student_logprobs = sampled_logprobs
+            student_mask = mask_tensor
             teacher_completion_ids = _student_completion_to_teacher_tokens(
                 student_completion_texts[i],
                 teacher_tokenizer,
             )
             logger.info(
-                "GOLD: datum=%d trimmed teacher_completion_tokens=%d/%d student_completion_tokens=%d/%d",
+                "GOLD: datum=%d trimmed teacher_completion_tokens=%d/%d",
                 i,
                 int(teacher_tensor.shape[0]),
                 original_teacher_len,
-                len(student_tokens),
-                len(student_tokens_full),
             )
 
             seq_len = min(len(teacher_completion_ids), int(teacher_tensor.shape[0]))
@@ -227,9 +216,7 @@ async def incorporate_kl_penalty(
                 teacher_tensor.shape[0]
             ), "GOLD: teacher token/logprobs lengths diverged after trimming"
             assert len(student_tokens) == student_logprobs.shape[0], (
-                "GOLD: student completion slices must have matching lengths, but got %d and %d",
-                len(student_tokens),
-                student_logprobs.shape[0],
+                f"GOLD: student tokens and logprobs must have matching lengths, but got {len(student_tokens)} and {teacher_logprobs.shape[0]}",
             )
 
             group_reverse_kl_slice, group_mask_slice = _compute_groupwise_reverse_kl(
@@ -510,7 +497,7 @@ async def prepare_minibatch(
         for datum in data_D:
             prompt_ids = list(datum.model_input.to_ints())
             completion_ids = _datum_to_student_completion_ids(datum)
-            student_sequence_token_ids.append(prompt_ids + completion_ids)
+            student_sequence_token_ids.append(completion_ids)
             student_completion_texts.append(
                 tokenizer.decode(
                     completion_ids,
