@@ -227,7 +227,9 @@ async def incorporate_kl_penalty(
                 teacher_tensor.shape[0]
             ), "GOLD: teacher token/logprobs lengths diverged after trimming"
             assert len(student_tokens) == student_logprobs.shape[0], (
-                "GOLD: student completion slices must have matching lengths"
+                "GOLD: student completion slices must have matching lengths, but got %d and %d",
+                len(student_tokens),
+                student_logprobs.shape[0],
             )
 
             group_reverse_kl_slice, group_mask_slice = _compute_groupwise_reverse_kl(
