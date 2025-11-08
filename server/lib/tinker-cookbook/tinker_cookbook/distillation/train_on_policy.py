@@ -228,14 +228,9 @@ async def incorporate_kl_penalty(
                 teacher_tensor,
                 student_mask,
             )
-            if student_start:
-                padded_reverse_kl = torch.zeros_like(sampled_logprobs)
-                padded_mask = torch.zeros_like(mask_tensor)
-                padded_reverse_kl[student_start:] = group_reverse_kl_slice
-                padded_mask[student_start:] = group_mask_slice
-            else:
-                padded_reverse_kl = group_reverse_kl_slice
-                padded_mask = group_mask_slice
+            
+            padded_reverse_kl = group_reverse_kl_slice
+            padded_mask = group_mask_slice
             reverse_kl.append(padded_reverse_kl)
             effective_masks.append(padded_mask)
             continue
