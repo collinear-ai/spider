@@ -85,7 +85,7 @@ async def incorporate_kl_penalty(
     kl_penalty_coef: float,
     kl_discount_factor: float,
     *,
-    student_completion_token_ids: List[List[int]] | None = None,
+    student_sequence_token_ids: List[List[int]] | None = None,
     student_completion_texts: List[str] | None = None,
     student_full_texts: List[str] | None = None,
     student_prompt_texts: List[str] | None = None,
@@ -115,7 +115,7 @@ async def incorporate_kl_penalty(
         if (
             student_full_texts is None
             or student_completion_texts is None
-            or student_completion_token_ids is None
+            or student_sequence_token_ids is None
             or student_prompt_texts is None
             or student_completion_start_indices is None
             or raw_prompt_texts is None
@@ -139,7 +139,7 @@ async def incorporate_kl_penalty(
         full_sequence_inputs_D = [entry[0] for entry in teacher_inputs_and_offsets]
         teacher_completion_start_offsets = [entry[1] for entry in teacher_inputs_and_offsets]
         logger.info(
-            "GOLD: encoded teacher inputs for logprobs"
+            "GOLD: encoded teacher inputs for logprobs with teacher template"
         )
     else:
         full_sequence_inputs_D = [
@@ -170,7 +170,8 @@ async def incorporate_kl_penalty(
 
         if use_gold_alignment:
             teacher_tokenizer = teacher_tokenizers[dataset_indices_D[i]]
-            student_tokens = student_completion_token_ids[i]
+            student_tokens_full = student_sequence_token_ids[i]
+            student_start = student_completion_start_indices[i] if student_completion_start_indices else 0
             completion_start = teacher_completion_start_offsets[i] if teacher_completion_start_offsets else 0
             if completion_start >= teacher_tensor.shape[0]:
                 logger.warning(
@@ -179,17 +180,31 @@ async def incorporate_kl_penalty(
                     int(teacher_tensor.shape[0]),
                 )
                 completion_start = int(teacher_tensor.shape[0])
+            original_teacher_len = int(teacher_tensor.shape[0])
             if completion_start:
                 teacher_tensor = teacher_tensor[completion_start:]
+
+            if student_start >= len(student_tokens_full):
+                logger.warning(
+                    "GOLD: student completion start %d exceeds token len %d; clamping",
+                    student_start,
+                    len(student_tokens_full),
+                )
+                student_start = len(student_tokens_full)
+            student_tokens = student_tokens_full[student_start:]
+            student_logprobs = sampled_logprobs[student_start:]
+            student_mask = mask_tensor[student_start:]
             teacher_completion_ids = _student_completion_to_teacher_tokens(
                 student_completion_texts[i],
                 teacher_tokenizer,
             )
             logger.info(
-                "GOLD: datum=%d student_tokens=%d teacher_tokens=%d",
+                "GOLD: datum=%d trimmed teacher_completion_tokens=%d/%d student_completion_tokens=%d/%d",
                 i,
+                int(teacher_tensor.shape[0]),
+                original_teacher_len,
                 len(student_tokens),
-                len(teacher_completion_ids),
+                len(student_tokens_full),
             )
 
             seq_len = min(len(teacher_completion_ids), int(teacher_tensor.shape[0]))
@@ -197,17 +212,32 @@ async def incorporate_kl_penalty(
                 teacher_completion_ids = teacher_completion_ids[:seq_len]
                 teacher_tensor = teacher_tensor[:seq_len]
 
-            group_reverse_kl, group_mask = _compute_groupwise_reverse_kl(
+            assert len(teacher_completion_ids) == int(
+                teacher_tensor.shape[0]
+            ), "GOLD: teacher token/logprobs lengths diverged after trimming"
+            assert len(student_tokens) == student_logprobs.shape[0], (
+                "GOLD: student completion slices must have matching lengths"
+            )
+
+            group_reverse_kl_slice, group_mask_slice = _compute_groupwise_reverse_kl(
                 student_tokenizer,
                 student_tokens,
-                sampled_logprobs,
+                student_logprobs,
                 teacher_tokenizer,
                 teacher_completion_ids,
                 teacher_tensor,
-                mask_tensor,
+                student_mask,
             )
-            reverse_kl.append(group_reverse_kl)
-            effective_masks.append(group_mask)
+            if student_start:
+                padded_reverse_kl = torch.zeros_like(sampled_logprobs)
+                padded_mask = torch.zeros_like(mask_tensor)
+                padded_reverse_kl[student_start:] = group_reverse_kl_slice
+                padded_mask[student_start:] = group_mask_slice
+            else:
+                padded_reverse_kl = group_reverse_kl_slice
+                padded_mask = group_mask_slice
+            reverse_kl.append(padded_reverse_kl)
+            effective_masks.append(padded_mask)
             continue
 
         reverse_kl.append((sampled_logprobs - teacher_tensor) * mask_tensor)
@@ -295,7 +325,7 @@ def _compute_groupwise_reverse_kl(
         teacher_token_ids,
     )
     logger.info(
-        "GOLD alignment: student_tokens=%d teacher_tokens=%d student_groups=%d teacher_groups=%d",
+        "GOLD alignment (post-trim): student_tokens=%d teacher_tokens=%d student_groups=%d teacher_groups=%d",
         len(student_token_ids),
         len(teacher_token_ids),
         len(student_groups),
@@ -443,7 +473,7 @@ async def prepare_minibatch(
             logger.info(colorize_example(datum, tokenizer, key="mask"))
             printed_datasets.add(dataset_idx)
 
-    student_completion_token_ids = None
+    student_sequence_token_ids = None
     student_completion_texts = None
     student_full_texts = None
     student_prompt_texts = None
@@ -451,7 +481,7 @@ async def prepare_minibatch(
     raw_prompt_texts = None
     teacher_convo_prefixes = None
     if use_gold_alignment:
-        student_completion_token_ids = []
+        student_sequence_token_ids = []
         student_completion_texts = []
         student_full_texts = []
         student_prompt_texts = []
@@ -467,7 +497,7 @@ async def prepare_minibatch(
         for datum in data_D:
             prompt_ids = list(datum.model_input.to_ints())
             completion_ids = _datum_to_student_completion_ids(datum)
-            student_completion_token_ids.append(completion_ids)
+            student_sequence_token_ids.append(prompt_ids + completion_ids)
             student_completion_texts.append(
                 tokenizer.decode(
                     completion_ids,
@@ -514,7 +544,7 @@ async def prepare_minibatch(
                 dataset_indices_D,
                 kl_penalty_coef,
                 kl_discount_factor,
-                student_completion_token_ids=student_completion_token_ids,
+                student_sequence_token_ids=student_sequence_token_ids,
                 student_completion_texts=student_completion_texts,
                 student_full_texts=student_full_texts,
                 student_prompt_texts=student_prompt_texts,
