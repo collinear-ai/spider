@@ -161,19 +161,26 @@ class PromptOnlyDataset(RLDataset):
         batch_start = index * self.batch_size
         batch_end = min((index + 1) * self.batch_size, len(self.prompts))
         assert batch_start < batch_end, "Incorrect batch size"
-        return [
-            ProblemGroupBuilder(
-                env_thunk=partial(
-                    PromptOnlyEnv,
-                    self._truncate_prompt(prompt),
-                    self.renderer,
-                    convo_prefix=self.convo_prefix,
-                ),
-                num_envs=self.group_size,
-                dataset_name=self.dataset_name,
+        builders = []
+        for prompt in self.prompts[batch_start:batch_end]:
+            truncated_prompt = self._truncate_prompt(prompt)
+            builders.append(
+                ProblemGroupBuilder(
+                    env_thunk=partial(
+                        PromptOnlyEnv,
+                        truncated_prompt,
+                        self.renderer,
+                        convo_prefix=self.convo_prefix,
+                    ),
+                    num_envs=self.group_size,
+                    dataset_name=self.dataset_name,
+                    metadata={
+                        "prompt": truncated_prompt,
+                        "convo_prefix": self.convo_prefix,
+                    }
+                )
             )
-            for prompt in self.prompts[batch_start:batch_end]
-        ]
+        return builders
 
     def __len__(self) -> int:
         return math.ceil(len(self.prompts) / self.batch_size)

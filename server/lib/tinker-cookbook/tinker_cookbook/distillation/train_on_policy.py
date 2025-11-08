@@ -12,7 +12,7 @@ from typing import Any, List, Literal, Sequence, Dict, cast
 import chz
 import tinker
 import torch
-from tinker_cookbook import checkpoint_utils
+from tinker_cookbook import checkpoint_utils, model_info, renderers
 from tinker_cookbook.display import colorize_example
 from tinker_cookbook.eval.evaluators import SamplingClientEvaluator, SamplingClientEvaluatorBuilder
 from tinker_cookbook.rl.data_processing import (
@@ -46,6 +46,36 @@ from tinker_cookbook.rl.train import (
 
 logger = logging.getLogger(__name__)
 
+def _get_or_create_teacher_tokenizer(
+    cache: dict[str, Tokenizer],
+    *,
+    model_name: str,
+) -> Tokenizer:
+    if model_name not in cache:
+        cache[model_name] = get_tokenizer(model_name)
+    return cache[model_name]
+
+def _teacher_input_and_completion_start(
+    *,
+    raw_prompt_text: str,
+    student_completion_text: str,
+    convo_prefix: list[renderers.Message] | None,
+    teacher_renderer: renderers.Renderer,
+    teacher_tokenizer: Tokenizer,
+) -> tuple[tinker.ModelInput, int]:
+    messages = list(convo_prefix or []) + [
+        {"role": "user", "content": raw_prompt_text},
+    ]
+    prompt_input = teacher_renderer.build_generation_prompt(messages)
+    prompt_tokens = list(prompt_input.to_ints())
+    completion_tokens = teacher_tokenizer.encode(
+        student_completion_text,
+        add_special_tokens=False,
+    )
+    return (
+        tinker.ModelInput.from_ints(tokens=prompt_tokens + completion_tokens),
+        len(prompt_tokens),
+    )
 
 @scope
 async def incorporate_kl_penalty(
@@ -58,8 +88,13 @@ async def incorporate_kl_penalty(
     student_completion_token_ids: List[List[int]] | None = None,
     student_completion_texts: List[str] | None = None,
     student_full_texts: List[str] | None = None,
+    student_prompt_texts: List[str] | None = None,
+    student_completion_start_indices: List[int] | None = None,
+    raw_prompt_texts: List[str] | None = None,
+    teacher_convo_prefixes: List[list[renderers.Message]] | None = None,
     student_tokenizer: Tokenizer | None = None,
     teacher_tokenizers: List[Tokenizer] | None = None,
+    teacher_renderers: List[renderers.Renderer] | None = None,
     use_gold_alignment: bool = False,
 ) -> Dict[str, float]:
     """
@@ -75,23 +110,34 @@ async def incorporate_kl_penalty(
     """
     # Note: if your teacher has a different renderer than the student, you may want to modify
     #       the full_sequence_inputs_D to match the teacher's renderer.
+    teacher_completion_start_offsets = None
     if use_gold_alignment:
         if (
             student_full_texts is None
             or student_completion_texts is None
             or student_completion_token_ids is None
+            or student_prompt_texts is None
+            or student_completion_start_indices is None
+            or raw_prompt_texts is None
+            or teacher_convo_prefixes is None
             or student_tokenizer is None
             or teacher_tokenizers is None
+            or teacher_renderers is None
         ):
             raise ValueError("[tinker-cookbook.distillation.train_on_policy] GOLD alignment requires reconstructed student text and teacher tokenizers")
 
-        full_sequence_inputs_D = [
-            _student_text_to_teacher_input(
-                text=student_full_texts[i],
-                tokenizer=teacher_tokenizers[dataset_indices_D[i]]
+        teacher_inputs_and_offsets = [
+            _teacher_input_and_completion_start(
+                raw_prompt_text=raw_prompt_texts[i],
+                student_completion_text=student_completion_texts[i],
+                convo_prefix=teacher_convo_prefixes[i],
+                teacher_renderer=teacher_renderers[dataset_indices_D[i]],
+                teacher_tokenizer=teacher_tokenizers[dataset_indices_D[i]],
             )
             for i in range(len(data_D))
         ]
+        full_sequence_inputs_D = [entry[0] for entry in teacher_inputs_and_offsets]
+        teacher_completion_start_offsets = [entry[1] for entry in teacher_inputs_and_offsets]
         logger.info(
             "GOLD: encoded teacher inputs for logprobs"
         )
@@ -125,6 +171,16 @@ async def incorporate_kl_penalty(
         if use_gold_alignment:
             teacher_tokenizer = teacher_tokenizers[dataset_indices_D[i]]
             student_tokens = student_completion_token_ids[i]
+            completion_start = teacher_completion_start_offsets[i] if teacher_completion_start_offsets else 0
+            if completion_start >= teacher_tensor.shape[0]:
+                logger.warning(
+                    "GOLD: teacher completion start %d exceeds teacher tensor len %d; skipping trim",
+                    completion_start,
+                    int(teacher_tensor.shape[0]),
+                )
+                completion_start = int(teacher_tensor.shape[0])
+            if completion_start:
+                teacher_tensor = teacher_tensor[completion_start:]
             teacher_completion_ids = _student_completion_to_teacher_tokens(
                 student_completion_texts[i],
                 teacher_tokenizer,
@@ -364,6 +420,7 @@ async def prepare_minibatch(
     kl_discount_factor: float,
     *,
     teacher_tokenizers: List[Tokenizer] | None = None,
+    teacher_renderers: List[renderers.Renderer] | None = None,
     use_gold_alignment: bool = False,
 ) -> tuple[list[tinker.Datum], dict[str, Any]]:
     """Converts the trajectories into a minibatch, and provides metrics about the minibatch"""
@@ -389,11 +446,26 @@ async def prepare_minibatch(
     student_completion_token_ids = None
     student_completion_texts = None
     student_full_texts = None
+    student_prompt_texts = None
+    student_completion_start_indices = None
+    raw_prompt_texts = None
+    teacher_convo_prefixes = None
     if use_gold_alignment:
         student_completion_token_ids = []
         student_completion_texts = []
         student_full_texts = []
+        student_prompt_texts = []
+        student_completion_start_indices = []
+        raw_prompt_texts = []
+        teacher_convo_prefixes = []
+        group_prompts = []
+        group_convo_prefixes = []
+        for env_group_builder in env_group_builders_P:
+            metadata = getattr(env_group_builder, "metadata", None) or {}
+            group_prompts.append(metadata.get("prompt"))
+            group_convo_prefixes.append(metadata.get("convo_prefix"))
         for datum in data_D:
+            prompt_ids = list(datum.model_input.to_ints())
             completion_ids = _datum_to_student_completion_ids(datum)
             student_completion_token_ids.append(completion_ids)
             student_completion_texts.append(
@@ -402,13 +474,22 @@ async def prepare_minibatch(
                     skip_special_tokens=False,
                 )
             )
-            full_ids = list(datum.model_input.to_ints()) + completion_ids
-            student_full_texts.append(
-                tokenizer.decode(
-                    full_ids,
-                    skip_special_tokens=False,
-                )
+            student_prompt_texts.append(
+                tokenizer.decode(prompt_ids, skip_special_tokens=False)
             )
+            student_completion_start_indices.append(len(prompt_ids))
+            full_ids = prompt_ids + completion_ids
+            student_full_texts.append(
+                tokenizer.decode(full_ids, skip_special_tokens=False)
+            )
+        for metadata in metadata_D:
+            group_idx = metadata["group_idx"]
+            raw_prompt = group_prompts[group_idx]
+            if raw_prompt is None:
+                raise ValueError("GOLD alignment requires prompt metadata per group")
+            raw_prompt_texts.append(raw_prompt)
+            teacher_convo_prefixes.append(group_convo_prefixes[group_idx])
+            
         logger.info(
             "GOLD: reconstructed student text (prompts=%d)",
             len(student_full_texts)
@@ -436,8 +517,13 @@ async def prepare_minibatch(
                 student_completion_token_ids=student_completion_token_ids,
                 student_completion_texts=student_completion_texts,
                 student_full_texts=student_full_texts,
+                student_prompt_texts=student_prompt_texts,
+                student_completion_start_indices=student_completion_start_indices,
+                raw_prompt_texts=raw_prompt_texts,
+                teacher_convo_prefixes=teacher_convo_prefixes,
                 student_tokenizer=tokenizer,
                 teacher_tokenizers=teacher_tokenizers,
+                teacher_renderers=teacher_renderers,
                 use_gold_alignment=use_gold_alignment,
             )
         metrics.update(kl_penalty_metrics)
@@ -457,6 +543,7 @@ async def do_train_step_and_get_sampling_client(
     dataset_indices_P: List[int],
     teacher_clients: List[tinker.SamplingClient],
     teacher_tokenizers: List[Tokenizer],
+    teacher_renderers: List[renderers.Renderer],
 ) -> tuple[tinker.SamplingClient, dict[str, Any]]:
     context = get_scope_context()
     context.attributes["step"] = i_batch
@@ -471,6 +558,7 @@ async def do_train_step_and_get_sampling_client(
         kl_penalty_coef=cfg.kl_penalty_coef,
         kl_discount_factor=cfg.kl_discount_factor,
         teacher_tokenizers=teacher_tokenizers,
+        teacher_renderers=teacher_renderers,
         use_gold_alignment=cfg.use_gold_alignment,
     )
     metrics.update(prepare_minibatch_metrics)
@@ -511,6 +599,7 @@ async def do_sync_training(
     dataset: CompositeDataset,
     teacher_clients: List[tinker.SamplingClient],
     teacher_tokenizers: List[Tokenizer],
+    teacher_renderers: List[renderers.Renderer],
     ml_logger: ml_log.Logger,
     tokenizer: Tokenizer,
 ):
@@ -631,6 +720,8 @@ async def main(
     datasets = []
     teacher_clients = []
     teacher_tokenizers = []
+    teacher_renderers = []
+    teacher_tokenizer_cache = {}
     groups_per_batch_list = []
     evaluators = [evaluator() for evaluator in cfg.evaluator_builders]
 
@@ -654,7 +745,16 @@ async def main(
                 model_path=teacher_config.load_checkpoint_path,
             )
         teacher_clients.append(teacher_client)
-        teacher_tokenizers.append(get_tokenizer(teacher_config.base_model))
+        teacher_tokenizer =_get_or_create_teacher_tokenizer(
+            teacher_tokenizer_cache,
+            model_name=teacher_config.base_model,
+        )
+        teacher_tokenizers.append(teacher_tokenizer)
+        renderer_name = model_info.get_recommended_renderer_name(teacher_config.base_model)
+        teacher_renderers.append(
+            renderers.get_renderer(renderer_name, tokenizer=teacher_tokenizer)
+        )
+
         logger.info(
             f"Created teacher sampling client for {teacher_config.base_model} "
             f"(checkpoint: {teacher_config.load_checkpoint_path})"
@@ -677,6 +777,7 @@ async def main(
         dataset=composite_dataset,
         teacher_clients=teacher_clients,
         teacher_tokenizers=teacher_tokenizers,
+        teacher_renderers=teacher_renderers,
         ml_logger=ml_logger,
         tokenizer=tokenizer,
     )

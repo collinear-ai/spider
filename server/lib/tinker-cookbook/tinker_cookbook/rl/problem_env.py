@@ -1,7 +1,7 @@
 import logging
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Callable, Sequence, Any
 
 import tinker
 from tinker_cookbook import renderers
@@ -89,6 +89,7 @@ class ProblemGroupBuilder(EnvGroupBuilder):
     env_thunk: Callable[[], ProblemEnv]
     num_envs: int
     dataset_name: str = "problems"
+    metadata: dict[str, Any] | None = None
 
     async def make_envs(self) -> Sequence[Env]:
         return [self.env_thunk() for _ in range(self.num_envs)]
