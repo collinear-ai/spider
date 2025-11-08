@@ -96,11 +96,8 @@ async def incorporate_kl_penalty(
     kl_penalty_coef: float,
     kl_discount_factor: float,
     *,
-    student_sequence_token_ids: List[List[int]] | None = None,
+    student_completion_token_ids: List[List[int]] | None = None,
     student_completion_texts: List[str] | None = None,
-    student_full_texts: List[str] | None = None,
-    student_prompt_texts: List[str] | None = None,
-    student_completion_start_indices: List[int] | None = None,
     raw_prompt_texts: List[str] | None = None,
     teacher_convo_prefixes: List[list[renderers.Message]] | None = None,
     student_tokenizer: Tokenizer | None = None,
@@ -124,11 +121,8 @@ async def incorporate_kl_penalty(
     teacher_completion_start_offsets = None
     if use_gold_alignment:
         if (
-            student_full_texts is None
+            student_completion_token_ids is None
             or student_completion_texts is None
-            or student_sequence_token_ids is None
-            or student_prompt_texts is None
-            or student_completion_start_indices is None
             or raw_prompt_texts is None
             or teacher_convo_prefixes is None
             or student_tokenizer is None
@@ -181,7 +175,7 @@ async def incorporate_kl_penalty(
 
         if use_gold_alignment:
             teacher_tokenizer = teacher_tokenizers[dataset_indices_D[i]]
-            student_tokens = student_sequence_token_ids[i]
+            student_tokens = student_completion_token_ids[i]
             completion_start = teacher_completion_start_offsets[i] if teacher_completion_start_offsets else 0
             if completion_start >= teacher_tensor.shape[0]:
                 logger.warning(
@@ -277,7 +271,14 @@ async def incorporate_kl_penalty(
 
 def _datum_to_student_completion_ids(datum: tinker.Datum) -> List[int]:
     target_tokens = datum.loss_fn_inputs["target_tokens"].to_torch().tolist()
-    return [int(token) for token in target_tokens]
+    mask = datum.loss_fn_inputs["mask"].to_torch().tolist()
+    start_idx = 0
+    for idx, value in enumerate(mask):
+        if float(value) > 0:
+            start_idx = idx
+            break
+    completion_slice = target_tokens[start_idx:]
+    return [int(token) for token in completion_slice]
 
 def _student_text_to_teacher_input(*, text: str, tokenizer: Tokenizer) -> tinker.ModelInput:
     teacher_token_ids = tokenizer.encode(
@@ -468,19 +469,13 @@ async def prepare_minibatch(
             logger.info(colorize_example(datum, tokenizer, key="mask"))
             printed_datasets.add(dataset_idx)
 
-    student_sequence_token_ids = None
+    student_completion_token_ids = None
     student_completion_texts = None
-    student_full_texts = None
-    student_prompt_texts = None
-    student_completion_start_indices = None
     raw_prompt_texts = None
     teacher_convo_prefixes = None
     if use_gold_alignment:
-        student_sequence_token_ids = []
+        student_completion_token_ids = []
         student_completion_texts = []
-        student_full_texts = []
-        student_prompt_texts = []
-        student_completion_start_indices = []
         raw_prompt_texts = []
         teacher_convo_prefixes = []
         group_prompts = []
@@ -490,23 +485,15 @@ async def prepare_minibatch(
             group_prompts.append(metadata.get("prompt"))
             group_convo_prefixes.append(metadata.get("convo_prefix"))
         for datum in data_D:
-            prompt_ids = list(datum.model_input.to_ints())
             completion_ids = _datum_to_student_completion_ids(datum)
-            student_sequence_token_ids.append(completion_ids)
+            student_completion_token_ids.append(completion_ids)
             student_completion_texts.append(
                 tokenizer.decode(
                     completion_ids,
                     skip_special_tokens=False,
                 )
             )
-            student_prompt_texts.append(
-                tokenizer.decode(prompt_ids, skip_special_tokens=False)
-            )
-            student_completion_start_indices.append(len(prompt_ids))
-            full_ids = prompt_ids + completion_ids
-            student_full_texts.append(
-                tokenizer.decode(full_ids, skip_special_tokens=False)
-            )
+
         for metadata in metadata_D:
             group_idx = metadata["group_idx"]
             raw_prompt = group_prompts[group_idx]
@@ -516,8 +503,8 @@ async def prepare_minibatch(
             teacher_convo_prefixes.append(group_convo_prefixes[group_idx])
             
         logger.info(
-            "GOLD: reconstructed student text (prompts=%d)",
-            len(student_full_texts)
+            "GOLD: prepare GOLD student completion metadata for %d datums",
+            len(student_completion_texts)
         )
 
     # Incorporate KL penalty if configured
@@ -539,11 +526,8 @@ async def prepare_minibatch(
                 dataset_indices_D,
                 kl_penalty_coef,
                 kl_discount_factor,
-                student_sequence_token_ids=student_sequence_token_ids,
+                student_completion_token_ids=student_completion_token_ids,
                 student_completion_texts=student_completion_texts,
-                student_full_texts=student_full_texts,
-                student_prompt_texts=student_prompt_texts,
-                student_completion_start_indices=student_completion_start_indices,
                 raw_prompt_texts=raw_prompt_texts,
                 teacher_convo_prefixes=teacher_convo_prefixes,
                 student_tokenizer=tokenizer,
