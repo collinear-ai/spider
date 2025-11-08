@@ -701,6 +701,7 @@ async def do_sync_training(
             dataset_indices_P,
             teacher_clients,
             teacher_tokenizers,
+            teacher_renderers,
         )
 
         # Log metrics
