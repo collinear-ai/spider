@@ -72,6 +72,17 @@ def _teacher_input_and_completion_start(
         student_completion_text,
         add_special_tokens=False,
     )
+
+    prompt_snippet = teacher_tokenizer.decode(
+        prompt_tokens[: min(len(prompt_tokens), 20)],
+        skip_special_tokens=False,
+    )
+    completion_snippet = student_completion_text[:40].replace("\n", " ")
+    logger.info(
+        "GOLD: teacher_prompt_prefix='%s...' student_completion_prefix='%s...'",
+        prompt_snippet,
+        completion_snippet,
+    )
     return (
         tinker.ModelInput.from_ints(tokens=prompt_tokens + completion_tokens),
         len(prompt_tokens),
