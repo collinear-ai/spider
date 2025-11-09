@@ -329,7 +329,25 @@ def _compute_groupwise_reverse_kl(
     reverse_kl = torch.zeros_like(student_logprobs)
     mask = torch.zeros_like(base_mask)
 
-    for s_group, t_group in zip(student_groups, teacher_groups):
+    for i, (s_group, t_group) in enumerate(zip(student_groups, teacher_groups)):
+        if i < 5:
+            student_slice = student_tokenizer.decode(
+                [student_token_ids[j] for j in s_group],
+                skip_special_tokens=False,
+            )
+            teacher_slice = teacher_tokenizer.decode(
+                [teacher_token_ids[j] for j in t_group],
+                skip_special_tokens=False,
+            )
+            logger.info(
+                "GOLD group %d: student_tokens=%d teacher_tokens=%d student_text='%s', teacher_text='%s'",
+                i,
+                len(s_group),
+                len(t_group),
+                student_slice,
+                teacher_slice,
+            )
+
         teacher_indices = [idx for idx in t_group if idx < len(teacher_logprobs)]
         student_indices = [idx for idx in s_group if idx < len(student_logprobs) and base_mask[idx] > 0]
         if not teacher_indices or not student_indices:
