@@ -188,8 +188,9 @@ async def incorporate_kl_penalty(
             if completion_start:
                 teacher_tensor = teacher_tensor[completion_start:]
 
-            student_logprobs = sampled_logprobs[mask_tensor > 0]
-            student_mask = mask_tensor[mask_tensor > 0]
+            completion_mask = mask_tensor > 0
+            student_logprobs = sampled_logprobs[completion_mask]
+            student_mask = mask_tensor[completion_mask]
             teacher_completion_ids = _student_completion_to_teacher_tokens(
                 student_completion_texts[i],
                 teacher_tokenizer,
@@ -223,8 +224,10 @@ async def incorporate_kl_penalty(
                 student_mask,
             )
             
-            padded_reverse_kl = group_reverse_kl_slice
-            padded_mask = group_mask_slice
+            padded_reverse_kl = torch.zeros_like(sampled_logprobs)
+            padded_mask = torch.zeros_like(mask_tensor)
+            padded_reverse_kl[completion_mask] = group_reverse_kl_slice
+            padded_mask[completion_mask] = group_mask_slice
             reverse_kl.append(padded_reverse_kl)
             effective_masks.append(padded_mask)
             continue
@@ -235,6 +238,8 @@ async def incorporate_kl_penalty(
     # Track per-dataset KL for logging
     # dataset_idx -> (sum of KL, sum of mask)
     per_dataset_kl: Dict[int, tuple[float, float]] = {}
+
+    logger.info("Computing KL advantages for %d datums", len(data_D))
 
     for i, datum in enumerate(data_D):
         # The advantage is the negative reverse KL. We can optionally apply a discount factor.
@@ -255,6 +260,8 @@ async def incorporate_kl_penalty(
             per_dataset_kl[dataset_idx] = (0.0, 0.0)
         prev_kl_sum, prev_mask_sum = per_dataset_kl[dataset_idx]
         per_dataset_kl[dataset_idx] = (prev_kl_sum + kl_sum, prev_mask_sum + mask_sum)
+
+    logger.info("Computing average reverse KL over the batch.")
 
     # Compute average reverse KL over the batch for logging purposes
     avg_logp_diff = sum([diff.sum() for diff in reverse_kl]) / sum(
@@ -277,13 +284,6 @@ def _datum_to_student_completion_ids(datum: tinker.Datum) -> List[int]:
         for token, m in zip(target_tokens, mask, strict=True)
         if float(m) > 0.0
     ]
-
-def _student_text_to_teacher_input(*, text: str, tokenizer: Tokenizer) -> tinker.ModelInput:
-    teacher_token_ids = tokenizer.encode(
-        text,
-        add_special_tokens=False,
-    )
-    return tinker.ModelInput.from_ints(tokens=teacher_token_ids)
 
 def _student_completion_to_teacher_tokens(text: str, tokenizer: Tokenizer) -> List[int]:
     return tokenizer.encode(
