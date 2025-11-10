@@ -63,7 +63,7 @@ async def _fetch_teacher_logprobs(
     teacher_input: tinker.ModelInput,
 ) -> torch.Tensor:
     raw = await client.compute_logprobs_async(teacher_input)
-    return torch.tensor(raw, dtype=torch.float32)
+    return torch.tensor(raw[1:], dtype=torch.float32) # skip bos
 
 async def _run_probe(args: argparse.Namespace) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
