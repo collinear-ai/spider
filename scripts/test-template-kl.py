@@ -119,6 +119,24 @@ async def _run_probe(args: argparse.Namespace) -> None:
     teacher_completion_ids = _student_completion_to_teacher_tokens(
         example.completion, teacher_tokenizer,
     )
+
+    teacher_tokens_correct = list(teacher_input_correct.to_ints())
+    teacher_tokens_reused = list(teacher_input_reused.to_ints())
+    completion_text_correct = teacher_tokenizer.decode(
+        teacher_tokens_correct[
+            completion_start: completion_start + len(teacher_completion_ids)
+        ],
+        skip_special_tokens=False,
+    )
+    completion_text_reused = teacher_tokenizer.decode(
+        teacher_tokens_reused[
+            completion_start_reused: completion_start_reused + len(teacher_completion_ids)
+        ],
+        skip_special_tokens=False,
+    )
+    logger.info("Teacher completion text (correct): %r", completion_text_correct)
+    logger.info("Teacher completion text (reused): %r", completion_text_reused)
+    
     trim_correct = teacher_logprobs_correct[
         completion_start: completion_start + len(teacher_completion_ids)
     ]
