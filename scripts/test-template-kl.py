@@ -93,6 +93,7 @@ async def _run_probe(args: argparse.Namespace) -> None:
         base_model=args.teacher_model,
     )
 
+    # get correct logprobs
     teacher_input_correct, completion_start = _teacher_input_and_completion_start(
         raw_prompt_text=example.prompt,
         student_completion_text=example.completion,
@@ -104,6 +105,7 @@ async def _run_probe(args: argparse.Namespace) -> None:
         teacher_client, teacher_input_correct,
     )
 
+    # get reused logprobs
     student_sequence_text = student_renderer.tokenizer.decode(
         datum.model_input.to_ints(),
         skip_special_tokens=False,
@@ -120,8 +122,21 @@ async def _run_probe(args: argparse.Namespace) -> None:
         example.completion, teacher_tokenizer,
     )
 
+    # log text
     teacher_tokens_correct = list(teacher_input_correct.to_ints())
     teacher_tokens_reused = list(teacher_input_reused.to_ints())
+
+    prompt_header_correct = teacher_tokenizer.decode(
+        teacher_tokens_correct[:min(completion_start, 10)],
+        skip_special_tokens=False,
+    )
+    prompt_header_reused = teacher_tokenizer.decode(
+        teacher_tokens_reused[:min(completion_start_reused, 10)],
+        skip_special_tokens=False,
+    )
+    logger.info("Teacher prompt header (correct): %r", prompt_header_correct)
+    logger.info("Teacher prompt header (reused): %r", prompt_header_reused)
+    
     completion_text_correct = teacher_tokenizer.decode(
         teacher_tokens_correct[
             completion_start: completion_start + len(teacher_completion_ids)
@@ -136,7 +151,8 @@ async def _run_probe(args: argparse.Namespace) -> None:
     )
     logger.info("Teacher completion text (correct): %r", completion_text_correct)
     logger.info("Teacher completion text (reused): %r", completion_text_reused)
-    
+
+    # align logprobs
     trim_correct = teacher_logprobs_correct[
         completion_start: completion_start + len(teacher_completion_ids)
     ]
@@ -144,6 +160,7 @@ async def _run_probe(args: argparse.Namespace) -> None:
         completion_start_reused: completion_start_reused + len(teacher_completion_ids)
     ]
     
+    # compute KL
     per_token_delta = trim_correct - trim_reused
     total_kl = float(per_token_delta.sum())
     avg_kl = float(per_token_delta.mean())
