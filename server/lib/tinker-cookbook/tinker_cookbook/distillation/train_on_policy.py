@@ -79,7 +79,7 @@ def _teacher_input_and_completion_start(
     )
     completion_snippet = student_completion_text[:40].replace("\n", " ")
     logger.info(
-        "GOLD: teacher_prompt_prefix='%s...' student_completion_prefix='%s...'",
+        "GOLD: \nteacher_prompt_prefix='%s...' \nstudent_completion_prefix='%s...'",
         prompt_snippet,
         completion_snippet,
     )
