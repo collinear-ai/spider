@@ -124,6 +124,7 @@ async def _run_probe(args: argparse.Namespace) -> None:
 
     total_delta = 0.0
     total_tokens = 0
+    per_prompt_extremes = []
     for idx, example in enumerate(examples):
         logger.info("==== Prompt %d ====", idx)
 
@@ -217,6 +218,31 @@ async def _run_probe(args: argparse.Namespace) -> None:
         total_delta += prompt_delta
         total_tokens += per_token_delta.numel()
 
+        most_agree = None
+        most_disagree = None
+        for tok_idx, delta_val in enumerate(per_token_delta.tolist()):
+            start = max(0, tok_idx - 8)
+            if most_agree is None or abs(delta_val) < abs(most_agree[0]):
+                most_agree = (
+                    delta_val,
+                    teacher_tokenizer.decode(
+                        teacher_completion_ids[start : tok_idx + 1],
+                        skip_special_tokens=False,
+                    )
+                )
+            if most_disagree is None or delta_val < most_disagree[0]:
+                most_disagree = (
+                    delta_val,
+                    teacher_tokenizer.decode(
+                        teacher_completion_ids[start : tok_idx + 1],
+                        skip_special_tokens=False,
+                    )
+                )
+        if most_agree:
+            per_prompt_extremes.append((idx, "agree", most_agree[0], most_agree[1]))
+        if most_disagree:
+            per_prompt_extremes.append((idx, "disagree", most_disagree[0], most_disagree[1]))
+
         logger.info(
             "Prompt %d: compared %d completion tokens, sum delta %.6f, avg delta %.6f",
             idx,
@@ -237,6 +263,33 @@ async def _run_probe(args: argparse.Namespace) -> None:
         "Mean per-token delta across prompts = %.6f",
         total_delta / total_tokens,
     )
+
+    if per_prompt_extremes:
+        agreeing = sorted(
+            [entry for entry in per_prompt_extremes if entry[1] == "agree"],
+            key=lambda x: x[2],
+            reverse=True,
+        )[:5]
+        disagreeing = sorted(
+            [entry for entry in per_prompt_extremes if entry[1] == "disagree"],
+            key=lambda x: x[2],
+        )[:5]
+        logger.info("Tokens least sensitive to template:")
+        for prompt_idx, _, delta_val, ctx_text in agreeing:
+            logger.info(
+                "  prompt %d delta=%.6f context=%r",
+                prompt_idx,
+                delta_val,
+                ctx_text,
+            )
+        logger.info("Tokens most favoring reused template:")
+        for prompt_idx, _, delta_val, ctx_text in disagreeing:
+            logger.info(
+                "  prompt %d delta=%.6f context=%r",
+                prompt_idx,
+                delta_val,
+                ctx_text,
+            )
 
 def main():
     parser = argparse.ArgumentParser()
