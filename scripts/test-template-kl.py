@@ -22,6 +22,10 @@ PROMPTS = [
     "Describe why deciduous leaves change color in the fall.",
     "How does a total solar eclipse occur?",
     "Explain how a sailboat can move against the wind.",
+    "Why does bread dough rise when yeast is added?",
+    "How do vaccines train the immune system?",
+    "Explain how a refrigerator removes heat from food.",
+    "Why does a magnet attract metal objects?",
 ]
 SYSTEM_PROMPT = None
 DEFAULT_MAX_STUDENT_TOKENS = 128
@@ -116,7 +120,6 @@ async def _run_probe(args: argparse.Namespace) -> None:
             SYSTEM_PROMPT,
             sampling_params,
         )
-        logger.info("Student completion for prompt %r: %s", prompt, completion)
         examples.append(Example(prompt=prompt, completion=completion, system=SYSTEM_PROMPT))
 
     total_delta = 0.0
