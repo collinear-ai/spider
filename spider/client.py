@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional, Union, Callable, List, Tuple, Iterable
 import httpx, time, inspect, textwrap, sys, json
 
 from .config import AppConfig
+from .processor_bundle import bundle_processor_source, ProcessorBundlingError
 
 class SpiderClient:
     def __init__(
@@ -217,10 +218,9 @@ class SpiderClient:
         if not name:
             raise ValueError("Processor callable must have a __name__ attribute")
         try:
-            source = inspect.getsource(self._processor)
-        except (OSError, TypeError) as exc:
-            raise ValueError("Unable to retrieve source for processor callable") from exc
-        source = textwrap.dedent(source)
+            source = bundle_processor_source(self._processor)
+        except ProcessorBundlingError as exc:
+            raise ValueError(str(exc)) from exc
         return {
             "name": name,
             "source": source,
