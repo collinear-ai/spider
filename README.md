@@ -2,7 +2,9 @@
 
 Lightweight on/off-policy distillation framework with a single client interface.
 
-If `on_policy: false`, a complete pipeline for generating distillation data will be set up. If `on_policy: true`, a complete pipeline for online training job will be set up.
+If `on_policy: false`, a complete pipeline for generating distillation data will be set up. 
+
+If `on_policy: true`, a complete pipeline for online training job will be set up, with cross-tokenizer teacher support.
 
 `spider` takes care the whole workflow from dataset preparation, rollouts, kl supervision (on-policy only), and data post-processing in a few lines of code.
 
@@ -25,16 +27,22 @@ The following snippet showcases a complete job cycle for a distillation job.
 from spider.client import SpiderClient
 from spider.config import AppConfig
 
-def filter_rows(records): # define custom data filtering logic
-  return records
+def post_process_row(row): # define custom data filtering logic
+  """
+  Per-row filtering function after a rollout is generated.
+  Can reference arbitrary helpers defined in the same script
+  """
+  return row # or None, if unwanted
 
 config = AppConfig.load("config/test-remote-processor.yaml") # define rollout hyperparams
 
-with SpiderClient(config=config, processor=filter_rows) as client:
+with SpiderClient(config=config, processor=post_process_row) as client:
     submission = client.submit_job()
     job_id = submission["job_id"]
 
+    # pool_job streams the distillation process back to client
     status = client.poll_job(job_id, interval=5.0, timeout=600, wait_for_completion=True)
+    
     if status["status"] == "completed":
         client.download_result(job_id, destionation="./artifacts/result.json") # return full data with metadata, optionally upload to HF
 ```
