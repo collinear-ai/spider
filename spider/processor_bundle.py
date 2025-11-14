@@ -5,6 +5,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Mapping, Optional, Set, Tuple
+from collections import OrderedDict
 
 __all__ = ["bundle_processor_source", "ProcessorBundlingError"]
 
@@ -151,7 +152,14 @@ def bundle_processor_source(func: Callable) -> str:
     return bundled + ("\n" if bundled else "")
 
 def _render_block(statements: Iterable[_Statement], *, separator: str = "\n") -> str:
-    snippets = [stmt.source for stmt in sorted(statements, key=lambda item: item.lineno)]
+    snippets = []
+    seen = set()
+    for stmt in sorted(statements, key=lambda item: item.lineno):
+        key = (stmt.lineno, stmt.source)
+        if key in seen:
+            continue
+        seen.add(key)
+        snippets.append(stmt.source)
     return separator.join(snippets).strip()
 
 def _statement_source(source: str, node: ast.AST) -> str:
