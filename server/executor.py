@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json, os, logging
+import json, os, logging, inspect
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -187,7 +187,7 @@ def _pair_records(prompts: Iterable[str], generations: Iterable[str]) -> List[Di
         paired.append({"prompt": prompt, "completion": completion})
     return paired
 
-def _resolve_processor(spec: Optional[ProcessorConfig]) -> Optional[Callable[[Iterable[Dict[str, Any]]], Iterable[Dict[str, Any]]]]:
+def _resolve_processor(spec: Optional[ProcessorConfig]) -> Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]]:
     if spec is None:
         return None
     exec_ns = {}
@@ -210,9 +210,16 @@ def _process_batch(
     prompts: Iterable[str], generations: Iterable[str], 
     processor: Callable[[Iterable[Dict[str, Any]]], Iterable[Dict[str, Any]]]
 ) -> List[Dict[str, Any]]:
-    records = _pair_records(prompts, generations)
-    processed = processor(records)
-    return list(processed)
+    processed = []
+    for prompt, completion in zip(prompts, generations):
+        record = {"prompt": prompt, "completion": completion}
+        result = processor(record)
+        if result is None:
+            continue
+        if not isinstance(result, dict):
+            raise JobExecutionError(f"Processor must return a dict or None per record")
+        processed.append(result)
+    return processed
 
 def _drain_ready_batches(
     pending: Dict[int, Tuple[Future[List[Dict[str, Any]]], Dict[str, Any]]],
