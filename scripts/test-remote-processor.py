@@ -4,30 +4,26 @@ from typing import Iterable, Dict, Any, List
 from spider.client import SpiderClient
 from spider.config import AppConfig
 
+LANG_MARKER = "```python"
+
+def _extract_code_block(text):
+    lower_text = text.lower()
+    start_marker = lower_text.rfind(LANG_MARKER)
+    if start_marker == -1:
+        return None
+    code_start = start_marker + len(LANG_MARKER)
+    closing_marker = text.find("```", code_start)
+    if closing_marker == -1:
+        return None
+    snippet = text[code_start:closing_marker].lstrip("\r\n").rstrip()
+    try:
+        ast.parse(snippet)
+    except SyntaxError:
+        return None
+    return snippet
+
 def filter_rows(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    filtered = []
-    for record in records:
-        updated = dict(record)
-        value = updated.get("completion")
-        if not isinstance(value, str):
-            continue
-        lower_value = value.lower()
-        start_marker = lower_value.rfind("```python")
-        if start_marker == -1:
-            continue
-        code_start = start_marker + len("```python")
-        closing_marker = value.find("```", code_start)
-        if closing_marker == -1:
-            continue
-        code = value[code_start:closing_marker].lstrip("\r\n").rstrip()
-        try:
-            ast.parse(code)
-        except SyntaxError:
-            continue
-        updated["completion"] = value
-        updated["code"] = code
-        filtered.append(updated)
-    return filtered
+    pass
 
 def main() -> None:
     config = AppConfig.load("config/test-remote-processor.yaml")

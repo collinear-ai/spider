@@ -188,28 +188,16 @@ def _pair_records(prompts: Iterable[str], generations: Iterable[str]) -> List[Di
     return paired
 
 def _resolve_processor(spec: Optional[ProcessorConfig]) -> Optional[Callable[[Iterable[Dict[str, Any]]], Iterable[Dict[str, Any]]]]:
-    import ast, math, numpy as np, pandas as pd, random, re
     if spec is None:
         return None
-    safe_builtins = MappingProxyType({
-        "len": len, "enumerate": enumerate, "range": range, "min": min, "max": max,
-        "sum": sum, "any": any, "all": all, "sorted": sorted, "zip": zip, "map": map,
-        "filter": filter, "list": list, "dict": dict, "set": set, "tuple": tuple, "str": str,
-        "int": int, "float": float, "bool": bool,
-        "isinstance": isinstance, "type": type
-    })
-    globals_dict = {
-        "__builtins__": safe_builtins, "ast": ast, "math": math, "np": np, "pd": pd, 
-        "random": random, "re": re
-    }
-    locals_dict = {}
+    exec_ns = {}
     try:
         compiled = compile(spec.source, "<processor>", "exec")
-        exec(compiled, globals_dict, locals_dict)
+        exec(compiled, exec_ns, exec_ns)
     except Exception as exc:
-        raise JobExecutionError(f"Failed to load processor source: {exc}") from exc
+        raise JobExecutionError(f"Failed to load processor `{spec.name}`: {exc}") from exc
     
-    func = locals_dict.get(spec.name)
+    func = exec_ns.get(spec.name)
     if not callable(func):
         raise JobExecutionError(f"Processor source did not define the expected callable")
     
