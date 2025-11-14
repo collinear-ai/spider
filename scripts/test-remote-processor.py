@@ -1,8 +1,10 @@
 import re, ast
-from typing import Iterable, Dict, Any, List
+from typing import Iterable, Dict, Any, List, Optional
 
 from spider.client import SpiderClient
 from spider.config import AppConfig
+
+# == sample post processor ==
 
 LANG_MARKER = "```python"
 
@@ -22,12 +24,30 @@ def _extract_code_block(text):
         return None
     return snippet
 
-def filter_rows(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    pass
+def filter_row(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    params:
+    -- record (dict): a single rollout record with a "completion" field (str)
+
+    return:
+    -- enriched record (dict): the updated record with arbitrary fields added / edited
+    -- None: if the record is unwanted
+    """
+    completion = record.get("completion")
+    if not isinstance(completion, str):
+        return None
+    snippet = _extract_code_block(completion)
+    if snippet is None:
+        return None
+    enriched = dict(record)
+    enriched["code"] = snippet
+    return enriched
+
+# == main function for client call ==
 
 def main() -> None:
     config = AppConfig.load("config/test-remote-processor.yaml")
-    with SpiderClient(config=config, processor=filter_rows) as client:
+    with SpiderClient(config=config, processor=filter_row) as client:
         submission = client.submit_job()
         job_id = submission["job_id"]
         print(f"Job submitted: {job_id}")
