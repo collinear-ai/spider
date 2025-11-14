@@ -42,7 +42,7 @@ with SpiderClient(config=config, processor=post_process_row) as client:
 
     # pool_job streams the distillation process back to client
     status = client.poll_job(job_id, interval=5.0, timeout=600, wait_for_completion=True)
-    
+
     if status["status"] == "completed":
         client.download_result(job_id, destionation="./artifacts/result.json") # return full data with metadata, optionally upload to HF
 ```
@@ -80,7 +80,7 @@ job:
       private: false
 ```
 
-The following is the config file for an off-policy distillation job.
+The following is the config file for an on-policy distillation job.
 
 ```yaml
 server:
