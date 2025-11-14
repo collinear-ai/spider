@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from this import d
 from typing import Any, Dict, Optional, Union, Callable, List, Tuple, Iterable
-import httpx, time, sys, json
+import httpx, time, sys, json, shutil, textwrap
 
 from .config import AppConfig
 from .processor_bundle import bundle_processor_source, ProcessorBundlingError
@@ -221,8 +222,21 @@ class SpiderClient:
             source = bundle_processor_source(self._processor)
         except ProcessorBundlingError as exc:
             raise ValueError(str(exc)) from exc
+        self._print_processor_preview(name, source)
         return {
             "name": name,
             "source": source,
             "kwargs": dict(self._processor_kwargs)
         }
+    
+    def _print_processor_preview(self, name: str, source: str) -> None:
+        try:
+            width = shutil.get_terminal_size().columns
+        except OSError:
+            width = 80
+        border = "-" * min(width, 80)
+        header = f"[Spider client] Bundled processor `{name}`:"
+        print(f"\033[34m{border}\033[0m", file=sys.stdout)
+        print(f"\033[36m{header}\033[0m", file=sys.stdout)
+        print(textwrap.indent(source.rstrip(), "  "), file=sys.stdout)
+        print(f"\033[34m{border}\033[0m", file=sys.stdout)
