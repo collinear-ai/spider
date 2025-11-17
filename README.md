@@ -27,7 +27,10 @@ The following snippet showcases a complete job cycle for a distillation job.
 from spider.client import SpiderClient
 from spider.config import AppConfig
 
-def post_process_row(row): # define custom data filtering logic
+def pre_prcess_row(row) -> str: # custom transform of input prompt
+  return ""
+
+def post_process_row(row) -> Dict[str, Any]: # custom transform of outputs
   """
   Per-row filtering function after a rollout is generated.
   Can reference arbitrary helpers defined in the same script
@@ -36,7 +39,11 @@ def post_process_row(row): # define custom data filtering logic
 
 config = AppConfig.load("config/test-remote-processor.yaml") # define rollout hyperparams
 
-with SpiderClient(config=config, processor=post_process_row) as client:
+with SpiderClient(
+  config=config, 
+  pre_processor=pre_process_row,
+  post_processor=post_process_row
+) as client:
     submission = client.submit_job()
     job_id = submission["job_id"]
 
