@@ -25,7 +25,7 @@ class SpiderClient:
         self._pre_processor = pre_processor
         self._pre_processor_kwargs = dict(pre_processor_kwargs or {})
         self._post_processor = post_processor
-        self._processor_kwargs = dict(post_processor_kwargs or {})
+        self._post_processor_kwargs = dict(post_processor_kwargs or {})
 
     def __enter__(self) -> "SpiderClient":
         self._ensure_client()
