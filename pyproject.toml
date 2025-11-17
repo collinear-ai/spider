@@ -31,7 +31,9 @@ client = [
     "httpx",
     "requests",
     "typer",
-    "rich"
+    "rich",
+    "openai",
+    "tqdm"
 ]
 server = [
     "datasets",
@@ -56,6 +58,8 @@ server = [
     "textarena",
     "math-verify",
     "scipy",
+    "openai",
+    "tqdm",
 ]
 all = [
     "httpx",
@@ -84,6 +88,8 @@ all = [
     "textarena",
     "math-verify",
     "scipy",
+    "openai",
+    "tqdm",
 ]
 
 [project.scripts]
