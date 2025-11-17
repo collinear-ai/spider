@@ -54,7 +54,7 @@ def _load_hf_dataset(
             prompts.append(prompt if isinstance(prompt, str) else str(prompt))
             continue
         if source.field is None:
-            prompts.append(str(example))
+            prompts.append(str(record))
         else:
             value = example[source.field]
             prompts.append(value if isinstance(value, str) else str(value))
