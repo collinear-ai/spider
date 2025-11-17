@@ -78,7 +78,10 @@ def _run_off_policy_job(
 
     _ensure_tensor_parallel(job)
     backend = create_backend(job.model)
-    prompts = collect_prompts(job.source)
+    pre_processor = _resolve_processor(job.pre_processor) if job.pre_processor else None
+    post_processor = _resolve_processor(job.post_processor) if job.post_processor else None
+    prompts = collect_prompts(job.source, pre_processor=pre_processor)
+
     batch_size = _resolve_batch_size(job, prompts)
     logger.info("Job %s: collected %d prompts for generation", job_id, len(prompts))
     events.emit(
@@ -107,14 +110,13 @@ def _run_off_policy_job(
     _write_metadata(metadata_path, payload, records_written)
 
     try:
-        processor = _resolve_processor(job.processor) if job.processor else None
         pending = {}
         next_index = 0
 
         with JSONLBatchWriter(artifact_path) as writer:
             executor_context = (
                 ThreadPoolExecutor(max_workers=_processing_worker_count()) 
-                if processor else None
+                if post_processor else None
             )
 
             try:
@@ -128,8 +130,8 @@ def _run_off_policy_job(
                             f"Generation count mismatch within batch: "
                             f"expected {len(chunk)}, received {len(chunk_generations)}"
                         )
-                    if processor and executor_context:
-                        future = executor_context.submit(_process_batch, chunk, chunk_generations, processor)
+                    if post_processor and executor_context:
+                        future = executor_context.submit(_process_batch, chunk, chunk_generations, post_processor)
                     else:
                         future = _immediate_future(_pair_records(chunk, chunk_generations))
 
@@ -187,7 +189,7 @@ def _pair_records(prompts: Iterable[str], generations: Iterable[str]) -> List[Di
         paired.append({"prompt": prompt, "completion": completion})
     return paired
 
-def _resolve_processor(spec: Optional[ProcessorConfig]) -> Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]]:
+def _resolve_processor(spec: Optional[ProcessorConfig]) -> Optional[Callable[[Dict[str, Any]], Any]]:
     if spec is None:
         return None
     exec_ns = {}
@@ -201,14 +203,14 @@ def _resolve_processor(spec: Optional[ProcessorConfig]) -> Optional[Callable[[Di
     if not callable(func):
         raise JobExecutionError(f"Processor source did not define the expected callable")
     
-    def wrapped(records: Iterable[Dict[str, Any]]) -> Iterable[Dict[str, Any]]:
-        return func(records, **spec.kwargs)
+    def wrapped(record: Dict[str, Any]):
+        return func(record, **spec.kwargs)
     
     return wrapped
 
 def _process_batch(
     prompts: Iterable[str], generations: Iterable[str], 
-    processor: Callable[[Iterable[Dict[str, Any]]], Iterable[Dict[str, Any]]]
+    processor: Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
 ) -> List[Dict[str, Any]]:
     processed = []
     for prompt, completion in zip(prompts, generations):
