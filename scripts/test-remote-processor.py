@@ -1,5 +1,7 @@
-import re, ast
+import json, os
 from typing import Iterable, Dict, Any, List, Optional
+
+from openai import OpenAI
 
 from spider.client import SpiderClient
 from spider.config import AppConfig
@@ -18,41 +20,103 @@ def _extract_code_block(text):
     if closing_marker == -1:
         return None
     snippet = text[code_start:closing_marker].lstrip("\r\n").rstrip()
-    try:
-        ast.parse(snippet)
-    except SyntaxError:
-        return None
     return snippet
 
-def filter_row(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def filter_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     params:
-    -- record (dict): a single rollout record with a "completion" field (str)
+    -- row (dict): a single rollout record with a "completion" field (str)
 
     return:
     -- enriched record (dict): the updated record with arbitrary fields added / edited
     -- None: if the record is unwanted
     """
-    completion = record.get("completion")
+    completion = row.get("completion")
     if not isinstance(completion, str):
         return None
     snippet = _extract_code_block(completion)
     if snippet is None:
         return None
-    enriched = dict(record)
-    enriched["code"] = snippet
+    enriched = dict(row)
+    enriched["code"] = snippet  
     return enriched
 
 # == sample pre processor == 
 
+PROMPT_GPT_DIFFICULTY = """You will be given a code problem. Your job is to grade the difficulty level from 1–10 according to the ICPC standard.
+Here is the standard:
+A 10-point scale for ICPC problems could be structured as follows, where level 1 represents the easiest problems and level 10 represents the most challenging:
+Level 1: Basic implementation problems requiring simple input/output handling and straightforward calculations. Typically solvable with a single loop or basic conditional statements. Examples include summing numbers or finding the maximum in an array.
+Level 2: Problems involving basic data structures like arrays and strings, requiring simple algorithms like linear search or basic sorting. May include simple mathematical concepts like prime numbers or basic geometry.
+Level 3: Problems requiring knowledge of standard algorithms like binary search, complete sorting algorithms, or basic graph traversal (DFS/BFS). May include simple dynamic programming problems with clear state transitions.
+Level 4: Problems combining multiple basic concepts, requiring careful implementation and moderate optimization. Includes medium-difficulty dynamic programming problems and basic graph algorithms like shortest paths.
+Level 5: Problems requiring solid understanding of data structures like segment trees, binary indexed trees, or disjoint set unions. May include more complex graph algorithms like minimum spanning trees or network flow basics.
+Level 6: Advanced dynamic programming problems with non-obvious state representations. Problems requiring combination of multiple algorithms or data structures. May include basic game theory or basic number theory concepts.
+Level 7: Problems requiring advanced algorithmic knowledge like heavy-light decomposition, suffix arrays, or advanced geometric algorithms. Includes complex optimization problems and harder network flow applications.
+Level 8: Problems requiring deep mathematical insights combined with complex algorithmic implementations. May include advanced number theory, complex geometric algorithms, or problems requiring multiple non-obvious observations.
+Level 9: Problems requiring extensive knowledge of advanced algorithms and mathematical concepts, often needing multiple key insights to solve. May include advanced string algorithms like suffix automata, or complex mathematical optimizations.
+Level 10: The most challenging problems, often requiring novel approaches or insights not covered in standard competitive programming material. These problems might combine multiple advanced concepts in non-obvious ways, require complex proofs for correctness, or need highly optimized implementations to meet strict time limits.
+This scale corresponds roughly to the difficulty progression you might see from early regional contests (levels 1–4) through regional finals (levels 4–7) to world finals problems (levels 7–10).
+Problem to be labeled: {question}."""
+
+DIFFICULTY_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "difficulty",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "score": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "Difficulty score from 1 to 10"
+                }
+            },
+            "required": ["score"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+}
+
 PROMPT_TEMPLATE = """You are a helpful programmer. You are given a programming question below.
 Question: {prompt}
 
-First reason through the problem. THen provide your final code in backticks. 
+First reason through the problem. Then provide your final code in backticks. 
 """
 
-def build_prompt(row: Dict[str, Any]):
+_gpt_client = None
+
+def get_client(api_key):
+    global _gpt_client
+    if _gpt_client is None:
+        _gpt_client = OpenAI(api_key=api_key)
+    return _gpt_client
+
+def judge_difficulty(client, question):
+    resp = client.responses.create(
+        model="gpt-5",
+        input=[
+            {"role": "user", "content": PROMPT_GPT_DIFFICULTY.format(question=question)},
+        ],
+        response_format=DIFFICULTY_SCHEMA,
+    )
+    return int(resp.parsed[0]["score"])
+
+def build_prompt(row: Dict[str, Any], *, openai_api_key):
+    """
+    param: row (dict): a single prompt record
+
+    return:
+    -- prompt (str): the transformed prompt to be sent to the rollout model
+    -- None: if the row is unwanted
+    """
+    client = get_client(openai_api_key)
     question = row.get("question")
+    difficulty = judge_difficulty(client, question)
+    if difficulty < 5:
+        return None
     return PROMPT_TEMPLATE.format(prompt=question)
 
 # == main function for client call ==
@@ -62,6 +126,7 @@ def main() -> None:
     with SpiderClient(
         config=config, 
         pre_processor=build_prompt,
+        pre_processor_kwargs={"openai_api_key": os.environ["OPENAI_API_KEY"]},
         post_processor=filter_row
     ) as client:
         submission = client.submit_job()

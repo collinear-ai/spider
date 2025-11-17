@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import List, Any, Callable, Dict, Optional
+from tqdm.auto import tqdm
 
 from spider.config import SourceConfig
 
@@ -34,7 +35,17 @@ def _load_hf_dataset(
         **source.options,
     )
     prompts: List[str] = []
-    for example in dataset:
+
+    total = None
+    iterable = dataset
+    if tqdm and not source.streaming:
+        try:
+            total = len(dataset)
+        except Exception:
+            total = None
+        iterable = tqdm(dataset, total=total, desc="Collecting prompts", leave=False)
+
+    for example in iterable:
         record = dict(example)
         if pre_processor:
             prompt = pre_processor(record)
