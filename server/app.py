@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from spider.config import JobConfig
-from .executor import JobExecutionError, run_generation_job
+from .executor import JobExecutionError, run_generation_job, _job_snapshot
 from . import events
 
 app = FastAPI(title="Spider Data Generation Service", version="0.1.0")
@@ -175,6 +175,7 @@ def _serialize_job(job_id: str, record: JobRecord, *, since: Optional[int] = Non
         "artifacts_path": record.artifacts_path,
         "remote_artifact": record.remote_artifact,
         "metrics": record.metrics,
+        "job": _job_snapshot(record.job),
         "events": events_payload,
         "events_next_offset": record.next_event_offset,
         "events_start_offset": events_start,

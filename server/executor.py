@@ -285,23 +285,57 @@ def _detect_available_gpus() -> int:
         return 1
     return 1
 
-def _base_metadata(job_id: str, job: JobConfig) -> Dict[str, Any]:
-    output_config = job.output.model_dump(exclude_none=True)
-    hf_config = output_config.get("hf")
-    if isinstance(hf_config, dict) and "token" in hf_config:
-        hf_config = dict(hf_config)
-        hf_config.pop("token", None)
-        output_config["hf"] = hf_config
+def _processor_snapshot(spec: ProcessorConfig) -> Dict[str, Any]:
+    return {"name": spec.name, "kwargs": dict(spec.kwargs or {})}
 
-    return {
-        "job_id": job_id,
+def _sanitize_generation_config(payload: Dict[str, Any]) -> Dict[str, Any]:
+    options = payload.get("on_policy_options")
+    if isinstance(options, dict):
+        options.pop("api_key", None)
+    return payload
+
+def _sanitize_output_config(payload: Dict[str, Any]) -> Dict[str, Any]:
+    hf_config = payload.get("hf")
+    if isinstance(hf_config, dict):
+        scrubbed = dict(hf_config)
+        scrubbed.pop("token", None)
+        payload["hf"] = scrubbed
+    return payload
+
+def _job_snapshot(job: JobConfig) -> Dict[str, Any]:
+    snapshot = {
         "model": job.model.model_dump(exclude_none=True),
         "source": job.source.model_dump(exclude_none=True),
-        "output": output_config,
+        "generation": _sanitize_generation_config(job.generation.model_dump(exclude_none=True)),
+        "output": _sanitize_output_config(job.output.model_dump(exclude_none=True)),
+        "metadata": dict(job.metadata)
+    }
+    processors = {}
+    if job.pre_processor:
+        processors["pre_processor"] = _processor_snapshot(job.pre_processor)
+    if job.post_processor:
+        processors["post_processor"] = _processor_snapshot(job.post_processor)
+    if processors:
+        snapshot["processors"] = processors
+    return snapshot
+
+def _base_metadata(job_id: str, job: JobConfig) -> Dict[str, Any]:
+    snapshot = _job_snapshot(job)
+    payload = {
+        "job_id": job_id,
+        "model": snapshot["model"],
+        "source": snapshot["source"],
+        "generation": snapshot["generation"],
+        "output": snapshot["output"],
+        "metadata": snapshot["metadata"],
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "records": 0,
         "metrics": {"records": 0}
     }
+    processors = snapshot.get("processors")
+    if processors:
+        payload["processors"] = processors
+    return payload
 
 def _write_metadata(path: Path, payload: Dict[str, Any], records: int) -> None:
     payload["records"] = records
