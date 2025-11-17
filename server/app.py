@@ -11,7 +11,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from spider.config import JobConfig
+from spider.config import JobConfig, OutputMode
 from .executor import JobExecutionError, run_generation_job, _job_snapshot
 from . import events
 
@@ -145,20 +145,23 @@ async def download_result(job_id: str):
     if not artifact_path.exists():
         raise HTTPException(status_code=404, detail="Artifact not found on disk")
 
+    include_records = record.job.output.mode != OutputMode.HF_UPLOAD
     artifact_records = []
-    with artifact_path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                artifact_records.append(json.loads(line))
-            except json.JSONDecodeError:
-                artifact_records.append({"raw": line})
+    if include_records:
+        with artifact_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    artifact_records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    artifact_records.append({"raw": line})
 
     payload = _serialize_job(job_id, record)
     payload["artifact_path"] = record.artifacts_path
-    payload["artifact"] = artifact_records
+    if include_records:
+        payload["artifact"] = artifact_records
     return JSONResponse(jsonable_encoder(payload))
 
 
