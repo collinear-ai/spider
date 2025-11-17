@@ -22,6 +22,7 @@ from tinker_cookbook.tokenizer_utils import get_tokenizer
 from .sources import collect_prompts
 from . import events
 from .writers import JSONLBatchWriter
+from .executor import _resolve_processor
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +107,8 @@ def run_on_policy_job(
     artifact_path = workspace / "result.jsonl"
     metadata_path = workspace / "metadata.json"
     
-    prompts = collect_prompts(job.source)
+    pre_processor = _resolve_processor(job.pre_processor) if job.pre_processor else None
+    prompts = collect_prompts(job.source, pre_processor=pre_processor)
     use_gold_alignment = _needs_gold_alignment(student_model, options.teacher)
     logger.info(
         "Job %s: on-policy distillation for student=%s collected %d prompts, use_gold_alignment=%s",
