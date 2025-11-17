@@ -43,11 +43,27 @@ def filter_row(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     enriched["code"] = snippet
     return enriched
 
+# == sample pre processor == 
+
+PROMPT_TEMPLATE = """You are a helpful programmer. You are given a programming question below.
+Question: {prompt}
+
+First reason through the problem. THen provide your final code in backticks. 
+"""
+
+def build_prompt(row: Dict[str, Any]):
+    question = row.get("question")
+    return PROMPT_TEMPLATE.format(prompt=question)
+
 # == main function for client call ==
 
 def main() -> None:
     config = AppConfig.load("config/test-remote-processor.yaml")
-    with SpiderClient(config=config, processor=filter_row) as client:
+    with SpiderClient(
+        config=config, 
+        pre_processor=build_prompt,
+        post_processor=filter_row
+    ) as client:
         submission = client.submit_job()
         job_id = submission["job_id"]
         print(f"Job submitted: {job_id}")
