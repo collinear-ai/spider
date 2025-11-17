@@ -155,7 +155,14 @@ class JobConfig(BaseModel):
     source: SourceConfig
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
-    processor: Optional[ProcessorConfig] = Field(default=None)
+    pre_processor: Optional[ProcessorConfig] = Field(
+        default=None,
+        description="Optional callable to filter / transform dataset rows to generate final prompts"
+    )
+    post_processor: Optional[ProcessorConfig] = Field(
+        default=None,
+        description="Optional callable to filter / transform rollout rows to generate final completions"
+    )
     metadata: Dict[str, Any] = Field(
         default_factory=dict,
         description="Arbitrary metadata to attach to the job request"
