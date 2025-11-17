@@ -1,13 +1,23 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Any, Callable, Dict, Optional
 
 from spider.config import SourceConfig
 
-def collect_prompts(source: SourceConfig) -> List[str]:
-    return _load_hf_dataset(source)
+PreProcessor = Callable[[Dict[str, Any]], Optional[str]]
 
-def _load_hf_dataset(source: SourceConfig) -> List[str]:
+def collect_prompts(
+    source: SourceConfig,
+    *,
+    pre_processor: Optional[PreProcessor] = None,
+) -> List[str]:
+    return _load_hf_dataset(source, pre_processor=pre_processor)
+
+def _load_hf_dataset(
+    source: SourceConfig,
+    *,
+    pre_processor: Optional[PreProcessor] = None,
+) -> List[str]:
     from datasets import load_dataset
 
     load_kwargs = {
@@ -25,6 +35,13 @@ def _load_hf_dataset(source: SourceConfig) -> List[str]:
     )
     prompts: List[str] = []
     for example in dataset:
+        record = dict(example)
+        if pre_processor:
+            prompt = pre_processor(record)
+            if prompt is None:
+                continue
+            prompts.append(prompt if isinstance(prompt, str) else str(prompt))
+            continue
         if source.field is None:
             prompts.append(str(example))
         else:
