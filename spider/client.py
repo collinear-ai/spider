@@ -2,22 +2,30 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, Optional, Union, Callable, List, Tuple, Iterable
-import httpx, time, sys, json, shutil, textwrap
+import httpx, time, sys, json, shutil, textwrap, warnings
 
 from .config import AppConfig
 from .processor_bundle import bundle_processor_source, ProcessorBundlingError
 
 class SpiderClient:
     def __init__(
-        self, config: AppConfig, *, client: Optional[httpx.Client] = None,
-        processor: Optional[callable[[Iterable[Dict[str, Any]]], Iterable[Dict[str, Any]]]] = None,
-        processor_kwargs: Optional[Dict[str, Any]] = None,
+        self, 
+        config: AppConfig, 
+        *, 
+        client: Optional[httpx.Client] = None,
+        pre_processor: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
+        pre_processor_kwargs: Optional[Dict[str, Any]] = None,
+        post_processor: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+        post_processor_kwargs: Optional[Dict[str, Any]] = None,
     ):
         self._config = config
         self._client: Optional[httpx.Client] = client
         self._owns_client = client is None
-        self._processor = processor
-        self._processor_kwargs = dict(processor_kwargs or {})
+
+        self._pre_processor = pre_processor
+        self._pre_processor_kwargs = dict(pre_processor_kwargs or {})
+        self._post_processor = post_processor
+        self._processor_kwargs = dict(post_processor_kwargs or {})
 
     def __enter__(self) -> "SpiderClient":
         self._ensure_client()
@@ -46,8 +54,19 @@ class SpiderClient:
         if job_overrides:
             payload = self._deep_merge(payload, job_overrides)
 
-        if self._processor is not None:
-            payload["processor"] = self._serialize_processor()
+        if self._pre_processor is not None:
+            payload["pre_processor"] = self._serialize_processor(
+                kind="pre_processor",
+                func=self._pre_processor,
+                kwargs=self._pre_processor_kwargs,
+            )
+
+        if self._post_processor is not None:
+            payload["post_processor"] = self._serialize_processor(
+                kind="post_processor",
+                func=self._post_processor,
+                kwargs=self._post_processor_kwargs,
+            )
 
         response = self._ensure_client().post("/v1/jobs", json=payload)
         response.raise_for_status()
@@ -211,30 +230,35 @@ class SpiderClient:
                 result[key] = value
         return result
 
-    def _serialize_processor(self) -> Dict[str, Any]:
-        if self._processor is None:
-            raise ValueError("Processor callable is not set")
-        name = getattr(self._processor, "__name__", None)
+    def _serialize_processor(
+        self,
+        kind: str,
+        func: Callable[[Dict[str, Any]], Any],
+        kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if func is None:
+            raise ValueError(f"{kind} callable is not set")
+        name = getattr(func, "__name__", None)
         if not name:
-            raise ValueError("Processor callable must have a __name__ attribute")
+            raise ValueError(f"{kind} callable must have a __name__ attribute")
         try:
-            source = bundle_processor_source(self._processor)
+            source = bundle_processor_source(func)
         except ProcessorBundlingError as exc:
             raise ValueError(str(exc)) from exc
-        self._print_processor_preview(name, source)
+        self._print_processor_preview(kind, name, source)
         return {
             "name": name,
             "source": source,
-            "kwargs": dict(self._processor_kwargs)
+            "kwargs": dict(kwargs)
         }
     
-    def _print_processor_preview(self, name: str, source: str) -> None:
+    def _print_processor_preview(self, kind: str, name: str, source: str) -> None:
         try:
             width = shutil.get_terminal_size().columns
         except OSError:
             width = 80
         border = "-" * min(width, 80)
-        header = f"[Spider client] Bundled processor `{name}`:"
+        header = f"[Spider client] Bundled {kind} `{name}`:"
         print(f"\033[34m{border}\033[0m", file=sys.stdout)
         print(f"\033[36m{header}\033[0m", file=sys.stdout)
         print(textwrap.indent(source.rstrip(), "  "), file=sys.stdout)
