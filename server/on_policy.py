@@ -22,7 +22,6 @@ from tinker_cookbook.tokenizer_utils import get_tokenizer
 from .sources import collect_prompts
 from . import events
 from .writers import JSONLBatchWriter
-from .executor import _resolve_processor
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +92,7 @@ def run_on_policy_job(
         JobExecutionResult,
         JobExecutionError,
         _base_metadata,
+        _resolve_processor,
         _summarize_metrics,
         _write_metadata,
     )
