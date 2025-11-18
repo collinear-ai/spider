@@ -149,17 +149,6 @@ class ProcessorConfig(BaseModel):
     name: str = Field(..., description="processor callable name")
     source: str = Field(..., description="Python source text defining the processor callable")
     kwargs: Dict[str, Any] = Field(default_factory=dict, description="Kwargs forwarded to the processor")
-
-class ToolConfig(BaseModel):
-    name: str = Field(..., description="Tool name")
-    description: str = Field(..., description="Tool description")
-    json_schema: Dict[str, Any] = Field(
-        ..., description="JSON schema for the tool arguments"
-    )
-    source: str = Field(..., description="Python source text defining the tool callable")
-    kwargs: Dict[str, Any] = Field(
-        default_factory=dict, description="Kwargs forwarded to the tool callable"
-    )
     
 class JobConfig(BaseModel):
     model: ModelConfig
@@ -177,10 +166,6 @@ class JobConfig(BaseModel):
     metadata: Dict[str, Any] = Field(
         default_factory=dict,
         description="Arbitrary metadata to attach to the job request"
-    )
-    tools: List[ToolConfig] = Field(
-        default_factory=list,
-        description="Optional set of tools"
     )
 
     @model_validator(mode="after")
