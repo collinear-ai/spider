@@ -6,7 +6,7 @@ from openai import OpenAI
 from spider.client import SpiderClient
 from spider.config import AppConfig
 
-# == sample post processor ==
+# == custom post processor ==
 
 LANG_MARKER = "```python"
 
@@ -41,7 +41,7 @@ def filter_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     enriched["code"] = snippet  
     return enriched
 
-# == sample pre processor == 
+# == custom pre processor == 
 
 PROMPT_GPT_DIFFICULTY = """You will be given a code problem. Your job is to grade the difficulty level from 1–10 according to the ICPC standard.
 Here is the standard:
@@ -119,10 +119,10 @@ def build_prompt(row: Dict[str, Any], *, openai_api_key):
         return None
     return PROMPT_TEMPLATE.format(prompt=question)
 
-# == main function for client call ==
+# == main client call ==
 
 def main() -> None:
-    config = AppConfig.load("config/test-remote-processor.yaml")
+    config = AppConfig.load("config/open_thoughts_3.yaml")
     with SpiderClient(
         config=config, 
         pre_processor=build_prompt,

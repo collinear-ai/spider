@@ -4,5 +4,5 @@ dist/
 __pycache__/
 artifacts/
 .artifacts/
-*-private.yaml
-*-private.py
+*private.yaml
+*private.py
