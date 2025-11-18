@@ -6,7 +6,7 @@ from openai import OpenAI
 from spider.client import SpiderClient
 from spider.config import AppConfig
 
-# == custom post processor ==
+# == sample post processor ==
 
 LANG_MARKER = "```python"
 
@@ -41,7 +41,7 @@ def filter_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     enriched["code"] = snippet  
     return enriched
 
-# == custom pre processor == 
+# == sample pre processor == 
 
 PROMPT_GPT_DIFFICULTY = """You will be given a code problem. Your job is to grade the difficulty level from 1–10 according to the ICPC standard.
 Here is the standard:
@@ -95,14 +95,15 @@ def get_client(api_key):
     return _gpt_client
 
 def judge_difficulty(client, question):
-    resp = client.responses.create(
-        model="gpt-5",
-        input=[
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
             {"role": "user", "content": PROMPT_GPT_DIFFICULTY.format(question=question)},
         ],
         response_format=DIFFICULTY_SCHEMA,
     )
-    return int(resp.parsed[0]["score"])
+    msg = resp.choices[0].message.content
+    return int(json.loads(msg)["score"])
 
 def build_prompt(row: Dict[str, Any], *, openai_api_key):
     """
@@ -113,13 +114,13 @@ def build_prompt(row: Dict[str, Any], *, openai_api_key):
     -- None: if the row is unwanted
     """
     client = get_client(openai_api_key)
-    question = row.get("question")
+    question = row.get("input")
     difficulty = judge_difficulty(client, question)
     if difficulty < 5:
         return None
     return PROMPT_TEMPLATE.format(prompt=question)
 
-# == main client call ==
+# == main function for client call ==
 
 def main() -> None:
     config = AppConfig.load("config/open_thoughts_3.yaml")
@@ -133,7 +134,7 @@ def main() -> None:
         job_id = submission["job_id"]
         print(f"Job submitted: {job_id}")
 
-        status = client.poll_job(job_id, interval=5.0, timeout=600, wait_for_completion=True)
+        status = client.poll_job(job_id, interval=5.0, wait_for_completion=True)
         print(f"Final status: {status['status']}")
 
         if status["status"] == "completed":
