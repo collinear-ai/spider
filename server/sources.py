@@ -45,10 +45,9 @@ def _load_hf_dataset(
             total = None
         iterable = tqdm(dataset, total=total, desc="Collecting prompts", leave=False)
 
-    for example in iterable:
+    for i, example in enumerate(iterable):
         record = dict(example)
         if pre_processor:
-            print("Apply pre processor to record: ", record[:32])
             prompt = pre_processor(record)
             if prompt is None:
                 continue
