@@ -107,7 +107,7 @@ def _run_off_policy_job(
     aggregated_metrics = {}
     records_written = 0
     metadata_path = workspace / "metadata.json"
-    payload = _base_metadata(job_id, job, tools=tools)
+    payload = _base_metadata(job_id, job)
     _write_metadata(metadata_path, payload, records_written)
 
     try:
@@ -344,12 +344,17 @@ def _job_snapshot(job: JobConfig) -> Dict[str, Any]:
         snapshot["processors"] = processors
     if job.tools:
         snapshot["tools"] = [
-            {} # TODO: complete
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "json_schema": tool.json_schema,
+                "kwargs": dict(tool.kwargs or {})
+            }
             for tool in job.tools
         ]
     return snapshot
 
-def _base_metadata(job_id: str, job: JobConfig, *, tools: Optional[Dict[str, Callable[..., Any]]] = None) -> Dict[str, Any]:
+def _base_metadata(job_id: str, job: JobConfig) -> Dict[str, Any]:
     snapshot = _job_snapshot(job)
     payload = {
         "job_id": job_id,
