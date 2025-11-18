@@ -48,6 +48,7 @@ def _load_hf_dataset(
     for example in iterable:
         record = dict(example)
         if pre_processor:
+            print("Apply pre processor to record: ", record[:32])
             prompt = pre_processor(record)
             if prompt is None:
                 continue

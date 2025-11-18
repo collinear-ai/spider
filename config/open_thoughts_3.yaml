@@ -12,6 +12,7 @@ job:
     dataset: "nvidia/OpenCodeReasoning"
     config_name: "split_0"
     split: "split_0[0:512]"
+    streaming: true
   generation:
     parameters:
       temperature: 0.7
