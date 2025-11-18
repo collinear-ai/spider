@@ -27,6 +27,8 @@ class SpiderClient:
         self._post_processor = post_processor
         self._post_processor_kwargs = dict(post_processor_kwargs or {})
 
+        self._tool_payloads: Dict[str, Dict[str, Any]] = {}
+
     def __enter__(self) -> "SpiderClient":
         self._ensure_client()
         return self
@@ -67,6 +69,11 @@ class SpiderClient:
                 func=self._post_processor,
                 kwargs=self._post_processor_kwargs,
             )
+
+        if self._tool_payloads:
+            payload_tools = list(payload.get("tools") or [])
+            payload_tools.extend(self._tool_payloads.values())
+            payload["tools"] = payload_tools
 
         response = self._ensure_client().post("/v1/jobs", json=payload)
         response.raise_for_status()
@@ -245,14 +252,68 @@ class SpiderClient:
             source = bundle_processor_source(func)
         except ProcessorBundlingError as exc:
             raise ValueError(str(exc)) from exc
-        self._print_processor_preview(kind, name, source)
+        self._print_bundle_preview(kind, name, source)
         return {
             "name": name,
             "source": source,
             "kwargs": dict(kwargs)
         }
+
+    def add_tool(
+        self,
+        *,
+        description: str,
+        json_schema: Dict[str, Any],
+        func: Callable[..., Any],
+        kwargs: Optional[Dict[str, Any]] = None,
+        name: Optional[str] = None,
+    ) -> None:
+        if func is None:
+            raise ValueError("Tool callable is required")
+        func_name = getattr(func, "__name__", None)
+        if not func_name:
+            raise ValueError("Tool callable must have a __name__ attribute")
+        tool_name = name or func_name
+        if tool_name != func_name:
+            raise ValueError(f"Tool name `{tool_name}` must match the callable name `{func_name}` so that the server can load it.")
+        if not description or not description.strip():
+            raise ValueError("Tool description is required.")
+
+        schema = self._prepare_tool_schema(json_schema)
+        try:
+            source = bundle_processor_source(func)
+        except ProcessorBundlingError as exc:
+            raise ValueError(str(exc)) from exc
+
+        self._print_bundle_preview("tool", tool_name, source)
+        self._tool_payloads[tool_name] = {
+            "name": tool_name,
+            "description": description.strip(),
+            "json_schema": schema,
+            "source": source,
+            "kwargs": dict(kwargs or {})
+        }
+
+    def _prepare_tool_schema(self, schema: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(schema, dict):
+            raise ValueError("Tool JSON schema must be a dictionary.")
+        try:
+            normalized = json.loads(json.dumps(schema))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Tool JSON schema must be JSON-serializable: {exc}") from exc
+        schema_type = normalized.get("type")
+        if schema_type is None:
+            normalized["type"] = "object"
+        elif schema_type != "object":
+            raise ValueError(f"Tool JSON schema must be 'object'.")
+        properties = normalized.get("properties")
+        if properties is None:
+            normalized["properties"] = {}
+        elif not isinstance(properties, dict):
+            raise ValueError("Tool JSON schema 'properties' must be a dictionary.")
+        return normalized
     
-    def _print_processor_preview(self, kind: str, name: str, source: str) -> None:
+    def _print_bundle_preview(self, kind: str, name: str, source: str) -> None:
         try:
             width = shutil.get_terminal_size().columns
         except OSError:
