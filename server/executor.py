@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json, os, logging, inspect
+import json, os, logging, inspect, time, threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -75,21 +75,13 @@ def _run_off_policy_job(
     job_id: str, job: JobConfig, *, workspace: Path
 ) -> JobExecutionResult:
     artifact_path = workspace / "result.jsonl"
+    metadata_path = workspace / "metadata.json"
 
     _ensure_tensor_parallel(job)
     backend = create_backend(job.model)
     pre_processor = _resolve_processor(job.pre_processor) if job.pre_processor else None
     post_processor = _resolve_processor(job.post_processor) if job.post_processor else None
-    tools = _resolve_tools(job.tools)
     prompts = collect_prompts(job.source, pre_processor=pre_processor)
-
-    batch_size = _resolve_batch_size(job, prompts)
-    logger.info("Job %s: collected %d prompts for generation", job_id, len(prompts))
-    events.emit(
-        "Collected prompts for generation.",
-        code="generation.prompts_collected",
-        data={"total_prompts": len(prompts)}
-    )
 
     if not prompts:
         artifact_path.write_text("", encoding="utf-8")
@@ -100,51 +92,87 @@ def _run_off_policy_job(
         )
         return JobExecutionResult(
             artifacts_path=artifact_path,
+            metadata_path=metadata_path,
             metrics={"records": 0},
             messages=["No prompts found; nothing generated."]
         )
 
+    logger.info("Job %s: collected %d prompts for generation", job_id, len(prompts))
+    events.emit(
+        "Collected prompts for generation.",
+        code="generation.prompts_collected",
+        data={"total_prompts": len(prompts)}
+    )
+
+    tool_registry = _resolve_tools(job.tools)
+    try:
+        batch_worker = _build_batch_worker(
+            job=job,
+            backend=backend,
+            post_processor=post_processor,
+            tool_registry=tool_registry,
+        )
+        if tool_registry:
+            events.emit(
+                "Tool-aware generation enabled.",
+                code="generation.tools_enabled",
+                data={"tool_names": sorted(tool_registry.keys())}
+            )
+        return _run_batched_generation(
+            job_id=job_id,
+            job=job,
+            prompts=prompts,
+            artifact_path=artifact_path,
+            metadata_path=metadata_path,
+            batch_worker=batch_worker,
+        )
+    finally:
+        _shutdown_backend(job_id, backend)
+
+def _run_batched_generation(
+    *,
+    job_id: str,
+    job: JobConfig,
+    prompts: List[str],
+    artifact_path: Path,
+    metadata_path: Path,
+    batch_worker: Callable[[List[str]], Tuple[List[Dict[str, Any]], Dict[str, Any]]],
+) -> JobExecutionResult:
     aggregated_metrics = {}
     records_written = 0
-    metadata_path = workspace / "metadata.json"
     payload = _base_metadata(job_id, job)
     _write_metadata(metadata_path, payload, records_written)
+
+    batch_size = _resolve_batch_size(job, prompts)
 
     try:
         pending = {}
         next_index = 0
 
         with JSONLBatchWriter(artifact_path) as writer:
-            executor_context = (
-                ThreadPoolExecutor(max_workers=_processing_worker_count()) 
-                if post_processor else None
-            )
-
+            executor_context = ThreadPoolExecutor(max_workers=_processing_worker_count())
             try:
                 for batch_index, chunk_start in enumerate(range(0, len(prompts), batch_size)):
                     chunk = prompts[chunk_start : chunk_start + batch_size]
-                    chunk_generations = backend.generate(
-                        chunk, parameters=job.generation.parameters
-                    )
-                    if len(chunk_generations) != len(chunk):
-                        raise JobExecutionError(
-                            f"Generation count mismatch within batch: "
-                            f"expected {len(chunk)}, received {len(chunk_generations)}"
-                        )
-                    if post_processor and executor_context:
-                        future = executor_context.submit(_process_batch, chunk, chunk_generations, post_processor)
-                    else:
-                        future = _immediate_future(_pair_records(chunk, chunk_generations))
-
-                    batch_metrics = dict(backend.metrics() or {})
-                    pending[batch_index] = (future, batch_metrics)
+                    future = batch_worker(chunk)
+                    pending[batch_index] = future
                     next_index = _drain_ready_batches(
-                        pending, next_index, writer, aggregated_metrics, payload,
-                        metadata_path, block=False
+                        pending, 
+                        next_index, 
+                        writer, 
+                        aggregated_metrics, 
+                        payload,
+                        metadata_path, 
+                        block=False
                     )
                 next_index = _drain_ready_batches(
-                    pending, next_index, writer, aggregated_metrics, payload,
-                    metadata_path, block=True
+                    pending, 
+                    next_index, 
+                    writer, 
+                    aggregated_metrics, 
+                    payload,
+                    metadata_path, 
+                    block=True
                 )
             finally:
                 if executor_context:
@@ -154,9 +182,6 @@ def _run_off_policy_job(
 
     except Exception as exc:
         raise JobExecutionError(f"Generation pipeline failed: {exc}") from exc
-    
-    finally:
-        _shutdown_backend(job_id, backend)
 
     filtered_records = max(0, len(prompts) - records_written)
     metrics = _summarize_metrics(records_written, aggregated_metrics)
@@ -182,6 +207,29 @@ def _run_off_policy_job(
         upload_source=artifact_path,
         metrics=metrics,
         messages=["Generation pipeline completed."]
+    )
+
+def _build_batch_worker(
+    *,
+    job: JobConfig,
+    backend: Any,
+    post_processor: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]],
+    tool_registry: Dict[str, Callable[..., Any]],
+) -> Callable[[List[str]], List[Dict[str, Any]]]:
+    if not tool_registry:
+        return lambda prompts: _immediate_future(_text_batch_worker(
+            prompts=prompts,
+            backend=backend,
+            job=job,
+            post_processor=post_processor,
+        ))
+
+    return lambda prompts: _tool_batch_worker(
+        prompts=prompts,
+        backend=backend,
+        job=job,
+        post_processor=post_processor,
+        tool_registry=tool_registry,
     )
 
 def _pair_records(prompts: Iterable[str], generations: Iterable[str]) -> List[Dict[str, Any]]:
@@ -282,6 +330,89 @@ def _immediate_future(result: Iterable[Dict[str, Any]]) -> Future[List[Dict[str,
     future = Future()
     future.set_result(list(result))
     return future
+
+def _text_batch_worker(
+    *,
+    prompts: List[str],
+    backend: Any,
+    job: JobConfig,
+    post_processor: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]],
+) -> List[Dict[str, Any]]:
+    generations = backend.generate(prompts, parameters=job.generation.parameters)
+
+    if len(generations) != len(prompts):
+        raise JobExecutionError(
+            f"Generation count mismatch within batch: expected {len(prompts)}, received {len(generations)}"
+        )
+
+    if post_processor:
+        records = _process_batch(prompts, generations, post_processor)
+    else:
+        records = _pair_records(prompts, generations)
+
+    return records
+
+def _tool_batch_worker(
+    *,
+    prompts: List[str],
+    backend: Any,
+    job: JobConfig,
+    post_processor: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]],
+    tool_registry: Dict[str, Callable[..., Any]],
+) -> List[Dict[str, Any]]:
+    tool_defs = _tool_descriptors(job.tools)
+    turn_limit = _tool_turn_limit(job)
+
+    max_concurrency = int(job.generation.get("max_batch_size", 4))
+    max_concurrency = max(1, max_concurrency)
+    max_concurrency = min(max_concurrency, len(prompts))
+
+    executor = ThreadPoolExecutor(max_workers=max_concurrency)
+
+    def run_prompt(prompt):
+        transcript = _run_prompt_with_tools(
+            backend=backend,
+            job=job,
+            prompt=prompt,
+            tool_defs=tool_defs,
+            tool_registry=tool_registry,
+            turn_limit=turn_limit,
+        )
+        record = {"prompt": prompt, "completion": transcript}
+        if post_processor:
+            processed = post_processor(record)
+            if processed is None:
+                return {}
+            if not isinstance(processed, dict):
+                raise JobExecutionError("Post-processor must return a dict (can be empty) per record")
+            record = processed
+        return record
+
+    futures = []
+    for prompt in prompts:
+        futures.append(executor.submit(run_prompt, prompt))
+
+    def gather_results():
+        try:
+            ordered_records = []
+            for prompt_future in futures:
+                result = prompt_future.result()
+                if result:
+                    ordered_records.append(result)
+            return ordered_records
+        finally:
+            executor.shutdown(wait=True)
+
+    aggregate = Future()
+
+    def finalize():
+        try:
+            aggregate.set_result(gather_results())
+        except Exception as exc:
+            aggregate.set_exception(exc)
+
+    threading.Thread(target=finalize, daemon=True).start()
+    return aggregate
 
 def _resolve_batch_size(job: JobConfig, prompts: List[str]) -> int:
     requested = job.generation.max_batch_size
