@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable, Iterable, Tuple
 from types import MappingProxyType
 
-from spider.config import JobConfig, OutputMode, ProcessorConfig
+from spider.config import JobConfig, OutputMode, ProcessorConfig, ToolConfig
 from .backends.factory import create_backend
 from . import events
 from .sources import collect_prompts
@@ -80,6 +80,7 @@ def _run_off_policy_job(
     backend = create_backend(job.model)
     pre_processor = _resolve_processor(job.pre_processor) if job.pre_processor else None
     post_processor = _resolve_processor(job.post_processor) if job.post_processor else None
+    tools = _resolve_tools(job.tools)
     prompts = collect_prompts(job.source, pre_processor=pre_processor)
 
     batch_size = _resolve_batch_size(job, prompts)
@@ -106,7 +107,7 @@ def _run_off_policy_job(
     aggregated_metrics = {}
     records_written = 0
     metadata_path = workspace / "metadata.json"
-    payload = _base_metadata(job_id, job)
+    payload = _base_metadata(job_id, job, tools=tools)
     _write_metadata(metadata_path, payload, records_written)
 
     try:
@@ -207,6 +208,30 @@ def _resolve_processor(spec: Optional[ProcessorConfig]) -> Optional[Callable[[Di
         return func(record, **spec.kwargs)
     
     return wrapped
+
+def _resolve_tools(tool_specs: Optional[List[ToolConfig]]) -> Dict[str, Callable[..., Any]]:
+    registry = {}
+    for spec in tool_specs or []:
+        if spec.name in registry:
+            raise JobExecutionError(f"Duplicate tool name: `{spec.name}`")
+        exec_ns = {}
+        try:
+            compiled = compile(spec.source, "<tool>", "exec")
+            exec(compiled, exec_ns, exec_ns)
+        except Exception as exc:
+            raise JobExecutionError(f"Failed to load tool `{spec.name}`: {exc}") from exc
+        func = exec_ns.get(spec.name)
+        if not callable(func):
+            raise JobExecutionError(f"Tool `{spec.name}` did not define a callable named {spec.name}")
+
+        def _make_wrapper(f: Callable[..., Any], kwargs: Dict[str, Any]) -> Callable[..., Any]:
+            def wrapper(*args: Any, **inner_kwargs: Any) -> Any:
+                bound = dict(kwargs)
+                bound.update(inner_kwargs)
+                return f(*args, **bound)
+            return wrapper
+        registry[spec.name] = _make_wrapper(func, dict(spec.kwargs or {}))
+    return registry
 
 def _process_batch(
     prompts: Iterable[str], generations: Iterable[str], 
@@ -317,9 +342,14 @@ def _job_snapshot(job: JobConfig) -> Dict[str, Any]:
         processors["post_processor"] = _processor_snapshot(job.post_processor)
     if processors:
         snapshot["processors"] = processors
+    if job.tools:
+        snapshot["tools"] = [
+            {} # TODO: complete
+            for tool in job.tools
+        ]
     return snapshot
 
-def _base_metadata(job_id: str, job: JobConfig) -> Dict[str, Any]:
+def _base_metadata(job_id: str, job: JobConfig, *, tools: Optional[Dict[str, Callable[..., Any]]] = None) -> Dict[str, Any]:
     snapshot = _job_snapshot(job)
     payload = {
         "job_id": job_id,
@@ -335,6 +365,9 @@ def _base_metadata(job_id: str, job: JobConfig) -> Dict[str, Any]:
     processors = snapshot.get("processors")
     if processors:
         payload["processors"] = processors
+    tool_snapshot = snapshot.get("tools")
+    if tool_snapshot:
+        payload["tools"] = tool_snapshot
     return payload
 
 def _write_metadata(path: Path, payload: Dict[str, Any], records: int) -> None:
