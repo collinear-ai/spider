@@ -470,10 +470,15 @@ def _run_prompt_with_tools(
             if not tool_name or tool_name not in tool_registry:
                 raise JobExecutionError(f"Assistant requested unknown tool `{tool_name}`")
 
-            args = call.get("arguments") # TODO: check type with reference docs
+            raw_args = call.get("arguments") or "{}"
+            try:
+                tool_args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+            except (TypeError, ValueError) as exc:
+                raise JobExecutionError(f"Tool `{tool_name}` argument must be valid JSON")
+
             success = True
             try:
-                result = tool_registry[tool_name](**args)
+                result = tool_registry[tool_name](**tool_args)
             except Exception as exc:
                 success = False
                 result = {"error": str(exc)}
