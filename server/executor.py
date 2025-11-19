@@ -508,7 +508,17 @@ def _call_backend_chat(
     tools: List[Dict[str, Any]],
     parameters: Dict[str, Any],
 ) -> Dict[str, Any]:
-    pass
+    chat_fn = getattr(backend, "chat", None)
+    if not callable(chat_fn):
+        raise JobExecutionError("Backend does not support chat tool calls.")
+    try:
+        return chat_fn(
+            messages=messages,
+            tools=tools or None,
+            parameters=dict(parameters or {})
+        )
+    except Exception as exc:
+        raise JobExecutionError(f"Chat backend failed: {exc}") from exc
 
 def _initial_chat_history(prompt: str, job: JobConfig) -> List[Dict[str, Any]]:
     history = []

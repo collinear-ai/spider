@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Any, Optional
+import threading
 
 from vllm import LLM, SamplingParams
 
@@ -14,6 +15,7 @@ class VLLMBackend:
             model=config.name, **llm_kwargs
         )
         self._last_metrics: Dict[str, object] = {}
+        self._metrics_lock = threading.Lock()
 
     def generate(self, prompts: Iterable[str], *, parameters: Dict[str, object]) -> List[str]:
         tokenizer = self._llm.get_tokenizer()
@@ -38,14 +40,53 @@ class VLLMBackend:
         for output in outputs:
             text = output.outputs[0].text if output.outputs else ""
             completions.append(text)
-        self._last_metrics = {
-            "prompt_tokens": sum(len(getattr(o, "prompt_token_ids", []) or []) for o in outputs),
-            "completion_tokens": sum(sum(len(getattr(chunk, "token_ids", []) or []) for chunk in getattr(o, "outputs", [])) for o in outputs),
+        metrics = {
+            "prompt_tokens": sum(
+                len(getattr(o, "prompt_token_ids", []) or []) 
+                for o in outputs
+            ),
+            "completion_tokens": sum(
+                sum(len(getattr(chunk, "token_ids", []) or []) 
+                for chunk in getattr(o, "outputs", [])) 
+                for o in outputs
+            ),
         }
+        with self._metrics_lock:
+            self._last_metrics = metrics
         return completions
 
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        parameters: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        sampling = SamplingParams(**parameters)
+        outputs = self._llm.chat(
+            [messages], 
+            sampling_params=sampling,
+            tools=tools,
+        )
+        response = {}
+        if not outputs:
+            response = {"content": "", "tool_calls": None}
+        else:
+            first = outputs[0]
+            choice = first.outputs[0] if first.outputs else None
+            content = ""
+            tool_calls = None
+            if choice is not None:
+                message = getattr(choice, "message", None)
+                content = message.get("content") or ""
+                tool_calls = message.get("tool_calls")
+            response = {"content": content, "tool_calls": tool_calls}
+
+        return response
+
     def metrics(self) -> Dict[str, object]:
-        return dict(self._last_metrics)
+        with self._metrics_lock:
+            return dict(self._last_metrics)
 
     def close(self) -> None:
         engine = getattr(self._llm, "llm_engine", None)
