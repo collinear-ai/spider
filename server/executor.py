@@ -154,8 +154,8 @@ def _run_batched_generation(
             try:
                 for batch_index, chunk_start in enumerate(range(0, len(prompts), batch_size)):
                     chunk = prompts[chunk_start : chunk_start + batch_size]
-                    future = batch_worker(chunk)
-                    pending[batch_index] = future
+                    future, batch_metrics = batch_worker(chunk)
+                    pending[batch_index] = (future, batch_metrics)
                     next_index = _drain_ready_batches(
                         pending, 
                         next_index, 
@@ -215,21 +215,28 @@ def _build_batch_worker(
     backend: Any,
     post_processor: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]],
     tool_registry: Dict[str, Callable[..., Any]],
-) -> Callable[[List[str]], List[Dict[str, Any]]]:
+) -> Callable[[List[str]], Tuple[Future[List[Dict[str, Any]]], Dict[str, Any]]]:
     if not tool_registry:
-        return lambda prompts: _immediate_future(_text_batch_worker(
+        return lambda prompts: (
+            _immediate_future(_text_batch_worker(
+                prompts=prompts,
+                backend=backend,
+                job=job,
+                post_processor=post_processor,
+                )
+            ),
+            dict(backend.metrics() or {})
+        )
+
+    return lambda prompts: (
+        _tool_batch_worker(
             prompts=prompts,
             backend=backend,
             job=job,
             post_processor=post_processor,
-        ))
-
-    return lambda prompts: _tool_batch_worker(
-        prompts=prompts,
-        backend=backend,
-        job=job,
-        post_processor=post_processor,
-        tool_registry=tool_registry,
+            tool_registry=tool_registry,
+        ),
+        dict(backend.metrics() or {})
     )
 
 def _pair_records(prompts: Iterable[str], generations: Iterable[str]) -> List[Dict[str, Any]]:
@@ -361,10 +368,9 @@ def _tool_batch_worker(
     tool_registry: Dict[str, Callable[..., Any]],
 ) -> List[Dict[str, Any]]:
     tool_defs = _tool_descriptors(job.tools)
-    turn_limit = _tool_turn_limit(job)
 
-    max_concurrency = int(job.generation.get("max_batch_size", 4))
-    max_concurrency = max(1, max_concurrency)
+    turn_limit = max(1, job.generation.max_turns or 16)
+    max_concurrency = max(1, job.generation.max_batch_size or 4)
     max_concurrency = min(max_concurrency, len(prompts))
 
     executor = ThreadPoolExecutor(max_workers=max_concurrency)
@@ -413,6 +419,99 @@ def _tool_batch_worker(
 
     threading.Thread(target=finalize, daemon=True).start()
     return aggregate
+
+def _tool_descriptors(tool_specs: Optional[List[ToolConfig]]) -> List[Dict[str, Any]]:
+    descriptors = []
+    for spec in tool_specs or []:
+        descriptors.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": spec.json_schema,
+                }
+            }
+        )
+    return descriptors
+
+def _run_prompt_with_tools(
+    *,
+    backend: Any,
+    job: JobConfig,
+    prompt: str,
+    tool_defs: List[Dict[str, Any]],
+    tool_registry: Dict[str, Callable[..., Any]],
+    turn_limit: int,
+) -> List[Dict[str, Any]]:
+    history = _initial_chat_history(prompt, job)
+    transcript = []
+
+    for _ in range(turn_limit):
+        assistant_message = _call_backend_chat(
+            backend=backend,
+            messages=history,
+            tools=tool_defs,
+            parameters=job.generation.parameters,
+        )
+        snapshot = {
+            "role": "assistant",
+            "content": assistant_message.get("content", ""),
+            "tool_calls": assistant_message.get("tool_calls"),
+        }
+        transcript.append(snapshot)
+        history.append(snapshot)
+        tool_calls = assistant_message.get("tool_calls") or []
+        if not tool_calls:
+            return transcript
+        
+        for call in tool_calls:
+            tool_name = call.get("name")
+            if not tool_name or tool_name not in tool_registry:
+                raise JobExecutionError(f"Assistant requested unknown tool `{tool_name}`")
+
+            args = call.get("arguments") # TODO: check type with reference docs
+            success = True
+            try:
+                result = tool_registry[tool_name](**args)
+            except Exception as exc:
+                success = False
+                result = {"error": str(exc)}
+            payload = _serialize_tool_output(result)
+            tool_message = {
+                "role": "tool",
+                "name": tool_name,
+                "content": payload,
+                "tool_call_id": call.get("id"),
+            }
+            transcript.append(tool_message)
+            history.append(
+                {
+                    "role": "tool",
+                    "content": payload,
+                    "tool_call_id": call.get("id"),
+                }
+            )
+            logger.info("Tool %s invoked. Success: %s.", tool_name, success)
+
+    raise JobExecutionError(f"Tool-enabled generation exceeded {turn_limit} turns without reaching a final response.")
+
+def _call_backend_chat(
+    *,
+    backend: Any,
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    parameters: Dict[str, Any],
+) -> Dict[str, Any]:
+    pass
+
+def _initial_chat_history(prompt: str, job: JobConfig) -> List[Dict[str, Any]]:
+    history = []
+    system_prompt = job.model.parameters.get("system_prompt")
+    if system_prompt:
+        history.append({"role": "system", "content": system_prompt})
+    history.append({"role": "user", "content": prompt})
+    return history
 
 def _resolve_batch_size(job: JobConfig, prompts: List[str]) -> int:
     requested = job.generation.max_batch_size
