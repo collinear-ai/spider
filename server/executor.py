@@ -435,6 +435,18 @@ def _tool_descriptors(tool_specs: Optional[List[ToolConfig]]) -> List[Dict[str, 
         )
     return descriptors
 
+def _serialize_tool_output(result: Any) -> str:
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, (dict, list, tuple, int, float, bool)):
+        try:
+            return json.dumps(result)
+        except (TypeError, ValueError):
+            pass
+    return str(result)
+
 def _run_prompt_with_tools(
     *,
     backend: Any,
