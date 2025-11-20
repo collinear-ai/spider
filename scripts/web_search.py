@@ -2,12 +2,13 @@ import os
 from typing import Any, Dict, List, Optional
 
 from spider.client import SpiderClient
-from spider.config import AppConfig
+from spider.config import AppConfig, RuntimeDependencyConfig
 
 TAVILY_ENDPOINT = "https://api.tavily.com/search"
 
-def web_search(query, max_results, *, api_key):
+def web_search(query, max_results):
     import httpx
+    api_key = os.environ["TAVILY_API_KEY"]
     payload = {
         "query": query,
         "max_results": max(1, min(max_results, 10)),
@@ -87,12 +88,16 @@ def _fetch_schema():
 
 def main():
     config = AppConfig.load("config/web_search.yaml")
+    runtime = config.job.runtime or RuntimeDependencyConfig()
+    runtime.packages = ["httpx", "beautifulsoup4"]
+    runtime.env = {"TAVILY_API_KEY": os.environ["TAVILY_API_KEY"]}
+    config.job.runtime = runtime
+
     with SpiderClient(config=config) as client:
         client.add_tool(
             description="Run a web search and return relevant results.",
             json_schema=_search_schema(),
             func=web_search,
-            kwargs={"api_key": os.environ["TAVILY_API_KEY"]}
         )
         client.add_tool(
             description="Download a web page and return a cleaned text snippet.",
