@@ -131,19 +131,12 @@ def main() -> None:
         post_processor=filter_row
     ) as client:
         submission = client.submit_job()
-        job_id = submission["job_id"]
-        print(f"Job submitted: {job_id}")
-
-        status = client.poll_job(job_id, interval=5.0, wait_for_completion=True)
-        print(f"Final status: {status['status']}")
+        status = client.poll_job(submission["job_id"], interval=5.0, wait_for_completion=True)
 
         if status["status"] == "completed":
-            artifact_path = client.download_result(job_id, destination="artifacts/test-remote.json")
-            print(f"Artifacts saved to {artifact_path}")
+            client.download_result(submission["job_id"], destination="artifacts/test-remote.json")
         else:
-            print("Messages: ", status.get("messages", []))
-            if status.get("error"):
-                print("Error: ", status["error"])
+            raise RuntimeError(status.get("error") or status.get("messages"))
 
 if __name__ == "__main__":
     main()
