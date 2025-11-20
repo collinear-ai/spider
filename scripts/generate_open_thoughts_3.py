@@ -1,8 +1,6 @@
 import json, os
 from typing import Iterable, Dict, Any, List, Optional
 
-from openai import OpenAI
-
 from spider.client import SpiderClient
 from spider.config import AppConfig
 
@@ -89,6 +87,8 @@ First reason through the problem. Then provide your final code in backticks.
 _gpt_client = None
 
 def get_client(api_key):
+    from openai import OpenAI
+    
     global _gpt_client
     if _gpt_client is None:
         _gpt_client = OpenAI(api_key=api_key)

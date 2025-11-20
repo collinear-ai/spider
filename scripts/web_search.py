@@ -1,7 +1,5 @@
-import os, httpx
+import os
 from typing import Any, Dict, List, Optional
-
-from bs4 import BeautifulSoup
 
 from spider.client import SpiderClient
 from spider.config import AppConfig
@@ -9,6 +7,7 @@ from spider.config import AppConfig
 TAVILY_ENDPOINT = "https://api.tavily.com/search"
 
 def web_search(query, max_results, *, api_key):
+    import httpx
     payload = {
         "query": query,
         "max_results": max(1, min(max_results, 10)),
@@ -40,6 +39,9 @@ def web_search(query, max_results, *, api_key):
     }
 
 def fetch_page(url, max_chars):
+    import httpx
+    from bs4 import BeautifulSoup
+    
     with httpx.Client(timeout=20.0) as client:
         response = client.get(url, follow_redirects=True)
         response.raise_for_status()
