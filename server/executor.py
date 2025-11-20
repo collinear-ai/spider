@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json, os, logging, inspect, time, threading
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any, Dict, List, Optional, Callable, Iterable, Tuple
 from types import MappingProxyType
 
 from spider.config import JobConfig, OutputMode, ProcessorConfig, ToolConfig
+from .runtime_env import RuntimeEnvironment, RuntimeEnvironmentError
 from .backends.factory import create_backend
 from . import events
 from .sources import collect_prompts
@@ -76,6 +78,17 @@ def _run_off_policy_job(
 ) -> JobExecutionResult:
     artifact_path = workspace / "result.jsonl"
     metadata_path = workspace / "metadata.json"
+    runtime_env = None
+    runtime_stack = ExitStack()
+
+    if job.runtime:
+        runtime_env = RuntimeEnvironment()
+        try:
+            runtime_env.create()
+            runtime_env.install(job.runtime.packages)
+        except RuntimeEnvironmentError as exc:
+            raise JobExecutionError(f"Failed to prepare runtime environment: {exc}") from exc
+        runtime_stack.enter_context(runtime_env.activate(job.runtime.env))
 
     _ensure_tensor_parallel(job)
     backend = create_backend(job.model)
@@ -128,6 +141,9 @@ def _run_off_policy_job(
         )
     finally:
         _shutdown_backend(job_id, backend)
+        runtime_stack.close()
+        if runtime_env:
+            runtime_env.cleanup()
 
 def _run_batched_generation(
     *,
