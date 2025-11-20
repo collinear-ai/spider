@@ -139,10 +139,7 @@ def bundle_processor_source(func: Callable) -> str:
             if dep_name in index.imports:
                 required_imports[dep_name] = index.imports[dep_name]
                 continue
-            raise ProcessorBundlingError(
-                f"Processor `{name}` references `{dep_name}` which is not defined "
-                f"in {module_path}."
-            )
+            continue # leave unresolved symbol to runtime
 
     import_block = _render_block(required_imports.values())
     assignment_block = _render_block(required_assignments.values())
