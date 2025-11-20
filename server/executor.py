@@ -592,6 +592,8 @@ def _job_snapshot(job: JobConfig) -> Dict[str, Any]:
         "output": _sanitize_output_config(job.output.model_dump(exclude_none=True)),
         "metadata": dict(job.metadata)
     }
+    if job.runtime:
+        snapshot["runtime"] = job.runtime.model_dump(exclude_none=True)
     processors = {}
     if job.pre_processor:
         processors["pre_processor"] = _processor_snapshot(job.pre_processor)

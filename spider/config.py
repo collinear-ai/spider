@@ -165,6 +165,16 @@ class ToolConfig(BaseModel):
     kwargs: Dict[str, Any] = Field(
         default_factory=dict, description="Kwargs forwarded to the tool callable"
     )
+
+class RuntimeDependencyConfig(BaseModel):
+    packages: List[str] = Field(
+        default_factory=list,
+        description="List of pip requirements that must be installed before execution."
+    )
+    env: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Environment variables to expose the runetime sandbox when using dependencies"
+    )
     
 class JobConfig(BaseModel):
     model: ModelConfig
@@ -186,6 +196,10 @@ class JobConfig(BaseModel):
     tools: List[ToolConfig] = Field(
         default_factory=list,
         description="Optional set of tools"
+    )
+    runtime: Optional[RuntimeDependencyConfig] = Field(
+        default=None,
+        description="Optional runtime dependency requirements declared by the client"
     )
 
     @model_validator(mode="after")
