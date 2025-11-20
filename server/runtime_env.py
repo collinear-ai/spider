@@ -18,6 +18,7 @@ class RuntimeEnvironment:
         self._lock = threading.RLock()
         self._thread_state = threading.local()
         self._global_snapshot: Optional[Tuple[Dict[str, str], List[str]]] = None
+        self._cwd_snapshot: Optional[Path] = None
 
     def create(self) -> None:
         self._run([self._python, "-m", "venv", str(self._venv_dir)])
@@ -79,16 +80,23 @@ class RuntimeEnvironment:
             previous_env = os.environ.copy()
             previous_path = list(sys.path)
             self._global_snapshot = (previous_env, previous_path)
+            self._cwd_snapshot = Path.cwd()
             os.environ["VIRTUAL_ENV"] = str(self._venv_dir)
             os.environ["PATH"] = f"{self._bin_dir}{os.pathsep}{previous_env.get('PATH', '')}"
             if extra_env:
                 os.environ.update(extra_env)
-            sys.path.insert(0, str(self._site_packages))
+            os.environ["HOME"] = str(self._workspace)
+            os.environ["SPIDER_SANDBOX_ROOT"] = str(self._workspace)
+            sys.path[:] = [str(self._workspace) + [str(self._site_packages)] + previous_path]
+            os.chdir(self._workspace)
 
     def _exit_global(self) -> None:
         with self._lock:
             if not self._global_snapshot:
                 return
+            if self._cwd_snapshot is not None:
+                os.chdir(self._cwd_snapshot)
+                self._cwd_snapshot = None
             previous_env, previous_path = self._global_snapshot
             os.environ.clear()
             os.environ.update(previous_env)
