@@ -88,7 +88,9 @@ def _fetch_schema():
 
 def main():
     config = AppConfig.load("config/web_search.yaml")
-    runtime = config.job.runtime or RuntimeDependencyConfig()
+    runtime = config.job.runtime
+    if runtime is None:
+        runtime = RuntimeDependencyConfig()
     runtime.packages = ["httpx", "beautifulsoup4"]
     runtime.env = {"TAVILY_API_KEY": os.environ["TAVILY_API_KEY"]}
     config.job.runtime = runtime
