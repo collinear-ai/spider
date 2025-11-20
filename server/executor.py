@@ -89,11 +89,15 @@ def _run_off_policy_job(
         except RuntimeEnvironmentError as exc:
             raise JobExecutionError(f"Failed to prepare runtime environment: {exc}") from exc
         runtime_stack.enter_context(runtime_env.activate(job.runtime.env))
+        events.emit(
+            "Runtime sandbox prepared.",
+            code="runtime.ready",
+        )
 
     _ensure_tensor_parallel(job)
     backend = create_backend(job.model)
-    pre_processor = _resolve_processor(job.pre_processor) if job.pre_processor else None
-    post_processor = _resolve_processor(job.post_processor) if job.post_processor else None
+    pre_processor = _resolve_processor(job.pre_processor, runtime_env=runtime_env) if job.pre_processor else None
+    post_processor = _resolve_processor(job.post_processor, runtime_env=runtime_env) if job.post_processor else None
     prompts = collect_prompts(job.source, pre_processor=pre_processor)
 
     if not prompts:
@@ -117,7 +121,7 @@ def _run_off_policy_job(
         data={"total_prompts": len(prompts)}
     )
 
-    tool_registry = _resolve_tools(job.tools)
+    tool_registry = _resolve_tools(job.tools, runtime_env=runtime_env)
     try:
         batch_worker = _build_batch_worker(
             job=job,
@@ -144,6 +148,10 @@ def _run_off_policy_job(
         runtime_stack.close()
         if runtime_env:
             runtime_env.cleanup()
+            events.emit(
+                "Runtime sandbox cleaned.",
+                code="runtime.cleaned"
+            )
 
 def _run_batched_generation(
     *,
@@ -157,6 +165,8 @@ def _run_batched_generation(
     aggregated_metrics = {}
     records_written = 0
     payload = _base_metadata(job_id, job)
+    if job.runtime and job.runtime.packages:
+        payload.setdefault("runtime", {})["packages"] = list(job.runtime.packages)
     _write_metadata(metadata_path, payload, records_written)
 
     batch_size = _resolve_batch_size(job, prompts)
@@ -261,7 +271,7 @@ def _pair_records(prompts: Iterable[str], generations: Iterable[str]) -> List[Di
         paired.append({"prompt": prompt, "completion": completion})
     return paired
 
-def _resolve_processor(spec: Optional[ProcessorConfig]) -> Optional[Callable[[Dict[str, Any]], Any]]:
+def _resolve_processor(spec: Optional[ProcessorConfig], *, runtime_env: Optional["RuntimeEnvironment"] = None) -> Optional[Callable[[Dict[str, Any]], Any]]:
     if spec is None:
         return None
     exec_ns = {}
@@ -278,9 +288,9 @@ def _resolve_processor(spec: Optional[ProcessorConfig]) -> Optional[Callable[[Di
     def wrapped(record: Dict[str, Any]):
         return func(record, **spec.kwargs)
     
-    return wrapped
+    return _wrap_runtime_callable(wrapped, runtime_env)
 
-def _resolve_tools(tool_specs: Optional[List[ToolConfig]]) -> Dict[str, Callable[..., Any]]:
+def _resolve_tools(tool_specs: Optional[List[ToolConfig]], *, runtime_env: Optional["RuntimeEnvironment"] = None) -> Dict[str, Callable[..., Any]]:
     registry = {}
     for spec in tool_specs or []:
         if spec.name in registry:
@@ -300,9 +310,22 @@ def _resolve_tools(tool_specs: Optional[List[ToolConfig]]) -> Dict[str, Callable
                 bound = dict(kwargs)
                 bound.update(inner_kwargs)
                 return f(*args, **bound)
-            return wrapper
+            return _wrap_runtime_callable(wrapper, runtime_env)
         registry[spec.name] = _make_wrapper(func, dict(spec.kwargs or {}))
     return registry
+
+def _wrap_runtime_callable(
+    func: Callable[..., Any],
+    runtime_env: Optional["RuntimeEnvironment"],
+) -> Callable[..., Any]:
+    if runtime_env is None:
+        return func
+
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        with runtime_env.activate():
+            return func(*args, **kwargs)
+
+    return wrapped
 
 def _process_batch(
     prompts: Iterable[str], generations: Iterable[str], 
