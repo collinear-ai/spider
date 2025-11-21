@@ -77,7 +77,7 @@ class VLLMBackend:
         )
         logger.info(
             "vLLM chat return %d output batch(es)",
-            len(outputs) if outputs is not None else 0s
+            len(outputs) if outputs is not None else 0
         )
         response = {}
         if not outputs:
