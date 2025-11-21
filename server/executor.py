@@ -540,7 +540,8 @@ def _run_prompt_with_tools(
     history = _initial_chat_history(prompt, job)
     transcript = []
     
-    prompt_preview = prompt[:80] + ("..." if len(prompt) > 80 else "")
+    prompt_preview = prompt.replace("\n", "\\n")
+    prompt_preview = prompt_preview[:40] + ("..." if len(prompt_preview) > 80 else "")
     logger.info("Job %s: Tool-runner invoked for prompt `%s`", job_id, prompt_preview)
 
     for turn_idx in range(turn_limit):
@@ -555,6 +556,14 @@ def _run_prompt_with_tools(
             messages=history,
             tools=tool_defs,
             parameters=job.generation.parameters,
+        )
+        logger.info(
+            "Job %s: assistant turn %d for prompt `%s` returned keys=%s tool_calls=%s",
+            job_id,
+            turn_idx,
+            prompt_preview,
+            sorted(list(assistant_message.keys())),
+            bool(assistant_message.get("tool_calls")) 
         )
         snapshot = {
             "role": "assistant",
