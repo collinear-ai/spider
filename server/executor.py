@@ -678,6 +678,7 @@ def _base_metadata(job_id: str, job: JobConfig) -> Dict[str, Any]:
 
 def _write_metadata(path: Path, payload: Dict[str, Any], records: int) -> None:
     payload["records"] = records
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 def _summarize_metrics(records: int, aggregated: Dict[str, float]) -> Dict[str, Any]:
