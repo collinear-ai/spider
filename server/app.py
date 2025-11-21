@@ -16,7 +16,7 @@ from .executor import JobExecutionError, run_generation_job, _job_snapshot
 from . import events
 
 def _configure_executor_logging() -> None:
-    logger = logger.getLogger("server.executor")
+    logger = logging.getLogger("server.executor")
     logger.setLevel(logging.INFO)
     if logger.handlers:
         return
