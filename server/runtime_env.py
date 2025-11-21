@@ -36,7 +36,7 @@ class RuntimeEnvironment:
     def activate(self, extra_env: Optional[Dict[str, str]] = None):
         if not self._site_packages:
             raise RuntimeEnvironmentError("Runtime environment not created.")
-        state_stack = Deque[int] = getattr(self._thread_state, "stack", deque())
+        state_stack: Deque[int] = getattr(self._thread_state, "stack", deque())
         setattr(self._thread_state, "stack", state_stack)
         reentrant = bool(state_stack)
         token = object()
