@@ -200,7 +200,13 @@ class SpiderClient:
         else:
             line = f"[{level}] {message}"
         if data:
-            line = f"{line} {json.dumps(data)}"
+            items = []
+            for key in data.keys():
+                value = data[key]
+                serialized = json.dumps(value, ensure_ascii=True)
+                items.append(f"{key}={serialized}")
+            if items:
+                line = f"{line} |" + " | ".join(items)
         print(line, file=sys.stdout, flush=True)
 
     def _ensure_client(self) -> httpx.Client:
