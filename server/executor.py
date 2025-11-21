@@ -623,9 +623,7 @@ def _sanitize_generation_config(payload: Dict[str, Any]) -> Dict[str, Any]:
 def _sanitize_output_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     hf_config = payload.get("hf")
     if isinstance(hf_config, dict):
-        scrubbed = dict(hf_config)
-        scrubbed.pop("token", None)
-        payload["hf"] = scrubbed
+        payload["hf"] = dict(hf_config)
     return payload
 
 def _job_snapshot(job: JobConfig) -> Dict[str, Any]:

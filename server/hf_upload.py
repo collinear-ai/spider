@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 from huggingface_hub import HfApi, HfFolder, upload_file, upload_folder
@@ -13,7 +14,7 @@ class HFUploadError(RuntimeError):
 def publish_to_hub(
     *, job_id: str, artifact: Path, metadata: Path, config: HFUploadConfig
 ) -> str:
-    token = _resolve_token(config)
+    token = os.environ.get("HF_TOKEN")
     api = HfApi(token=token)
     repo_id = config.repo_id
     repo_type = (config.repo_type or "dataset").strip() or "dataset"
@@ -71,14 +72,6 @@ def _compose_repo_path(prefix: str, name: str) -> str:
     if prefix:
         return f"{prefix.rstrip('/')}/{name}"
     return name
-
-def _resolve_token(config: HFUploadConfig) -> str:
-    if config.token:
-        return config.token
-    token = HfFolder.get_token()
-    if token:
-        return token
-    raise HFUploadError("Hugging Face token must be supplied via config or `huggingface-cli login`")
 
 def _wrap_hf_error(prefix: str, exc: Exception) -> HFUploadError:
     if isinstance(exc, HfHubHTTPError):

@@ -121,12 +121,7 @@ class HFUploadConfig(BaseModel):
         default=None,
         description="Subset config name for the dataset upload"
     )
-    token: Optional[str] = Field(
-        default=None,
-        description="Write token supplied by client for Hub access"
-    )
-    private: bool = Field(default=True, description="whether to keep the target repo private")
-
+    
 class OutputConfig(BaseModel):
     mode: OutputMode = Field(default=OutputMode.RETURN)
     local_path: Optional[str] = Field(
