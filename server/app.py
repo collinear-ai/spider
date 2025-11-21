@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json, os, traceback
+import json, os, traceback, logging
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 from enum import Enum
@@ -14,6 +14,19 @@ from pydantic import BaseModel, Field
 from spider.config import JobConfig, OutputMode
 from .executor import JobExecutionError, run_generation_job, _job_snapshot
 from . import events
+
+def _configure_executor_logging() -> None:
+    logger = logger.getLogger("server.executor")
+    logger.setLevel(logging.INFO)
+    if logger.handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+_configure_executor_logging()
 
 app = FastAPI(title="Spider Data Generation Service", version="0.1.0")
 
