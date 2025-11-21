@@ -87,7 +87,7 @@ class RuntimeEnvironment:
                 os.environ.update(extra_env)
             os.environ["HOME"] = str(self._workspace)
             os.environ["SPIDER_SANDBOX_ROOT"] = str(self._workspace)
-            sys.path[:] = [str(self._workspace) + [str(self._site_packages)] + previous_path]
+            sys.path[:] = [str(self._workspace) + str(self._site_packages)] + previous_path
             os.chdir(self._workspace)
 
     def _exit_global(self) -> None:
