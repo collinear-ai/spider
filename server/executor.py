@@ -19,6 +19,8 @@ from .hf_upload import HFUploadError, publish_to_hub
 from .on_policy import run_on_policy_job
 
 logger = logging.getLogger(__name__)
+if logger.level == logging.NOTSET:
+    logger.setLevel(logging.INFO)
 
 class JobExecutionError(Exception):
     def __init__(self, message: str):
