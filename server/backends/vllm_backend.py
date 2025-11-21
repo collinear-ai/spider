@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from typing import Dict, Iterable, List, Any, Optional
-import threading
+import threading, logging
 
 from vllm import LLM, SamplingParams
 
 from spider.config import ModelConfig
+
+logger = logging.getLogger(__name__)
 
 class VLLMBackend:
     def __init__(self, config: ModelConfig):
@@ -63,10 +65,19 @@ class VLLMBackend:
         parameters: Dict[str, Any],
     ) -> Dict[str, Any]:
         sampling = SamplingParams(**parameters)
+        logger.info(
+            "vLLM chat caled with %d messages(s), tools=%s",
+            len(messages),
+            bool(tools),
+        )
         outputs = self._llm.chat(
             [messages], 
             sampling_params=sampling,
             tools=tools,
+        )
+        logger.info(
+            "vLLM chat return %d output batch(es)",
+            len(outputs) if outputs is not None else 0s
         )
         response = {}
         if not outputs:
