@@ -539,8 +539,17 @@ def _run_prompt_with_tools(
 ) -> List[Dict[str, Any]]:
     history = _initial_chat_history(prompt, job)
     transcript = []
+    
+    prompt_preview = prompt[:80] + ("..." if len(prompt) > 80 else "")
+    logger.info("Job %s: Tool-runner invoked for prompt `%s`", job_id, prompt_preview)
 
-    for _ in range(turn_limit):
+    for turn_idx in range(turn_limit):
+        logger.info(
+            "Job %s: starting turn %d for prompt `%s`",
+            job_id,
+            turn_idx,
+            prompt_preview
+        )
         assistant_message = _call_backend_chat(
             backend=backend,
             messages=history,
@@ -559,7 +568,7 @@ def _run_prompt_with_tools(
             logger.info(
                 "Job %s: trajectory finished for prompt `%s'",
                 job_id,
-                prompt[:64] + ("..." if len(prompt) > 64 else ""),
+                prompt_preview,
             )
             return transcript
         
@@ -576,7 +585,7 @@ def _run_prompt_with_tools(
                 tool_name,
                 turn_index,
                 raw_args,
-                prompt[:64] + ("..." if len(prompt) > 64 else "")
+                prompt_preview
             )
             try:
                 tool_args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
@@ -609,7 +618,7 @@ def _run_prompt_with_tools(
                 job_id,
                 tool_name, 
                 success,
-                prompt[:64] + ("..." if len(prompt) > 64 else ""),
+                prompt_preview,
             )
 
     raise JobExecutionError(f"Tool-enabled generation exceeded {turn_limit} turns without reaching a final response.")
