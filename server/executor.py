@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json, os, logging, inspect, time, threading
+import json, os, logging, inspect, time, threading, traceback
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -21,7 +21,12 @@ from .on_policy import run_on_policy_job
 logger = logging.getLogger(__name__)
 
 class JobExecutionError(Exception):
-    pass
+    def __init__(self, message: str):
+        tb = traceback.format_exc()
+        if not tb.strip() or tb.strip() == "NoneType: None":
+            tb = "".join(traceback.format_stack()[:-1])
+        payload = f"{message}\n{tb}".strip()
+        super().__init__(payload)
 
 @dataclass
 class JobExecutionResult:
