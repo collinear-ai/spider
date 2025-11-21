@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json, os
+import json, os, traceback
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 from enum import Enum
@@ -102,13 +102,14 @@ def _execute_job(job_id: str) -> None:
         )
     except Exception as exc:
         record.status = JobStatus.FAILED
-        record.error_message = str(exc)
-        record.messages.append(f"Job crashed: {exc}")
+        crash_tb = traceback.format_exc().strip()
+        record.error_message = crash_tb
+        record.messages.append(f"Job crashed: \n{crash_tb}")
         events.emit(
             "Job crashed.",
             level="error",
             code="job.crashed",
-            data={"error": str(exc)}
+            data={"error": crash_tb.splitlines()[-1]}
         )
     finally:
         record.updated_at = datetime.utcnow()
