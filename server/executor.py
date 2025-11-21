@@ -129,6 +129,7 @@ def _run_off_policy_job(
     tool_registry = _resolve_tools(job.tools, runtime_env=runtime_env)
     try:
         batch_worker = _build_batch_worker(
+            job_id=job_id,
             job=job,
             backend=backend,
             post_processor=post_processor,
@@ -179,12 +180,23 @@ def _run_batched_generation(
     try:
         pending = {}
         next_index = 0
+        total_batches = (len(prompts) + batch_size -1) // batch_size
 
         with JSONLBatchWriter(artifact_path) as writer:
             executor_context = ThreadPoolExecutor(max_workers=_processing_worker_count())
             try:
                 for batch_index, chunk_start in enumerate(range(0, len(prompts), batch_size)):
                     chunk = prompts[chunk_start : chunk_start + batch_size]
+                    events.emit(
+                        "Batch started.",
+                        code="batch.started",
+                        data={
+                            "batch_index": batch_index,
+                            "batch_size": batch_size,
+                            "total_batches": total_batches,
+                            "records_written": writer.count,
+                        }
+                    )
                     future, batch_metrics = batch_worker(chunk)
                     pending[batch_index] = (future, batch_metrics)
                     next_index = _drain_ready_batches(
@@ -194,7 +206,8 @@ def _run_batched_generation(
                         aggregated_metrics, 
                         payload,
                         metadata_path, 
-                        block=False
+                        block=False,
+                        batch_started=batch_index
                     )
                 next_index = _drain_ready_batches(
                     pending, 
@@ -203,7 +216,8 @@ def _run_batched_generation(
                     aggregated_metrics, 
                     payload,
                     metadata_path, 
-                    block=True
+                    block=True,
+                    batch_started=batch_index
                 )
             finally:
                 if executor_context:
@@ -242,6 +256,7 @@ def _run_batched_generation(
 
 def _build_batch_worker(
     *,
+    job_id: str,
     job: JobConfig,
     backend: Any,
     post_processor: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]],
@@ -261,6 +276,7 @@ def _build_batch_worker(
 
     return lambda prompts: (
         _tool_batch_worker(
+            job_id=job_id,
             prompts=prompts,
             backend=backend,
             job=job,
@@ -349,8 +365,14 @@ def _process_batch(
 
 def _drain_ready_batches(
     pending: Dict[int, Tuple[Future[List[Dict[str, Any]]], Dict[str, Any]]],
-    next_index: int, writer: JSONLBatchWriter, aggregated_metrics: Dict[str, float],
-    payload: Dict[str, Any], metadata_path: Path, *, block: bool
+    next_index: int, 
+    writer: JSONLBatchWriter, 
+    aggregated_metrics: Dict[str, float],
+    payload: Dict[str, Any], 
+    metadata_path: Path, 
+    *, 
+    block: bool, 
+    batch_started: Optional[int],
 ) -> int:
     while next_index in pending:
         future, batch_metrics = pending[next_index]
@@ -361,6 +383,15 @@ def _drain_ready_batches(
         except Exception as exc:
             raise JobExecutionError(f"Processor failed: {exc}") from exc
         writer.write_records(records)
+        events.emit(
+            "Batch completed.",
+            code="batch.completed",
+            data={
+                "batch_index": next_index,
+                "records_written": writer.count,
+                "records_in_batch": len(records),
+            }
+        )
 
         for key, value in batch_metrics.items():
             if isinstance(value, (int, float)):
@@ -405,6 +436,7 @@ def _text_batch_worker(
 
 def _tool_batch_worker(
     *,
+    job_id: str,
     prompts: List[str],
     backend: Any,
     job: JobConfig,
@@ -427,6 +459,7 @@ def _tool_batch_worker(
             tool_defs=tool_defs,
             tool_registry=tool_registry,
             turn_limit=turn_limit,
+            job_id=job_id,
         )
         record = {"prompt": prompt, "completion": transcript}
         if post_processor:
@@ -499,6 +532,7 @@ def _run_prompt_with_tools(
     tool_defs: List[Dict[str, Any]],
     tool_registry: Dict[str, Callable[..., Any]],
     turn_limit: int,
+    job_id: str,
 ) -> List[Dict[str, Any]]:
     history = _initial_chat_history(prompt, job)
     transcript = []
@@ -519,6 +553,11 @@ def _run_prompt_with_tools(
         history.append(snapshot)
         tool_calls = assistant_message.get("tool_calls") or []
         if not tool_calls:
+            logger.info(
+                "Job %s: trajectory finished for prompt `%s'",
+                job_id,
+                prompt[:64] + ("..." if len(prompt) > 64 else ""),
+            )
             return transcript
         
         for call in tool_calls:
@@ -527,6 +566,15 @@ def _run_prompt_with_tools(
                 raise JobExecutionError(f"Assistant requested unknown tool `{tool_name}`")
 
             raw_args = call.get("arguments") or "{}"
+            turn_index = len(transcript) - 1
+            logger.info(
+                "Job %s: invoking tool `%s` (turn=%d) args=%s for prompt '%s'",
+                job_id,
+                tool_name,
+                turn_index,
+                raw_args,
+                prompt[:64] + ("..." if len(prompt) > 64 else "")
+            )
             try:
                 tool_args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
             except (TypeError, ValueError) as exc:
@@ -553,7 +601,13 @@ def _run_prompt_with_tools(
                     "tool_call_id": call.get("id"),
                 }
             )
-            logger.info("Tool %s invoked. Success: %s.", tool_name, success)
+            logger.info(
+                "Job %s: Tool %s invoked. Success: %s for prompt `%s`", 
+                job_id,
+                tool_name, 
+                success,
+                prompt[:64] + ("..." if len(prompt) > 64 else ""),
+            )
 
     raise JobExecutionError(f"Tool-enabled generation exceeded {turn_limit} turns without reaching a final response.")
 
