@@ -100,6 +100,7 @@ def _run_off_policy_job(
             "Runtime sandbox prepared.",
             code="runtime.ready",
         )
+        logger.info("Job %s: runtime sandbox prepared and activated.", job_id)
 
     _ensure_tensor_parallel(job)
     backend = create_backend(job.model)
