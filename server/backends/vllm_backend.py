@@ -66,7 +66,7 @@ class VLLMBackend:
     ) -> Dict[str, Any]:
         sampling = SamplingParams(**parameters)
         logger.info(
-            "vLLM chat caled with %d messages(s), tools=%s",
+            "vLLM chat called with %d messages(s), tools=%s",
             len(messages),
             bool(tools),
         )
@@ -93,6 +93,11 @@ class VLLMBackend:
                 tool_calls = message.get("tool_calls")
             response = {"content": content, "tool_calls": tool_calls}
 
+        logger.info(
+            "vLLM chat returning content length %d tool_calls=%s",
+            len(response.get("content") or ""),
+            bool(response.get("tool_calls"))
+        )
         return response
 
     def metrics(self) -> Dict[str, object]:

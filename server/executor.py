@@ -642,12 +642,22 @@ def _call_backend_chat(
     chat_fn = getattr(backend, "chat", None)
     if not callable(chat_fn):
         raise JobExecutionError("Backend does not support chat tool calls.")
+    logger.info(
+        "Dispatching chat calls with %d message(s), tools=%s",
+        len(messages),
+        bool(tools)
+    )
     try:
-        return chat_fn(
+        response = chat_fn(
             messages=messages,
             tools=tools or None,
             parameters=dict(parameters or {})
         )
+        logger.info(
+            "Chat call returned successfully (tool_calls=%s)",
+            bool(response.get("tool_calls"))
+        )
+        return response
     except Exception as exc:
         raise JobExecutionError(f"Chat backend failed: {exc}") from exc
 
