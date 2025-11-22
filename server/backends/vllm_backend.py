@@ -86,16 +86,17 @@ class VLLMBackend:
             response = {"content": "", "tool_calls": None}
         else:
             first = outputs[0]
-            logger.info("first.outputs len=%s", len(first.outputs))
             choice = first.outputs[0] if first.outputs else None
-            logger.info("choice=%s", type(choice))
             content = ""
             tool_calls = None
             if choice is not None:
                 message = getattr(choice, "message", None)
-                logger.info("message=%s", type(message))
-                content = message.get("content") or ""
-                tool_calls = message.get("tool_calls")
+                if message:
+                    content = message.get("content") or ""
+                    tool_calls = message.get("tool_calls")
+                else:
+                    logging.warning("choice.message is None, using choice.outputs[0].text")
+                    content = choice.outputs[0].text if getattr(choice, "outputs", None) else ""
             response = {"content": content, "tool_calls": tool_calls}
 
         logger.info(
