@@ -22,6 +22,7 @@ def _configure_executor_logging() -> None:
     )
 
 _configure_executor_logging()
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Spider Data Generation Service", version="0.1.0")
 
@@ -99,6 +100,7 @@ def _execute_job(job_id: str) -> None:
         record.status = JobStatus.COMPLETED
         events.emit("Job completed successfully.", code="job.completed")
     except JobExecutionError as exc:
+        logger.exception("Job %s failed.", job_id)
         record.status = JobStatus.FAILED
         record.error_message = str(exc)
         record.messages.append(f"Job failed: {exc}")
@@ -109,6 +111,7 @@ def _execute_job(job_id: str) -> None:
             data={"error": str(exc)}
         )
     except Exception as exc:
+        logger.exception("Job %s crashed with unexpected error.", job_id)
         record.status = JobStatus.FAILED
         crash_tb = traceback.format_exc().strip()
         record.error_message = crash_tb

@@ -210,7 +210,8 @@ def _run_batched_generation(
                         payload,
                         metadata_path, 
                         block=False,
-                        batch_started=batch_index
+                        batch_started=batch_index,
+                        job_id=job_id,
                     )
                 next_index = _drain_ready_batches(
                     pending, 
@@ -220,7 +221,8 @@ def _run_batched_generation(
                     payload,
                     metadata_path, 
                     block=True,
-                    batch_started=batch_index
+                    batch_started=batch_index,
+                    job_id=job_id,
                 )
             finally:
                 if executor_context:
@@ -376,6 +378,7 @@ def _drain_ready_batches(
     *, 
     block: bool, 
     batch_started: Optional[int],
+    job_id: str,
 ) -> int:
     while next_index in pending:
         future, batch_metrics = pending[next_index]
@@ -384,6 +387,12 @@ def _drain_ready_batches(
         try:
             records = future.result()
         except Exception as exc:
+            logger.exception(
+                "Job %s: processor batch %s failed while draining (block=%s).)",
+                job_id,
+                next_index,
+                block,
+            )
             raise JobExecutionError(f"Processor failed: {exc}") from exc
         writer.write_records(records)
         events.emit(
@@ -495,6 +504,7 @@ def _tool_batch_worker(
         try:
             aggregate.set_result(gather_results())
         except Exception as exc:
+            logger.exception("Job %s: tool prompt worker crashed.", job_id)
             aggregate.set_exception(exc)
 
     threading.Thread(target=finalize, daemon=True).start()
