@@ -87,16 +87,15 @@ class VLLMBackend:
         else:
             first = outputs[0]
             choice = first.outputs[0] if first.outputs else None
-            content = ""
-            tool_calls = None
-            if choice is not None:
-                message = getattr(choice, "message", None)
-                if message:
-                    content = message.get("content") or ""
-                    tool_calls = message.get("tool_calls")
-                else:
-                    logging.warning("choice.message is None, using choice.outputs[0].text")
-                    content = choice.outputs[0].text if getattr(choice, "outputs", None) else ""
+            message = getattr(choice, "message", None)
+            logger.info(
+                "vLLM chat: inspecting choice message (has_message=%s)",
+                bool(message)
+            )
+            if message is None:
+                raise RuntimeError("vLLM chat choice.message missing.")
+            content = message.get("content") or ""
+            tool_calls = message.get("tool_calls")
             response = {"content": content, "tool_calls": tool_calls}
 
         logger.info(
