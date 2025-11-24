@@ -4,6 +4,8 @@ from typing import Dict, Iterable, List, Any, Optional
 import threading, logging
 
 from vllm import LLM, SamplingParams
+from vllm.entrypoints.openai.protocol import ChatCompletionRequest
+from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 
 from spider.config import ModelConfig
 
@@ -18,6 +20,24 @@ class VLLMBackend:
         )
         self._last_metrics: Dict[str, object] = {}
         self._metrics_lock = threading.Lock()
+        self._tool_parser_cls = ToolParserManager.get_tool_parser(
+            self._default_tool_parser(config.name or "")
+        )
+
+    @staticmethod
+    def _default_tool_parser(model_name: str) -> Optional[str]:
+        lower = (model_name or "").lower()
+        if "llama" in lower:
+            return "llama_tool_parser"
+        if "qwen3" in lower:
+            return "qwen3coder_tool_parser"
+        if "deepseek" in lower:
+            return "deepseek_v31" if "v3.1" in lower else "deepseek_v3"
+        if "mistral" in lower:
+            return "mistral_tool_parser"
+        if "glm" in lower:
+            return "glm45"
+        return "openai"
 
     def generate(self, prompts: Iterable[str], *, parameters: Dict[str, object]) -> List[str]:
         tokenizer = self._llm.get_tokenizer()
@@ -86,16 +106,43 @@ class VLLMBackend:
             response = {"content": "", "tool_calls": None}
         else:
             first = outputs[0]
-            choice = first.outputs[0] if first.outputs else None
-            message = getattr(choice, "message", None)
-            logger.info(
-                "vLLM chat: inspecting choice message (has_message=%s)",
-                bool(message)
-            )
-            if message is None:
-                raise RuntimeError("vLLM chat choice.message missing.")
-            content = message.get("content") or ""
-            tool_calls = message.get("tool_calls")
+            if not first.outputs:
+                raise RuntimeError("vLLM chat returned no candidate outputs.")
+
+            completion = first.outputs[0]
+            content = completion.text or ""
+            tool_calls = None
+
+            if self._tool_parser_cls and tools:
+                parser = self._tool_parser_cls(self._llm.get_tokenizer())
+                request = ChatCompletionRequest(
+                    messages=messages,
+                    model=self._config.name,
+                    tools=tools,
+                    tool_choice="auto",
+                    temperature=parameters.get("temperature"),
+                    top_p=parameters.get("top_p"),
+                    top_k=parameters.get("top_k"),
+                    max_tokens=parameters.get("max_tokens"),
+                )
+                request = parser.adjust_request(request)
+                parsed = parser.extract_tool_calls(content, request=request)
+
+                if parsed is not None and parsed.tools_called:
+                    tool_calls = []
+                    for idx, call in enumerate(parsed.tool_calls):
+                        tool_calls.append(
+                            {
+                                "id": call.id or f"call_{idx}",
+                                "type": "function",
+                                "function": {
+                                    "name": call.function.name,
+                                    "arguments": call.function.arguments or "{}",
+                                },
+                            }
+                        )
+                    content = parsed.content or ""
+
             response = {"content": content, "tool_calls": tool_calls}
 
         logger.info(
