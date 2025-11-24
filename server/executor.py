@@ -509,7 +509,7 @@ def _tool_batch_worker(
             for future in futures:
                 if not future.done():
                     future.cancel()
-            executor.shutdown(wait=True)
+            executor.shutdown(wait=False, cancel_futures=True)
 
     aggregate = Future()
 
