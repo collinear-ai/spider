@@ -464,15 +464,19 @@ def _tool_batch_worker(
     executor = ThreadPoolExecutor(max_workers=max_concurrency)
 
     def run_prompt(prompt):
-        transcript = _run_prompt_with_tools(
-            backend=backend,
-            job=job,
-            prompt=prompt,
-            tool_defs=tool_defs,
-            tool_registry=tool_registry,
-            turn_limit=turn_limit,
-            job_id=job_id,
-        )
+        try:
+            transcript = _run_prompt_with_tools(
+                backend=backend,
+                job=job,
+                prompt=prompt,
+                tool_defs=tool_defs,
+                tool_registry=tool_registry,
+                turn_limit=turn_limit,
+                job_id=job_id,
+            )
+        except Exception:
+            logger.exception("Job %s: prompt worker crashed while handling `%s`.", job_id, prompt[:20])
+            raise
         record = {"prompt": prompt, "completion": transcript}
         if post_processor:
             processed = post_processor(record)
