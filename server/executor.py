@@ -681,6 +681,7 @@ def _call_backend_chat(
         )
         return response
     except Exception as exc:
+        logger.exception("Chat backend failed: %s", exc)
         raise JobExecutionError(f"Chat backend failed: {exc}") from exc
 
 def _initial_chat_history(prompt: str, job: JobConfig) -> List[Dict[str, Any]]:
