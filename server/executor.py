@@ -393,6 +393,13 @@ def _drain_ready_batches(
                 next_index,
                 block,
             )
+            events.emit_for_job(
+                job_id,
+                "Processor batch failed.",
+                level="error",
+                code="batch.failed",
+                data={"batch_index": next_index, "error": str(exc)}
+            )
             raise JobExecutionError(f"Processor failed: {exc}") from exc
         writer.write_records(records)
         events.emit(
@@ -509,6 +516,13 @@ def _tool_batch_worker(
             aggregate.set_result(gather_results())
         except Exception as exc:
             logger.exception("Job %s: tool prompt worker crashed.", job_id)
+            events.emit_for_job(
+                job_id,
+                "Tool prompt worker crashed.",
+                level="error",
+                code="batch.worker_failed",
+                data={"error": str(exc)}
+            )
             aggregate.set_exception(exc)
 
     threading.Thread(target=finalize, daemon=True).start()
