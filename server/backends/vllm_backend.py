@@ -28,13 +28,13 @@ class VLLMBackend:
     def _default_tool_parser(model_name: str) -> Optional[str]:
         lower = (model_name or "").lower()
         if "llama" in lower:
-            return "llama_tool_parser"
+            return "llama3_json"
         if "qwen3" in lower:
-            return "qwen3coder_tool_parser"
+            return "qwen3_coder"
         if "deepseek" in lower:
             return "deepseek_v31" if "v3.1" in lower else "deepseek_v3"
         if "mistral" in lower:
-            return "mistral_tool_parser"
+            return "mistral"
         if "glm" in lower:
             return "glm45"
         return "openai"
