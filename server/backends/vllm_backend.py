@@ -29,6 +29,7 @@ class VLLMBackend:
     
         self._last_metrics: Dict[str, object] = {}
         self._metrics_lock = threading.Lock()
+        self._tool_parser = _default_tool_parser(config.name or "")
 
         try:
             self._start_server()
@@ -138,6 +139,10 @@ class VLLMBackend:
             "--port",
             str(self._server_port),
         ]
+        if self._tool_parser:
+            command.append("--enable-auto-tool-choice")
+            command.extend(["--tool-call-parser", self._tool_parser])
+
         for key, value in self._model_params.items():
             if value is None: continue
             flag = f"--{key.replace('_', '-')}"
@@ -232,3 +237,17 @@ def _reserve_port():
     with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+def _default_tool_parser(model_name: str) -> Optional[str]:
+    lower = (model_name or "").lower()
+    if "llama" in lower:
+        return "llama3_json"
+    if "qwen3" in lower:
+        return "qwen3_coder"
+    if "deepseek" in lower:
+        return "deepseek_v31" if "v3.1" in lower else "deepseek_v3"
+    if "glm" in lower:
+        return "glm45"
+    if "mistral" in lower:
+        return "mistral"
+    return "openai"
