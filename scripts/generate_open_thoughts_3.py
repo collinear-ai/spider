@@ -1,14 +1,15 @@
-import json, os
-from typing import Iterable, Dict, Any, List, Optional
+import json
+import os
+from typing import Dict, Any, Optional
 
 from spider.client import SpiderClient
 from spider.config import AppConfig
 
-# == sample post processor ==
 
 LANG_MARKER = "```python"
 
-def _extract_code_block(text):
+
+def _extract_code_block(text: str) -> Optional[str]:
     lower_text = text.lower()
     start_marker = lower_text.rfind(LANG_MARKER)
     if start_marker == -1:
@@ -20,15 +21,8 @@ def _extract_code_block(text):
     snippet = text[code_start:closing_marker].lstrip("\r\n").rstrip()
     return snippet
 
-def filter_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    params:
-    -- row (dict): a single rollout record with a "completion" field (str)
 
-    return:
-    -- enriched record (dict): the updated record with arbitrary fields added / edited
-    -- None: if the record is unwanted
-    """
+def filter_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     completion = row.get("completion")
     if not isinstance(completion, str):
         return None
@@ -36,10 +30,9 @@ def filter_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if snippet is None:
         return None
     enriched = dict(row)
-    enriched["code"] = snippet  
+    enriched["code"] = snippet
     return enriched
 
-# == sample pre processor == 
 
 PROMPT_GPT_DIFFICULTY = """You will be given a code problem. Your job is to grade the difficulty level from 1–10 according to the ICPC standard.
 Here is the standard:
@@ -57,6 +50,7 @@ Level 10: The most challenging problems, often requiring novel approaches or ins
 This scale corresponds roughly to the difficulty progression you might see from early regional contests (levels 1–4) through regional finals (levels 4–7) to world finals problems (levels 7–10).
 Problem to be labeled: {question}."""
 
+
 DIFFICULTY_SCHEMA = {
     "type": "json_schema",
     "json_schema": {
@@ -68,7 +62,7 @@ DIFFICULTY_SCHEMA = {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 10,
-                    "description": "Difficulty score from 1 to 10"
+                    "description": "Difficulty score from 1 to 10",
                 }
             },
             "required": ["score"],
@@ -78,23 +72,27 @@ DIFFICULTY_SCHEMA = {
     },
 }
 
+
 PROMPT_TEMPLATE = """You are a helpful programmer. You are given a programming question below.
 Question: {prompt}
 
-First reason through the problem. Then provide your final code in backticks. 
+First reason through the problem. Then provide your final code in backticks.
 """
+
 
 _gpt_client = None
 
-def get_client(api_key):
+
+def get_client(api_key: str):
     from openai import OpenAI
-    
+
     global _gpt_client
     if _gpt_client is None:
         _gpt_client = OpenAI(api_key=api_key)
     return _gpt_client
 
-def judge_difficulty(client, question):
+
+def judge_difficulty(client, question: str) -> int:
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -105,30 +103,35 @@ def judge_difficulty(client, question):
     msg = resp.choices[0].message.content
     return int(json.loads(msg)["score"])
 
-def build_prompt(row: Dict[str, Any], *, openai_api_key):
-    """
-    param: row (dict): a single prompt record
 
-    return:
-    -- prompt (str): the transformed prompt to be sent to the rollout model
-    -- None: if the row is unwanted
-    """
+def build_prompt(row: Dict[str, Any], *, openai_api_key: str):
+    question = row.get("question")
+    if not isinstance(question, str):
+        return None
     client = get_client(openai_api_key)
-    question = row.get("input")
     difficulty = judge_difficulty(client, question)
     if difficulty < 5:
         return None
     return PROMPT_TEMPLATE.format(prompt=question)
 
-# == main function for client call ==
+
+build_prompt.__spider_requirements__ = ["openai>=1.45.0"]
+
+
+def _load_openai_key() -> str:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY must be set to run the pre-processor")
+    return api_key
+
 
 def main() -> None:
     config = AppConfig.load("config/open_thoughts_3.yaml")
     with SpiderClient(
-        config=config, 
+        config=config,
         pre_processor=build_prompt,
-        pre_processor_kwargs={"openai_api_key": os.environ["OPENAI_API_KEY"]},
-        post_processor=filter_row
+        pre_processor_kwargs={"openai_api_key": _load_openai_key()},
+        post_processor=filter_row,
     ) as client:
         submission = client.submit_job()
         status = client.poll_job(submission["job_id"], interval=5.0, wait_for_completion=True)

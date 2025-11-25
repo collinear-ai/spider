@@ -22,6 +22,7 @@ from tinker_cookbook.tokenizer_utils import get_tokenizer
 from .sources import collect_prompts
 from . import events
 from .writers import JSONLBatchWriter
+from .processor_service import ProcessorServiceError
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +93,9 @@ def run_on_policy_job(
         JobExecutionResult,
         JobExecutionError,
         _base_metadata,
-        _resolve_processor,
+        _service_pre_processor,
+        _start_processor_service,
+        _stop_processor_service,
         _summarize_metrics,
         _write_metadata,
     )
@@ -106,9 +109,21 @@ def run_on_policy_job(
 
     artifact_path = workspace / "result.jsonl"
     metadata_path = workspace / "metadata.json"
-    
-    pre_processor = _resolve_processor(job.pre_processor) if job.pre_processor else None
-    prompts = collect_prompts(job.source, pre_processor=pre_processor)
+
+    processor_service = None
+    try:
+        if job.pre_processor:
+            try:
+                processor_service = _start_processor_service(job_id, job, workspace)
+            except ProcessorServiceError as exc:
+                raise JobExecutionError(f"Failed to prepare processor service: {exc}") from exc
+            pre_processor = _service_pre_processor(processor_service)
+        else:
+            pre_processor = None
+
+        prompts = collect_prompts(job.source, pre_processor=pre_processor)
+    finally:
+        _stop_processor_service(processor_service, job)
     use_gold_alignment = _needs_gold_alignment(student_model, options.teacher)
     logger.info(
         "Job %s: on-policy distillation for student=%s collected %d prompts, use_gold_alignment=%s",

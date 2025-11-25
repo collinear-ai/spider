@@ -149,6 +149,10 @@ class ProcessorConfig(BaseModel):
     name: str = Field(..., description="processor callable name")
     source: str = Field(..., description="Python source text defining the processor callable")
     kwargs: Dict[str, Any] = Field(default_factory=dict, description="Kwargs forwarded to the processor")
+    requirements: List[str] = Field(
+        default_factory=list,
+        description="Additional pip requirements installed inside the processor sandbox",
+    )
 
 class ToolConfig(BaseModel):
     name: str = Field(..., description="Tool name")

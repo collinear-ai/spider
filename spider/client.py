@@ -258,12 +258,16 @@ class SpiderClient:
             source = bundle_processor_source(func)
         except ProcessorBundlingError as exc:
             raise ValueError(str(exc)) from exc
+        requirements = self._normalize_processor_requirements(func)
         self._print_bundle_preview(kind, name, source)
-        return {
+        payload = {
             "name": name,
             "source": source,
-            "kwargs": dict(kwargs)
+            "kwargs": dict(kwargs),
         }
+        if requirements:
+            payload["requirements"] = requirements
+        return payload
 
     def add_tool(
         self,
@@ -330,3 +334,24 @@ class SpiderClient:
         print(f"\033[36m{header}\033[0m", file=sys.stdout)
         print(textwrap.indent(source.rstrip(), "  "), file=sys.stdout)
         print(f"\033[34m{border}\033[0m", file=sys.stdout)
+
+    @staticmethod
+    def _normalize_processor_requirements(func: Callable[..., Any]) -> List[str]:
+        raw = getattr(func, "__spider_requirements__", None)
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            candidates = [raw]
+        elif isinstance(raw, (list, tuple, set)):
+            candidates = list(raw)
+        else:
+            raise ValueError(
+                "Processor requirements must be a string or iterable of strings when set on the callable"
+            )
+        normalized: List[str] = []
+        for item in candidates:
+            value = str(item).strip()
+            if not value or value in normalized:
+                continue
+            normalized.append(value)
+        return normalized

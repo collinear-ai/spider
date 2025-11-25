@@ -18,6 +18,7 @@ from .sources import collect_prompts
 from .writers import JSONLBatchWriter
 from .hf_upload import HFUploadError, publish_to_hub
 from .on_policy import run_on_policy_job
+from .processor_service import DockerProcessorService, ProcessorServiceError
 
 logger = logging.getLogger(__name__)
 if logger.level == logging.NOTSET:
@@ -88,6 +89,7 @@ def _run_off_policy_job(
     metadata_path = workspace / "metadata.json"
     runtime_env = None
     runtime_stack = ExitStack()
+    processor_service: Optional[DockerProcessorService] = None
 
     if job.runtime:
         runtime_env = RuntimeEnvironment()
@@ -105,8 +107,26 @@ def _run_off_policy_job(
 
     _ensure_tensor_parallel(job)
     backend = create_backend(job.model)
-    pre_processor = _resolve_processor(job.pre_processor, runtime_env=runtime_env) if job.pre_processor else None
-    post_processor = _resolve_processor(job.post_processor, runtime_env=runtime_env) if job.post_processor else None
+
+    try:
+        processor_service = _start_processor_service(job_id, job, workspace)
+    except ProcessorServiceError as exc:
+        raise JobExecutionError(f"Failed to prepare processor service: {exc}") from exc
+
+    if job.pre_processor:
+        if not processor_service:
+            raise JobExecutionError("Pre-processor configured but processor service unavailable")
+        pre_processor = _service_pre_processor(processor_service)
+    else:
+        pre_processor = None
+
+    if job.post_processor:
+        if not processor_service:
+            raise JobExecutionError("Post-processor configured but processor service unavailable")
+        post_processor = _service_post_processor(processor_service)
+    else:
+        post_processor = None
+
     prompts = collect_prompts(job.source, pre_processor=pre_processor)
 
     if not prompts:
@@ -154,6 +174,7 @@ def _run_off_policy_job(
             batch_worker=batch_worker,
         )
     finally:
+        _stop_processor_service(processor_service, job)
         _shutdown_backend(job_id, backend)
         runtime_stack.close()
         if runtime_env:
@@ -298,24 +319,76 @@ def _pair_records(prompts: Iterable[str], generations: Iterable[str]) -> List[Di
         paired.append({"prompt": prompt, "completion": completion})
     return paired
 
-def _resolve_processor(spec: Optional[ProcessorConfig], *, runtime_env: Optional["RuntimeEnvironment"] = None) -> Optional[Callable[[Dict[str, Any]], Any]]:
-    if spec is None:
+def _start_processor_service(job_id: str, job: JobConfig, workspace: Path) -> Optional[DockerProcessorService]:
+    if not job.pre_processor and not job.post_processor:
         return None
-    exec_ns = {}
-    try:
-        compiled = compile(spec.source, "<processor>", "exec")
-        exec(compiled, exec_ns, exec_ns)
-    except Exception as exc:
-        raise JobExecutionError(f"Failed to load processor `{spec.name}`: {exc}") from exc
-    
-    func = exec_ns.get(spec.name)
-    if not callable(func):
-        raise JobExecutionError(f"Processor source did not define the expected callable")
-    
-    def wrapped(record: Dict[str, Any]):
-        return func(record, **spec.kwargs)
-    
-    return _wrap_runtime_callable(wrapped, runtime_env)
+
+    service = DockerProcessorService(
+        job_id=job_id,
+        workspace=workspace,
+        pre_processor=job.pre_processor,
+        post_processor=job.post_processor,
+    )
+    service.start()
+    events.emit(
+        "Processor service started.",
+        code="processor.started",
+        data={
+            "pre_processor": bool(job.pre_processor),
+            "post_processor": bool(job.post_processor),
+        },
+    )
+    logger.info(
+        "Job %s: processor service ready (pre=%s post=%s) port=%s",
+        job_id,
+        bool(job.pre_processor),
+        bool(job.post_processor),
+        service.base_url,
+    )
+    return service
+
+def _service_pre_processor(service: DockerProcessorService) -> Callable[[Dict[str, Any]], Optional[str]]:
+    def wrapper(record: Dict[str, Any]) -> Optional[str]:
+        try:
+            result = service.invoke_preprocess(record)
+        except ProcessorServiceError as exc:
+            raise JobExecutionError(f"Pre-processor failed: {exc}") from exc
+        if result is None:
+            return None
+        if isinstance(result, str):
+            return result
+        return str(result)
+
+    return wrapper
+
+def _service_post_processor(service: DockerProcessorService) -> Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    def wrapper(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        try:
+            result = service.invoke_postprocess(record)
+        except ProcessorServiceError as exc:
+            raise JobExecutionError(f"Post-processor failed: {exc}") from exc
+        if result is None:
+            return None
+        if not isinstance(result, dict):
+            raise JobExecutionError("Post-processor must return a dict or None per record")
+        return result
+
+    return wrapper
+
+def _stop_processor_service(service: Optional[DockerProcessorService], job: JobConfig) -> None:
+    if not service:
+        DockerProcessorService.cleanup_all()
+        return
+    service.stop()
+    events.emit(
+        "Processor service stopped.",
+        code="processor.stopped",
+        data={
+            "pre_processor": bool(job.pre_processor),
+            "post_processor": bool(job.post_processor),
+        },
+    )
+    DockerProcessorService.cleanup_all()
 
 def _resolve_tools(tool_specs: Optional[List[ToolConfig]], *, runtime_env: Optional["RuntimeEnvironment"] = None) -> Dict[str, Callable[..., Any]]:
     registry = {}
@@ -720,7 +793,10 @@ def _detect_available_gpus() -> int:
     return 1
 
 def _processor_snapshot(spec: ProcessorConfig) -> Dict[str, Any]:
-    return {"name": spec.name, "kwargs": dict(spec.kwargs or {})}
+    snapshot = {"name": spec.name, "kwargs": dict(spec.kwargs or {})}
+    if spec.requirements:
+        snapshot["requirements"] = list(spec.requirements)
+    return snapshot
 
 def _sanitize_generation_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     options = payload.get("on_policy_options")

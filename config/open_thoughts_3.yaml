@@ -1,25 +1,22 @@
 server:
-  base_url: 
-  api_key:
+  base_url: http://localhost:9000
+  api_key: 
   request_timeout: 120
 job:
   model: 
     provider: vllm
-    name: "Qwen/QwQ-32B-AWQ"
+    name: "Qwen/Qwen3-1.7B"
     parameters:
       tensor_parallel_size: 2
   source:
-    dataset: "nvidia/OpenCodeReasoning"
-    config_name: "split_0"
-    split: "split_0[:512]"
+    dataset: "RiddleHe/OpenCodeReasoning-2-questions-dedup-34k-sample-1024"
+    config_name: "default"
+    split: "train[:8]"
   generation:
     parameters:
       temperature: 0.7
       top_p: 0.9
       max_tokens: 32768
   output:
-    mode: "upload_hf"
-    hf:
-      repo_id: RiddleHe/spider-rollouts-openthoughts-3-qwen32b-opencodereasoning-split-0-512
-      token:
-      private: false
+    mode: "return"
+    format: "jsonl"
