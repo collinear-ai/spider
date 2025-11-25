@@ -31,10 +31,6 @@ def pre_prcess_row(row) -> str: # custom transform of input prompt
   return ""
 
 def post_process_row(row) -> Dict[str, Any]: # custom transform of outputs
-  """
-  Per-row filtering function after a rollout is generated.
-  Can reference arbitrary helpers defined in the same script
-  """
   return row # or None, if unwanted
 
 config = AppConfig.load("config/test-remote-processor.yaml") # define rollout hyperparams
@@ -83,7 +79,6 @@ job:
     hf:
       repo_id: collinear-ai/spider-rollouts-qwen2.5-7b-instruct-ocr2-ast-filter
       repo_type: "dataset"
-      token: 
       private: false
 ```
 
@@ -126,5 +121,4 @@ job:
       repo_id: RiddleHe/qwen3-8B-on-policy-distill-teacher-qwen3-30B-A3B-OCR2-8-examples
       repo_type: "model"
       private: false
-      token: 
 ```
