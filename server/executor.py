@@ -48,6 +48,7 @@ def run_generation_job(
     job_env: Optional[Dict[str, str]] = None,
 ) -> JobExecutionResult:
     with _job_env_context(job_env or {}):
+        workspace = workspace.resolve()
         workspace.mkdir(parents=True, exist_ok=True)
 
         if job.generation.on_policy:
