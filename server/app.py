@@ -189,7 +189,7 @@ async def download_result(job_id: str):
         raise HTTPException(status_code=404, detail="Result not available yet")
     artifact_path = Path(record.artifacts_path)
     if not artifact_path.exists():
-        logger.warnng(
+        logger.warning(
             "Result request for %s failed: artifact missing on disk (%s)",
             job_id,
             artifact_path,
