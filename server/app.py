@@ -182,11 +182,18 @@ async def cancel_job(job_id: str):
 async def download_result(job_id: str):
     record = _get_job_record(job_id)
     if record is None:
+        logger.warning("Result request for %s failed: job not found", job_id)
         raise HTTPException(status_code=404, detail="Job not found")
     if not record.artifacts_path:
+        logger.warning("Result request for %s failed: artifacts_path not set", job_id)
         raise HTTPException(status_code=404, detail="Result not available yet")
     artifact_path = Path(record.artifacts_path)
     if not artifact_path.exists():
+        logger.warnng(
+            "Result request for %s failed: artifact missing on disk (%s)",
+            job_id,
+            artifact_path,
+        )
         raise HTTPException(status_code=404, detail="Artifact not found on disk")
 
     include_records = record.job.output.mode != OutputMode.HF_UPLOAD
