@@ -184,21 +184,22 @@ async def download_result(job_id: str):
     if record is None:
         logger.warning("Result request for %s failed: job not found", job_id)
         raise HTTPException(status_code=404, detail="Job not found")
-    if not record.artifacts_path:
-        logger.warning("Result request for %s failed: artifacts_path not set", job_id)
-        raise HTTPException(status_code=404, detail="Result not available yet")
-    artifact_path = Path(record.artifacts_path)
-    if not artifact_path.exists():
-        logger.warning(
-            "Result request for %s failed: artifact missing on disk (%s)",
-            job_id,
-            artifact_path,
-        )
-        raise HTTPException(status_code=404, detail="Artifact not found on disk")
-
+    
     include_records = record.job.output.mode != OutputMode.HF_UPLOAD
     artifact_records = []
     if include_records:
+        if not record.artifacts_path:
+            logger.warning("Result request for %s failed: artifacts_path not set", job_id)
+            raise HTTPException(status_code=404, detail="Result not available yet")
+        artifact_path = Path(record.artifacts_path)
+        if not artifact_path.exists():
+            logger.warning(
+                "Result request for %s failed: artifact missing on disk (%s)",
+                job_id,
+                artifact_path,
+            )
+            raise HTTPException(status_code=404, detail="Artifact not found on disk")
+
         with artifact_path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
