@@ -637,13 +637,7 @@ def _run_prompt_with_tools(
                 "tool_call_id": call.get("id"),
             }
             transcript.append(tool_message)
-            history.append(
-                {
-                    "role": "tool",
-                    "content": payload,
-                    "tool_call_id": call.get("id"),
-                }
-            )
+            history.append(dict(tool_message))
             logger.info(
                 "Job %s: Tool %s invoked. Success: %s for prompt `%s`", 
                 job_id,

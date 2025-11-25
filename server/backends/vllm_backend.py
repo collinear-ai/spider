@@ -83,6 +83,15 @@ class VLLMBackend:
 
         response = self._client.post("/v1/chat/completions", json=payload)
         response.raise_for_status()
+
+        if response.status_code >= 400:
+            logger.error(
+                "vLLM chat request failed (status=%s) payload=%s body=%s",
+                response.status_code,
+                payload,
+                response.text[:2048].replace("\n", "\\n"),
+            )
+            
         data = response.json()
         choices = data.get("choices") or []
         if not choices:
