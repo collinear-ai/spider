@@ -60,6 +60,7 @@ server = [
     "scipy",
     "openai",
     "tqdm",
+    "httpx",
 ]
 all = [
     "httpx",
@@ -90,6 +91,7 @@ all = [
     "scipy",
     "openai",
     "tqdm",
+    "httpx",
 ]
 
 [project.scripts]
