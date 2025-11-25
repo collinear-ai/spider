@@ -71,8 +71,9 @@ class VLLMBackend:
         payload = {
             "model": self._config.name,
             "messages": messages,
-            "tools": tools or None,
         }
+        if tools:
+            payload["tools"] = tools
         payload.update(dict(parameters or {}))
         logger.info(
             "vLLM chat called with %d messages(s), tools=%s",
