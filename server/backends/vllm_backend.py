@@ -130,7 +130,7 @@ class VLLMBackend:
         ]
         for key, value in self._model_params.items():
             if value is None: continue
-            flag = f"--{key.replace('_', "-")}"
+            flag = f"--{key.replace('_', '-')}"
             if isinstance(value, bool):
                 if value:
                     command.append(flag)
