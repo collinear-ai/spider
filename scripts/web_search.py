@@ -15,6 +15,7 @@ def web_search(query, max_results):
         "include_images": False,
         "include_answer": False,
     }
+
     with httpx.Client(timeout=15.0) as client:
         response = client.post(
             TAVILY_ENDPOINT,
@@ -26,6 +27,7 @@ def web_search(query, max_results):
         )
         response.raise_for_status()
         data = response.json()
+
     results = data.get("results", [])[: payload["max_results"]]
     return {
         "query": query,
@@ -46,6 +48,7 @@ def fetch_page(url, max_chars):
     with httpx.Client(timeout=20.0) as client:
         response = client.get(url, follow_redirects=True)
         response.raise_for_status()
+        
     soup = BeautifulSoup(response.text, "html.parser")
     text = soup.get_text(separator=" ", strip=True)
     snippet = text[: max_chars]
@@ -88,14 +91,16 @@ def _fetch_schema():
 
 def main():
     config = AppConfig.load("config/web_search.yaml")
-    runtime = config.job.runtime
-    if runtime is None:
-        runtime = RuntimeDependencyConfig()
+    runtime = config.job.runtime or RuntimeDependencyConfig()
     runtime.packages = ["httpx", "beautifulsoup4"]
-    runtime.env = {"TAVILY_API_KEY": os.environ["TAVILY_API_KEY"]}
     config.job.runtime = runtime
 
-    with SpiderClient(config=config) as client:
+    secrets = {
+        "TAVILY_API_KEY": os.environ["TAVILY_API_KEY"],
+        "HF_TOKEN": os.environ["HF_TOKEN"]
+    }
+
+    with SpiderClient(config=config, env=secrets) as client:
         client.add_tool(
             description="Run a web search and return relevant results.",
             json_schema=_search_schema(),

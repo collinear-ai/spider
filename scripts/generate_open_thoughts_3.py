@@ -1,6 +1,8 @@
 import json, os
 from typing import Iterable, Dict, Any, List, Optional
 
+from openai import OpenAI
+
 from spider.client import SpiderClient
 from spider.config import AppConfig
 
@@ -86,12 +88,10 @@ First reason through the problem. Then provide your final code in backticks.
 
 _gpt_client = None
 
-def get_client(api_key):
-    from openai import OpenAI
-    
+def get_client():
     global _gpt_client
     if _gpt_client is None:
-        _gpt_client = OpenAI(api_key=api_key)
+        _gpt_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     return _gpt_client
 
 def judge_difficulty(client, question):
@@ -105,7 +105,7 @@ def judge_difficulty(client, question):
     msg = resp.choices[0].message.content
     return int(json.loads(msg)["score"])
 
-def build_prompt(row: Dict[str, Any], *, openai_api_key):
+def build_prompt(row: Dict[str, Any]):
     """
     param: row (dict): a single prompt record
 
@@ -113,7 +113,7 @@ def build_prompt(row: Dict[str, Any], *, openai_api_key):
     -- prompt (str): the transformed prompt to be sent to the rollout model
     -- None: if the row is unwanted
     """
-    client = get_client(openai_api_key)
+    client = get_client()
     question = row.get("input")
     difficulty = judge_difficulty(client, question)
     if difficulty < 5:
@@ -124,19 +124,27 @@ def build_prompt(row: Dict[str, Any], *, openai_api_key):
 
 def main() -> None:
     config = AppConfig.load("config/open_thoughts_3.yaml")
+    secrets = {"OPENAI_API_KEY": os.environ["OPENAI_API_KEY"]}
     with SpiderClient(
         config=config, 
+        env=secrets,
         pre_processor=build_prompt,
-        pre_processor_kwargs={"openai_api_key": os.environ["OPENAI_API_KEY"]},
         post_processor=filter_row
     ) as client:
         submission = client.submit_job()
-        status = client.poll_job(submission["job_id"], interval=5.0, wait_for_completion=True)
+        job_id = submission["job_id"]
+        print(f"Job submitted: {job_id}")
+
+        status = client.poll_job(job_id, interval=5.0, timeout=600, wait_for_completion=True)
+        print(f"Final status: {status['status']}")
 
         if status["status"] == "completed":
-            client.download_result(submission["job_id"], destination="artifacts/test-remote.json")
+            artifact_path = client.download_result(job_id, destination="artifacts/test-remote.json")
+            print(f"Artifacts saved to {artifact_path}")
         else:
-            raise RuntimeError(status.get("error") or status.get("messages"))
+            print("Messages: ", status.get("messages", []))
+            if status.get("error"):
+                print("Error: ", status["error"])
 
 if __name__ == "__main__":
     main()
