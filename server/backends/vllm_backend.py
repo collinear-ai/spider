@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, Iterable, List, Any, Optional
 import threading, logging, contextlib, os, socket, subprocess, sys, time, httpx
+from pathlib import Path
 
 from spider.config import ModelConfig
 
@@ -30,6 +31,7 @@ class VLLMBackend:
         self._last_metrics: Dict[str, object] = {}
         self._metrics_lock = threading.Lock()
         self._tool_parser = _default_tool_parser(config.name or "")
+        self._chat_template = _default_chat_template(config.name or "")
 
         try:
             self._start_server()
@@ -142,6 +144,8 @@ class VLLMBackend:
         if self._tool_parser:
             command.append("--enable-auto-tool-choice")
             command.extend(["--tool-call-parser", self._tool_parser])
+        if self._chat_template:
+            command.extend(["--chat-template", str(self._chat_template)])
 
         for key, value in self._model_params.items():
             if value is None: continue
@@ -242,12 +246,30 @@ def _default_tool_parser(model_name: str) -> Optional[str]:
     lower = (model_name or "").lower()
     if "llama" in lower:
         return "llama3_json"
-    if "qwen3" in lower:
-        return "qwen3_coder"
+    if "qwen3-coder" in lower:
+        return "qwen3_xml"
     if "deepseek" in lower:
         return "deepseek_v31" if "v3.1" in lower else "deepseek_v3"
     if "glm" in lower:
         return "glm45"
     if "mistral" in lower:
         return "mistral"
-    return "openai"
+    return None
+
+def _default_chat_template(model_name: str) -> Optional[Path]:
+    lower = (model_name or "").lower()
+    supported_models = ["mistral"]
+    if not any(model in lower for model in supported_models):
+        return None
+
+    import vllm
+    template_root = (
+        Path(vllm.__file__).resolve().parent 
+        / "examples"
+    )
+    if "mistral" in lower:
+        template = template_root / "tool_chat_template_mistral_parallel.jinja"
+        if template.exists():
+            return template
+        logger.warning("Could not find mistral chat template at %s", template)
+    return None
