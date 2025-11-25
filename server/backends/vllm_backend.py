@@ -82,7 +82,6 @@ class VLLMBackend:
         )
 
         response = self._client.post("/v1/chat/completions", json=payload)
-        response.raise_for_status()
 
         if response.status_code >= 400:
             logger.error(
@@ -91,7 +90,8 @@ class VLLMBackend:
                 payload,
                 response.text[:2048].replace("\n", "\\n"),
             )
-            
+        response.raise_for_status()
+
         data = response.json()
         choices = data.get("choices") or []
         if not choices:
