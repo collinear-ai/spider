@@ -9,8 +9,6 @@ from spider.config import ModelConfig
 logger = logging.getLogger(__name__)
 
 class VLLMBackend:
-    _STARTUP_TIMEOUT = 120.0
-
     def __init__(self, config: ModelConfig):
         if not config.name:
             raise ValueError("`model.name` is required for vLLM backend.")
@@ -179,9 +177,8 @@ class VLLMBackend:
         self._wait_for_startup()
 
     def _wait_for_startup(self) -> None:
-        deadline = time.time() + self._STARTUP_TIMEOUT
         assert self._client is not None
-        while time.time() < deadline:
+        while True:
             if self._server_proc and self._server_proc.poll() is not None:
                 raise RuntimeError("vLLM HTTP server exited before it became ready.")
             try:
@@ -189,10 +186,16 @@ class VLLMBackend:
                 if response.status_code == 200:
                     logger.info("vLLM HTTP server ready on %s", self._base_url)
                     return
+                if response.status_code == 503:
+                    time.sleep(1)
+                    continue
+                raise RuntimeError(
+                    f"vLLM HTTP server returned unexpected status {response.status_code}: "
+                    f"{(response.text or '').strip()[:200]}"
+                )
             except httpx.HTTPError:
                 pass
             time.sleep(1)
-        raise RuntimeError("Timed out waiting for vLLM HTTP server to start.")
 
     def _stop_server(self) -> None:
         assert self._server_proc is not None
