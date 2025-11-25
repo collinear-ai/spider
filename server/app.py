@@ -31,6 +31,10 @@ ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
 
 EVENT_BUFFER_LIMIT = 200
 
+class JobSubmission(BaseModel):
+    job: JobConfig
+    env: Dict[str, str] = Field(default_factory=dict)
+
 class JobStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -53,6 +57,8 @@ class JobRecord(BaseModel):
     next_event_offset: int = 0
 
 _JOB_STORE: Dict[str, JobRecord] = {}
+_JOB_SECRETS: Dict[str, Dict[str, str]] = {}
+
 def _job_snapshot_path(job_id: str) -> Path:
     return ARTIFACT_ROOT / job_id / "job.json"
 
@@ -99,7 +105,8 @@ def _store_job_event(job_id: str, event: Dict[str, Any]) -> None:
 events.configure_event_sink(_store_job_event)
 
 @app.post("/v1/jobs")
-async def create_job(job: JobConfig, background: BackgroundTasks):
+async def create_job(submission: JobSubmission, background: BackgroundTasks):
+    job = submission.job
     job_id = str(uuid4())
     now = datetime.utcnow()
     record = JobRecord(
@@ -108,6 +115,8 @@ async def create_job(job: JobConfig, background: BackgroundTasks):
     _JOB_STORE[job_id] = record
     _persist_job_record(job_id, record)
     events.emit_for_job(job_id, "Job accepted.", code="job.accepted")
+
+    _JOB_SECRETS[job_id] = dict(submission.env)
     background.add_task(_execute_job, job_id)
     return {"job_id": job_id, "status": record.status}
 
@@ -121,7 +130,8 @@ def _execute_job(job_id: str) -> None:
     token = events.bind_job(job_id)
     events.emit("Job started.", code="job.started")
     try:
-        result = run_generation_job(job_id, record.job, workspace=ARTIFACT_ROOT / job_id)
+        job_env = _JOB_SECRETS.get(job_id, {})
+        result = run_generation_job(job_id, record.job, workspace=ARTIFACT_ROOT / job_id, job_env=job_env)
         record.artifacts_path = str(result.artifacts_path)
         record.remote_artifact = result.remote_artifact
         record.metrics = result.metrics
@@ -153,6 +163,7 @@ def _execute_job(job_id: str) -> None:
             data={"error": crash_tb.splitlines()[-1]}
         )
     finally:
+        _JOB_SECRETS.pop(job_id, None)
         record.updated_at = datetime.utcnow()
         _persist_job_record(job_id, record)
         events.reset_job(token)

@@ -86,7 +86,8 @@ def run_on_policy_job(
     job_id: str, 
     job: JobConfig, 
     *, 
-    workspace: Path
+    workspace: Path,
+    job_env: dict[str, str],
 ):
     from .executor import (
         JobExecutionResult,

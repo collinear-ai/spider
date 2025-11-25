@@ -13,6 +13,7 @@ class SpiderClient:
         config: AppConfig, 
         *, 
         client: Optional[httpx.Client] = None,
+        env: Optional[Dict[str, str]] = None,
         pre_processor: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
         pre_processor_kwargs: Optional[Dict[str, Any]] = None,
         post_processor: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
@@ -28,6 +29,7 @@ class SpiderClient:
         self._post_processor_kwargs = dict(post_processor_kwargs or {})
 
         self._tool_payloads: Dict[str, Dict[str, Any]] = {}
+        self._job_env = dict(env or {})
 
     def __enter__(self) -> "SpiderClient":
         self._ensure_client()
@@ -75,7 +77,8 @@ class SpiderClient:
             payload_tools.extend(self._tool_payloads.values())
             payload["tools"] = payload_tools
 
-        response = self._ensure_client().post("/v1/jobs", json=payload)
+        request_body = {"job": payload, "env": self._job_env}
+        response = self._ensure_client().post("/v1/jobs", json=request_body)
         response.raise_for_status()
         return response.json()
 

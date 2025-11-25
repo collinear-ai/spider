@@ -3,7 +3,7 @@ from __future__ import annotations
 import json, os, logging, inspect, time, threading, traceback
 import concurrent
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -41,48 +41,68 @@ class JobExecutionResult:
     messages: List[str] = field(default_factory=list)
 
 def run_generation_job(
-    job_id: str, job: JobConfig, *, workspace: Path
+    job_id: str, 
+    job: JobConfig, 
+    *, 
+    workspace: Path,
+    job_env: Optional[Dict[str, str]] = None,
 ) -> JobExecutionResult:
-    workspace.mkdir(parents=True, exist_ok=True)
-    if job.generation.on_policy:
-        if (
-            job.output.mode != OutputMode.HF_UPLOAD
-            or not job.output.hf
-            or not job.output.hf.repo_id.strip()
-        ):
-            raise JobExecutionError(
-                "On-policy jobs require `output.mode: upload_hf` with a populated `output.hf.repo_id`"
-            )
-        logger.info("Job %s: starting on-policy distillation", job_id)
-        events.emit("Launching on-policy distillation pipeline.", code="job.pipeline", data={"mode": "on_policy"})
-        result = run_on_policy_job(job_id, job, workspace=workspace)
-    else:
-        logger.info("Job %s: starting off-policy generation pipeline", job_id)
-        events.emit("Launching off-policy generation pipeline.", code="job.pipeline", data={"mode": "off_policy"})
-        result = _run_off_policy_job(job_id, job, workspace=workspace)
+    with _job_env_context(job_env or {}):
+        workspace.mkdir(parents=True, exist_ok=True)
 
-    if job.output.mode == OutputMode.HF_UPLOAD and job.output.hf:
-        artifact_source = result.upload_source or result.artifacts_path
-        metadata_path = result.metadata_path or (workspace / "metadata.json")
-        try:
-            remote = publish_to_hub(
-                job_id=job_id,
-                artifact=artifact_source,
-                metadata=metadata_path,
-                config=job.output.hf
+        if job.generation.on_policy:
+            if (
+                job.output.mode != OutputMode.HF_UPLOAD
+                or not job.output.hf
+                or not job.output.hf.repo_id.strip()
+            ):
+                raise JobExecutionError(
+                    "On-policy jobs require `output.mode: upload_hf` with a populated `output.hf.repo_id`"
+                )
+            logger.info("Job %s: starting on-policy distillation", job_id)
+            events.emit("Launching on-policy distillation pipeline.", code="job.pipeline", data={"mode": "on_policy"})
+            result = run_on_policy_job(
+                job_id, 
+                job, 
+                workspace=workspace,
+                job_env=job_env or {},
             )
-        except HFUploadError as exc:
-            raise JobExecutionError(str(exc)) from exc
-        result.remote_artifact = remote
-        events.emit(
-            "Published artifacts to remote storage.",
-            code="artifact.uploaded",
-            data={"remote_artifact": remote}
-        )
+        else:
+            logger.info("Job %s: starting off-policy generation pipeline", job_id)
+            events.emit("Launching off-policy generation pipeline.", code="job.pipeline", data={"mode": "off_policy"})
+            result = _run_off_policy_job(
+                job_id, 
+                job, 
+                workspace=workspace,
+                job_env=job_env or {},
+            )
+
+        if job.output.mode == OutputMode.HF_UPLOAD and job.output.hf:
+            artifact_source = result.upload_source or result.artifacts_path
+            metadata_path = result.metadata_path or (workspace / "metadata.json")
+            try:
+                remote = publish_to_hub(
+                    job_id=job_id,
+                    artifact=artifact_source,
+                    metadata=metadata_path,
+                    config=job.output.hf
+                )
+            except HFUploadError as exc:
+                raise JobExecutionError(str(exc)) from exc
+            result.remote_artifact = remote
+            events.emit(
+                "Published artifacts to remote storage.",
+                code="artifact.uploaded",
+                data={"remote_artifact": remote}
+            )
     return result
 
 def _run_off_policy_job(
-    job_id: str, job: JobConfig, *, workspace: Path
+    job_id: str, 
+    job: JobConfig, 
+    *, 
+    workspace: Path, 
+    job_env: Dict[str, str]
 ) -> JobExecutionResult:
     artifact_path = workspace / "result.jsonl"
     metadata_path = workspace / "metadata.json"
@@ -96,7 +116,10 @@ def _run_off_policy_job(
             runtime_env.install(job.runtime.packages)
         except RuntimeEnvironmentError as exc:
             raise JobExecutionError(f"Failed to prepare runtime environment: {exc}") from exc
-        runtime_stack.enter_context(runtime_env.activate(job.runtime.env))
+
+        merged_env = dict(job_env or {})
+        merged_env.update(job.runtime.env)
+        runtime_stack.enter_context(runtime_env.activate(merged_env))
         events.emit(
             "Runtime sandbox prepared.",
             code="runtime.ready",
@@ -162,6 +185,28 @@ def _run_off_policy_job(
                 "Runtime sandbox cleaned.",
                 code="runtime.cleaned"
             )
+
+@contextmanager
+def _job_env_context(job_env: Dict[str, str]):
+    if not job_env:
+        yield 
+        return
+
+    previous = {}
+    try:
+        for key, value in job_env.items():
+            previous[key] = os.environ.get(key)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 def _run_batched_generation(
     *,
