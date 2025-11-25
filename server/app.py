@@ -53,6 +53,35 @@ class JobRecord(BaseModel):
     next_event_offset: int = 0
 
 _JOB_STORE: Dict[str, JobRecord] = {}
+def _job_snapshot_path(job_id: str) -> Path:
+    return ARTIFACT_ROOT / job_id / "job.json"
+
+def _persist_job_record(job_id: str, record: JobRecord) -> None:
+    snapshot_path = _job_snapshot_path(job_id)
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = jsonable_encoder(record)
+    snapshot_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+def _load_job_record(job_id: str) -> Optional[JobRecord]:
+    snapshot_path = _job_snapshot_path(job_id)
+    if not snapshot_path.exists():
+        return None
+    try:
+        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        return JobRecord.model_validate(payload)
+    except Exception as exc:
+        logger.warning("Failed to load snapshot for job %s: %s", job_id, exc)
+        return None
+
+def _get_job_record(job_id: str) -> Optional[JobRecord]:
+    record = _JOB_STORE.get(job_id)
+    if record is not None:
+        return record
+    logger.info("_JOB_STORE is empty, loading record from disk for job %s", job_id)
+    record = _load_job_record(job_id)
+    if record is not None:
+        _JOB_STORE[job_id] = record
+    return record
 
 def _store_job_event(job_id: str, event: Dict[str, Any]) -> None:
     record = _JOB_STORE.get(job_id)
@@ -77,6 +106,7 @@ async def create_job(job: JobConfig, background: BackgroundTasks):
         job=job, status=JobStatus.QUEUED, submitted_at=now, updated_at=now, messages=["Job accepted."]
     )
     _JOB_STORE[job_id] = record
+    _persist_job_record(job_id, record)
     events.emit_for_job(job_id, "Job accepted.", code="job.accepted")
     background.add_task(_execute_job, job_id)
     return {"job_id": job_id, "status": record.status}
@@ -124,18 +154,19 @@ def _execute_job(job_id: str) -> None:
         )
     finally:
         record.updated_at = datetime.utcnow()
+        _persist_job_record(job_id, record)
         events.reset_job(token)
 
 @app.get("/v1/jobs/{job_id}")
 async def get_job(job_id: str, since: Optional[int] = Query(None, ge=0)):
-    record = _JOB_STORE.get(job_id)
+    record = _get_job_record(job_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return _serialize_job(job_id, record, since=since)
 
 @app.post("/v1/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str):
-    record = _JOB_STORE.get(job_id)
+    record = _get_job_record(job_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Job not found")
     if record.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
@@ -144,11 +175,12 @@ async def cancel_job(job_id: str):
     record.updated_at = datetime.utcnow()
     record.messages.append("Cancellation requested.")
     events.emit_for_job(job_id, "Cancellation requested.", code="job.cancel_requested")
+    _persist_job_record(job_id, record)
     return {"job_id": job_id, "status": record.status}
 
 @app.get("/v1/jobs/{job_id}/result")
 async def download_result(job_id: str):
-    record = _JOB_STORE.get(job_id)
+    record = _get_job_record(job_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Job not found")
     if not record.artifacts_path:
