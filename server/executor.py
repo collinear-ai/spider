@@ -650,11 +650,12 @@ def _run_prompt_with_tools(
             return transcript
         
         for call in tool_calls:
-            tool_name = call.get("name")
+            function_call = call.get("function") or {}
+            tool_name = function_call.get("name")
             if not tool_name or tool_name not in tool_registry:
                 raise JobExecutionError(f"Assistant requested unknown tool `{tool_name}`")
 
-            raw_args = call.get("arguments") or "{}"
+            raw_args = function_call.get("arguments") or "{}"
             turn_index = len(transcript) - 1
             logger.info(
                 "Job %s: invoking tool `%s` (turn=%d) args=%s for prompt '%s'",
