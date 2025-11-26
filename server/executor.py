@@ -653,7 +653,25 @@ def _run_prompt_with_tools(
             function_call = call.get("function") or {}
             tool_name = function_call.get("name")
             if not tool_name or tool_name not in tool_registry:
-                raise JobExecutionError(f"Assistant requested unknown tool `{tool_name}`")
+                warning = (
+                    f"Tool `{tool_name or 'unknown'}` is not available. "
+                    "Please choose one of the provided tools."
+                )
+                logger.warning(
+                    "Job %s: assistant requested unknown tool `%s` for prompt `%s`",
+                    job_id,
+                    tool_name,
+                    prompt_preview,
+                )
+                tool_message = {
+                    "role": "tool",
+                    "name": tool_name or "unknown_tool",
+                    "content": warning,
+                    "tool_call_id": call.get("id"),
+                }
+                transcript.append(tool_message)
+                history.append(dict(tool_message))
+                continue
 
             raw_args = function_call.get("arguments") or "{}"
             turn_index = len(transcript) - 1
