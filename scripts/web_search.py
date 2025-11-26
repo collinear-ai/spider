@@ -22,7 +22,7 @@ def web_search(query, max_results):
             json=payload,
             headers={
                 "Content-Type": "application/json",
-                "X-Tavily-Api-Key": api_key,
+                "Authorization": f"Bearer {api_key}"
             }
         )
         response.raise_for_status()
