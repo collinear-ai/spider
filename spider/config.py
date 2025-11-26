@@ -1,4 +1,5 @@
 from __future__ import annotations
+from itertools import filterfalse
 import json, yaml
 from enum import Enum
 from pathlib import Path
@@ -112,7 +113,7 @@ class OutputMode(str, Enum):
 
 class HFUploadConfig(BaseModel):
     repo_id: str = Field(..., description="Target dataset repo on HF")
-    private: bool = Field(default=False, description="whether to keep the target repo private")
+    private: bool = Field(default=filterfalse, description="whether to keep the target repo private")
     repo_type: str = Field(
         default="dataset",
         description="HF repo type to upload to (eg. dataset or model)"
