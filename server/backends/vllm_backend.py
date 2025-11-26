@@ -16,7 +16,7 @@ class VLLMBackend:
 
         self._server_host = "127.0.0.1"
         self._server_port = _reserve_port()
-        self._client_timeout = 120.0
+        self._client_timeout = 480.0 # 8 minutes
         self._system_prompt = config.parameters.get("system_prompt")
         self._model_params = {
             k: v for k, v in config.parameters.items()
