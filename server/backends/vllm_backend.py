@@ -257,6 +257,8 @@ def _default_tool_parser(model_name: str) -> Optional[str]:
         return "glm45"
     if "mistral" in lower:
         return "mistral"
+    if "qwen2.5" in lower:
+        return "hermes"
     return None
 
 def _default_chat_template(model_name: str) -> Optional[Path]:
