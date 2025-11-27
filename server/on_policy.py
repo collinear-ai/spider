@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio, logging, os, shutil, tarfile, urllib.request, zipfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Mapping, Tuple
+from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional
 from urllib.parse import urlparse
 import blobfile
 
@@ -22,6 +22,8 @@ from tinker_cookbook.tokenizer_utils import get_tokenizer
 from .sources import collect_prompts
 from . import events
 from .writers import JSONLBatchWriter
+
+RolloutBatch = List[Dict[str, Any]]
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,30 @@ class PromptListDatasetBuilder(RLDatasetBuilder):
         )
         return dataset, None
 
+class ToolRolloutDatasetBuilder(RLDatasetBuilder):
+    def __init__(
+        self,
+        prompt_batches: Iterable[RolloutBatch],
+        dataset_name: str,
+        renderer_name: str,
+        model_name_for_tokenizer: str,
+    ) -> None:
+        object.__setattr__(self, "_prompt_batches", prompt_batches)
+        object.__setattr__(self, "_dataset_name", dataset_name)
+        object.__setattr__(self, "_renderer_name", renderer_name)
+        object.__setattr__(self, "_model_name", model_name_for_tokenizer)
+
+        async def __call__(self) -> tuple[RLDataset, RLDataset | None]:
+            tokenizer = get_tokenizer(self._model_name)
+            renderer = renderers.get_renderer(self._renderer_name, tokenizer=tokenizer)
+            dataset = ToolRolloutDataset(
+                prompt_batches=self._prompt_batches,
+                renderer=renderer,
+                tokenizer=tokenizer,
+                dataset_name=self._dataset_name,
+            )
+            return dataset, None
+
 @contextmanager
 def _temporary_api_key(api_key: str | None):
     if not api_key:
@@ -88,6 +114,8 @@ def run_on_policy_job(
     *, 
     workspace: Path,
     job_env: dict[str, str],
+    prompts: Optional[List[str]],
+    rollout_stream: Optional[Iterable[RolloutBatch]] = None,
 ):
     from .executor import (
         JobExecutionResult,
@@ -109,20 +137,29 @@ def run_on_policy_job(
     metadata_path = workspace / "metadata.json"
     
     pre_processor = _resolve_processor(job.pre_processor) if job.pre_processor else None
-    prompts = collect_prompts(job.source, pre_processor=pre_processor)
+    prompt_list = prompts if prompts is not None else collect_prompts(job.source, pre_processor=pre_processor)
+
     use_gold_alignment = _needs_gold_alignment(student_model, options.teacher)
     logger.info(
-        "Job %s: on-policy distillation for student=%s collected %d prompts, use_gold_alignment=%s",
+        "Job %s: on-policy distillation for student=%s collected %d prompts, use_gold_alignment=%s, tool_rollouts=%s",
         job_id,
         student_model,
         len(prompts),
-        use_gold_alignment
+        use_gold_alignment,
+        bool(rollout_stream),
     )
-    events.emit(
-        "Collected prompts for on-policy distillation.",
-        code="on_policy.prompts_collected",
-        data={"total_prompts": len(prompts)}
-    )
+    
+    if rollout_stream:
+        events.emit(
+            "Finished Setup for tool rollouts streaming for on-policy distillation.",
+            code="on_policy.tool_rollouts_stream"
+        )
+    else:
+        events.emit(
+            "Collected prompts for on-policy distillation.",
+            code="on_policy.prompts_collected",
+            data={"total_prompts": len(prompt_list)}
+        )
 
     payload = _base_metadata(job_id, job)
     payload["generation_mode"] = "on_policy"
@@ -132,7 +169,7 @@ def run_on_policy_job(
     payload["on_policy"] = sanitized_options
     _write_metadata(metadata_path, payload, 0)
 
-    if not prompts:
+    if not prompt_list:
         artifact_path.write_text("", encoding="utf-8")
         payload["metrics"] = {"records": 0}
         _write_metadata(metadata_path, payload, 0)
@@ -150,14 +187,24 @@ def run_on_policy_job(
         )
     
     renderer_name = model_info.get_recommended_renderer_name(student_model)
-    dataset_builder = PromptListDatasetBuilder(
-        prompts=prompts,
-        dataset_name=(job.source.dataset or "prompts"),
-        groups_per_batch=options.groups_per_batch,
-        group_size=options.group_size,
-        renderer_name=renderer_name,
-        model_name_for_tokenizer=student_model,
-    )
+
+    dataset_builder: RLDatasetBuilder
+    if rollout_stream:
+        dataset_builder = ToolRolloutDatasetBuilder(
+            prompt_batches=rollout_stream,
+            dataset_name=(job.source.dataset or "prompts"), # does this not have option args
+            renderer_name=renderer_name,
+            model_name_for_tokenizer=student_model,
+        )
+    else:
+        dataset_builder = PromptListDatasetBuilder(
+            prompts=prompt_list,
+            dataset_name=(job.source.dataset or "prompts"),
+            groups_per_batch=options.groups_per_batch,
+            group_size=options.group_size,
+            renderer_name=renderer_name,
+            model_name_for_tokenizer=student_model,
+        )
 
     teacher_config = TeacherConfig(base_model=options.teacher)
     dataset_config = DistillationDatasetConfig(
