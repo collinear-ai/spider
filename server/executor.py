@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable, Iterable, Tuple
 from types import MappingProxyType
 
-from spider.config import JobConfig, OutputMode, ProcessorConfig, ToolConfig
+from spider.config import JobConfig, OutputMode, ProcessorConfig, ToolConfig, ModelConfig
 from .runtime_env import RuntimeEnvironment, RuntimeEnvironmentError
 from .backends.factory import create_backend
 from . import events
@@ -60,14 +60,30 @@ def run_generation_job(
                 raise JobExecutionError(
                     "On-policy jobs require `output.mode: upload_hf` with a populated `output.hf.repo_id`"
                 )
-            logger.info("Job %s: starting on-policy distillation", job_id)
-            events.emit("Launching on-policy distillation pipeline.", code="job.pipeline", data={"mode": "on_policy"})
-            result = run_on_policy_job(
-                job_id, 
-                job, 
-                workspace=workspace,
-                job_env=job_env or {},
-            )
+
+            if job.tools:
+                logger.info("Job %s: starting tool-aware on-policy distillation", job_id)
+                events.emit(
+                    "Launching tool-aware on-policy pipeline.",
+                    code="job.pipeline",
+                    data={"mode": "on_policy_tool"},
+                )
+                result = _run_tool_on_policy_job(
+                    job_id,
+                    job,
+                    workspace=workspace,
+                    job_env=job_env or {},
+                )
+            
+            else:
+                logger.info("Job %s: starting on-policy distillation", job_id)
+                events.emit("Launching on-policy distillation pipeline.", code="job.pipeline", data={"mode": "on_policy"})
+                result = run_on_policy_job(
+                    job_id, 
+                    job, 
+                    workspace=workspace,
+                    job_env=job_env or {},
+                )
         else:
             logger.info("Job %s: starting off-policy generation pipeline", job_id)
             events.emit("Launching off-policy generation pipeline.", code="job.pipeline", data={"mode": "off_policy"})
@@ -107,31 +123,17 @@ def _run_off_policy_job(
 ) -> JobExecutionResult:
     artifact_path = workspace / "result.jsonl"
     metadata_path = workspace / "metadata.json"
-    runtime_env = None
-    runtime_stack = ExitStack()
-
-    if job.runtime:
-        runtime_env = RuntimeEnvironment()
-        try:
-            runtime_env.create()
-            runtime_env.install(job.runtime.packages)
-        except RuntimeEnvironmentError as exc:
-            raise JobExecutionError(f"Failed to prepare runtime environment: {exc}") from exc
-
-        merged_env = dict(job_env or {})
-        merged_env.update(job.runtime.env)
-        runtime_stack.enter_context(runtime_env.activate(merged_env))
-        events.emit(
-            "Runtime sandbox prepared.",
-            code="runtime.ready",
-        )
-        logger.info("Job %s: runtime sandbox prepared and activated.", job_id)
+    runtime_env, runtime_stack, _ = _prepare_runtime_env(job, job_env)
 
     _ensure_tensor_parallel(job)
     backend = create_backend(job.model)
-    pre_processor = _resolve_processor(job.pre_processor, runtime_env=runtime_env) if job.pre_processor else None
-    post_processor = _resolve_processor(job.post_processor, runtime_env=runtime_env) if job.post_processor else None
-    prompts = collect_prompts(job.source, pre_processor=pre_processor)
+
+    pre_processor, post_processor, prompts = _prepare_processors_and_prompts(
+        job=job,
+        runtime_env=runtime_env,
+        pre_processor=job.pre_processor,
+        post_processor=job.post_processor,
+    )
 
     if not prompts:
         artifact_path.write_text("", encoding="utf-8")
@@ -186,6 +188,58 @@ def _run_off_policy_job(
                 "Runtime sandbox cleaned.",
                 code="runtime.cleaned"
             )
+
+def _run_tool_on_policy_job(
+    job_id: str,
+    job: JobConfig,
+    *,
+    workspace: Path,
+    job_env: Dict[str, str],
+) -> JobExecutionResult:
+    if not job.tools:
+        raise JobExecutionError("Tool-aware on-policy jobs require at least one tool.")
+    
+    runtime_env, runtime_stack, _ = _prepare_runtime_env(job, job_env)
+    backend = _resolve_rollout_backend(job)
+    
+    pre_processor, _, prompts = _prepare_processors_and_prompts(
+        job=job,
+        runtime_env=runtime_env,
+        pre_processor=job.pre_processor,
+    )
+
+    tool_registry = _resolve_tools(job.tools, runtime_env=runtime_env)
+    if tool_registry:
+        events.emit(
+            "Tool-aware rollout registry ready.",
+            code="tool_on_policy.tools_ready",
+            data={"tool_names": sorted(tool_registry.keys())}
+        )
+
+    rollout_stream = _tool_rollout_stream(
+        job_id=job_id,
+        job=job,
+        backend=backend,
+        prompts=prompts,
+        tool_registry=tool_registry,
+    )
+
+    try:
+        return run_on_policy_job(
+            job_id,
+            job,
+            workspace=workspace,
+            job_env=job_env,
+            prompts=prompts,
+            rollout_stream=rollout_stream,
+        )
+    finally:
+        _shutdown_backend(job_id, backend)
+        runtime_stack.close()
+        if runtime_env:
+            runtime_env.cleanup()
+            events.emit("Runtime sandbox cleaned.", code="runtime.cleaned")
+
 
 @contextmanager
 def _job_env_context(job_env: Dict[str, str]):
@@ -337,6 +391,41 @@ def _build_batch_worker(
         ),
         dict(backend.metrics() or {})
     )
+
+def _tool_rollout_stream(
+    *,
+    job_id: str,
+    job: JobConfig,
+    backend: Any,
+    prompts: List[str],
+    tool_registry: Dict[str, Callable[..., Any]],
+) -> Iterable[List[Dict[str, Any]]]:
+    batch_worker = _build_batch_worker(
+        job_id=job_id,
+        job=job,
+        backend=backend,
+        post_processor=None,
+        tool_registry=tool_registry,
+    )
+    batch_size = _resolve_batch_size(job, prompts)
+    total_batches = (len(prompts) + batch_size - 1) // batch_size
+
+    for batch_index, start in enumerate(range(0, len(prompts), batch_size)):
+        chunk = prompts[start: start + batch_size]
+        future, metrics = batch_worker(chunk)
+        records = future.result()
+        events.emit(
+            "Tool rollout batch ready.",
+            code="tool_on_policy.batch_ready",
+            data={
+                "batch_index": batch_index,
+                "batch_size": len(chunk),
+                "total_batches": total_batches,
+                "metrics": metrics,
+            },
+        )
+        if records:
+            yield records
 
 def _pair_records(prompts: Iterable[str], generations: Iterable[str]) -> List[Dict[str, Any]]:
     paired = []
@@ -712,6 +801,63 @@ def _run_prompt_with_tools(
             )
 
     raise JobExecutionError(f"Tool-enabled generation exceeded {turn_limit} turns without reaching a final response.")
+
+def _prepare_runtime_env(
+    job: JobConfig,
+    job_env: Dict[str, str],
+) -> tuple[Optional["RuntimeEnvironment"], ExitStack, Dict[str, str]]:
+    runtime_env = None
+    runtime_stack = ExitStack()
+    merged_env = dict(job_env or {})
+
+    if job.runtime:
+        runtime_env = RuntimeEnvironment()
+        try:
+            runtime_env.create()
+            runtime_env.install(job.runtime.packages)
+        except RuntimeEnvironmentError as exc:
+            raise JobExecutionError(f"Failed to prepare runtime environment: {exc}") from exc
+
+        merged_env = dict(job_env or {})
+        merged_env.update(job.runtime.env)
+        runtime_stack.enter_context(runtime_env.activate(merged_env))
+        events.emit(
+            "Runtime sandbox prepared.",
+            code="runtime.ready",
+        )
+        logger.info("Job %s: runtime sandbox prepared and activated.", job.metadata.get("job_id", ""))
+
+    return runtime_env, runtime_stack, merged_env
+
+def _resolve_rollout_backend(job: JobConfig):
+    model_config = job.model
+    provider = (model_config.provider or "").lower()
+    if provider == "tinker":
+        base_model_name = model_config.name
+        if not base_model_name:
+            raise JobExecutionError("Tool-aware on-policy jobs require `job.model.name` to resolve rollout backend.")
+
+        model_config = ModelConfig(
+            provider="vllm",
+            name=base_model_name,
+            parameters=dict(model_config.parameters or {})
+        )
+    
+    _ensure_tensor_parallel(job)
+    return create_backend(model_config)
+
+def _prepare_processors_and_prompts(
+    *,
+    job: JobConfig,
+    runtime_env: Optional["RuntimeEnvironment"],
+    pre_processor: Optional[ProcessorConfig],
+    post_processor: Optional[ProcessorConfig],
+) -> tuple[Optional[Callable[[Dict[str, Any]], Any]], List[str]]:
+    pre_processor = _resolve_processor(job.pre_processor, runtime_env=runtime_env) if pre_processor else None
+    post_processor = _resolve_processor(job.post_processor, runtime_env=runtime_env) if post_processor else None
+    prompts = collect_prompts(job.source, pre_processor=pre_processor)
+
+    return pre_processor, post_processor, prompts
 
 def _call_backend_chat(
     *,
