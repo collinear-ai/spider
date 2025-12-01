@@ -40,6 +40,10 @@ server/task_generation/
 ## Pipeline Flow
 
 ```
+0. Docker Image Creation (if enabled)
+   └─> Build Docker image with base repo + dependencies
+       (Required before validation, optional rebuild after tasks)
+
 1. Bug Generation
    ├─> LM Modify (LLM modifies code to introduce bugs)
    ├─> LM Rewrite (LLM rewrites code with bugs)
@@ -51,15 +55,23 @@ server/task_generation/
 
 3. Validation
    └─> Run test harness to ensure bugs break tests
+       (Uses Docker image from step 0)
 
 4. Task Gathering
    └─> Collect validated tasks into task instances
+       - Creates Git branches on GitHub mirror
+       - Each branch contains a bug
+       - Sets image_name in task instances
 
 5. Issue Generation (Optional)
    └─> Generate GitHub-style issue text using LLM
 
-6. Output
-   ├─> Save to JSONL file
+6. Docker Image Rebuild (Optional)
+   └─> Rebuild image to include task branches
+       (Makes branches available in Docker image)
+
+7. Output
+   ├─> Save to JSON/JSONL file
    └─> Upload to HuggingFace (optional)
 ```
 
@@ -125,7 +137,32 @@ with SpiderClient(config=config) as client:
 repository:
   github_url: "owner/repo"  # Required
   commit: "abc123"          # Optional: commit, branch, or tag
+  mirror_org: "your-org"    # Optional: GitHub org/user for mirrors
+  mirror_repo_template: "custom-{owner}-{repo}-{commit}"  # Optional: Custom repo name format
 ```
+
+**Mirror Repository Options:**
+- `mirror_org: "username"` → Creates `username/{owner}__{repo}.{commit}`
+- `mirror_org: "org/prefix"` → Creates `org/prefix-{owner}__{repo}.{commit}`
+- `mirror_repo_template` → Fully custom format with `{owner}`, `{repo}`, `{commit}` placeholders
+
+### Docker Image Config
+
+```yaml
+docker_image:
+  enabled: true
+  build_before_tasks: true   # Required: build before validation
+  rebuild_after_tasks: false # Optional: rebuild after tasks to include branches
+  push: false                # Optional: push to Docker Hub
+  options:
+    workers: 4               # Parallel workers for building
+```
+
+**Important Notes:**
+- `build_before_tasks: true` is **required** for validation to work
+- Docker images contain the base repository at a specific commit
+- Task branches are created on GitHub mirror (not in initial image)
+- `rebuild_after_tasks: true` includes task branches in the image (optional)
 
 ### Bug Generation Methods
 

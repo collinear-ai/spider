@@ -7,6 +7,7 @@ from GitHub repositories.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +38,118 @@ class SWESmithTaskGenerator:
         
         for dir_path in [self.bug_gen_dir, self.validation_dir, self.tasks_dir, self.issue_gen_dir]:
             dir_path.mkdir(parents=True, exist_ok=True)
+        
+        # Set mirror organization for SWE-smith
+        self._setup_mirror_org()
+    
+    def _setup_mirror_org(self) -> None:
+        """Configure SWE-smith to use custom mirror repository location.
+        
+        SWE-smith uses the ORG_NAME_GH constant from swesmith.constants.
+        We patch this at runtime before SWE-smith creates any profiles.
+        
+        Mirror location can be:
+        - Just org/user: "spider" -> creates "spider/{owner}__{repo}.{commit}"
+        - Full path: "spider/mirrors" -> creates "spider/mirrors-{owner}__{repo}.{commit}"
+        """
+        # Get mirror org from config (docker_image.mirror_org or repository.mirror_org)
+        mirror_org = None
+        mirror_repo_template = None
+        
+        if self.config.docker_image:
+            if self.config.docker_image.mirror_org:
+                mirror_org = self.config.docker_image.mirror_org
+            if self.config.docker_image.mirror_repo_template:
+                mirror_repo_template = self.config.docker_image.mirror_repo_template
+        
+        if not mirror_org and self.config.repository.mirror_org:
+            mirror_org = self.config.repository.mirror_org
+        if not mirror_repo_template and self.config.repository.mirror_repo_template:
+            mirror_repo_template = self.config.repository.mirror_repo_template
+        
+        # Parse mirror_org - could be "org" or "org/repo"
+        mirror_org_name = None
+        mirror_repo_prefix = None
+        
+        if mirror_org:
+            if "/" in mirror_org:
+                # Full path like "spider/mirrors"
+                parts = mirror_org.split("/", 1)
+                mirror_org_name = parts[0]
+                mirror_repo_prefix = parts[1]
+            else:
+                # Just org/user like "spider"
+                mirror_org_name = mirror_org
+        
+        if mirror_org_name:
+            # Patch SWE-smith's constant before any profiles are created
+            try:
+                import swesmith.constants as swesmith_constants
+                # Store original value
+                original_org = getattr(swesmith_constants, 'ORG_NAME_GH', 'swesmith')
+                swesmith_constants.ORG_NAME_GH = mirror_org_name
+                logger.info(f"Patched SWE-smith ORG_NAME_GH: '{original_org}' -> '{mirror_org_name}'")
+                
+                # If we have a custom repo template or prefix, we need to patch the mirror_name property
+                # SWE-smith uses: f"{self.org_gh}/{self.repo_name}"
+                # We want to customize the repo_name part
+                if mirror_repo_template or mirror_repo_prefix:
+                    self._patch_mirror_repo_name(mirror_repo_template, mirror_repo_prefix)
+                
+                # Update existing profiles
+                try:
+                    from swesmith.profiles import registry
+                    for profile in registry.values():
+                        profile.org_gh = mirror_org_name
+                        if mirror_repo_template or mirror_repo_prefix:
+                            # Store custom template for later use
+                            profile._spider_mirror_template = mirror_repo_template
+                            profile._spider_mirror_prefix = mirror_repo_prefix
+                    logger.info(f"Updated mirror org for {len(registry)} existing profiles")
+                except Exception as e:
+                    logger.debug(f"Could not update existing profiles: {e}")
+                    
+            except Exception as e:
+                logger.warning(f"Could not patch SWE-smith constants: {e}")
+                logger.warning("Mirror repos will use default 'swesmith' organization")
+                os.environ["SWESMITH_MIRROR_ORG"] = mirror_org_name or mirror_org
+    
+    def _patch_mirror_repo_name(self, template: Optional[str], prefix: Optional[str]) -> None:
+        """Patch the repo_name and mirror_name properties to use custom template/prefix"""
+        try:
+            from swesmith.profiles.base import RepoProfile
+            
+            # Store original properties
+            original_repo_name = RepoProfile.repo_name
+            original_mirror_name = RepoProfile.mirror_name
+            
+            def custom_repo_name(self):
+                """Custom repo_name that uses template or prefix"""
+                if hasattr(self, '_spider_mirror_template') and self._spider_mirror_template:
+                    # Use custom template
+                    return self._spider_mirror_template.format(
+                        owner=self.owner,
+                        repo=self.repo,
+                        commit=self.commit[:8]
+                    )
+                elif hasattr(self, '_spider_mirror_prefix') and self._spider_mirror_prefix:
+                    # Use prefix + default format
+                    return f"{self._spider_mirror_prefix}-{self.owner}__{self.repo}.{self.commit[:8]}"
+                else:
+                    # Fall back to original
+                    return original_repo_name.fget(self)
+            
+            def custom_mirror_name(self):
+                """Custom mirror_name that uses patched repo_name"""
+                return f"{self.org_gh}/{self.repo_name}"
+            
+            # Replace the properties
+            RepoProfile.repo_name = property(custom_repo_name)
+            RepoProfile.mirror_name = property(custom_mirror_name)
+            logger.info("Patched RepoProfile.repo_name and mirror_name to use custom template")
+            
+        except Exception as e:
+            logger.warning(f"Could not patch repo_name/mirror_name properties: {e}")
     
     def generate_tasks(self) -> List[Dict[str, Any]]:
         """Run the complete task generation pipeline.
@@ -45,6 +158,11 @@ class SWESmithTaskGenerator:
             List of task instances in SWE-smith format
         """
         logger.info("Starting SWE task generation pipeline")
+        
+        # Step 0: Build Docker image (if enabled and required)
+        docker_config = self.config.docker_image
+        if docker_config and docker_config.enabled and docker_config.build_before_tasks:
+            self._build_docker_image()
         
         # Step 1: Generate bugs
         bug_patches = self._generate_bugs()
@@ -73,6 +191,10 @@ class SWESmithTaskGenerator:
         # Step 5: Generate issue text (optional)
         if self.config.issue_generation and self.config.issue_generation.enabled:
             tasks = self._generate_issues(tasks)
+        
+        # Step 6: Rebuild Docker image with task branches (optional)
+        if docker_config and docker_config.enabled and docker_config.rebuild_after_tasks:
+            self._rebuild_docker_image()
         
         logger.info(f"Generated {len(tasks)} task instances")
         return tasks
@@ -311,6 +433,11 @@ class SWESmithTaskGenerator:
             str(validation_run_dir),
         ]
         
+        # Add repush_image flag if Docker rebuild is enabled
+        docker_config = self.config.docker_image
+        if docker_config and docker_config.enabled and docker_config.rebuild_after_tasks:
+            cmd.append("--repush_image")
+        
         for key, value in self.config.gather.options.items():
             cmd.extend([f"--{key}", str(value)])
         
@@ -377,6 +504,61 @@ class SWESmithTaskGenerator:
         # Issue generation modifies tasks in place or creates new files
         # This is a simplified version - may need adjustment based on SWE-smith behavior
         return tasks
+    
+    def _build_docker_image(self) -> None:
+        """Build Docker image for the repository before task generation"""
+        repo_name = self._get_repo_name()
+        docker_config = self.config.docker_image
+        
+        logger.info(f"Building Docker image for {repo_name}")
+        
+        # Use SWE-smith's build_repo.create_images
+        # First, we need to ensure the repo profile is registered
+        # SWE-smith auto-detects based on repo, but we can also call it directly
+        
+        cmd = [
+            sys.executable, "-m", "swesmith.build_repo.create_images",
+            "--repos", self.config.repository.github_url,
+        ]
+        
+        if docker_config and docker_config.push:
+            cmd.append("--push")
+        
+        if docker_config and docker_config.options.get("workers"):
+            cmd.extend(["--workers", str(docker_config.options["workers"])])
+        
+        if docker_config and docker_config.options.get("proceed"):
+            cmd.append("--proceed")
+        
+        logger.info(f"Building Docker image: {' '.join(cmd)}")
+        result = subprocess.run(cmd, cwd=str(self.workspace), capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            # Check if image already exists (that's OK)
+            if "already exists" in result.stderr.lower() or "ImageNotFound" not in result.stderr:
+                logger.warning(f"Docker image build had issues (may already exist): {result.stderr}")
+            else:
+                raise TaskGenerationError(
+                    f"Docker image build failed: {result.stderr}\n{result.stdout}"
+                )
+        else:
+            logger.info("Docker image built successfully")
+    
+    def _rebuild_docker_image(self) -> None:
+        """Rebuild Docker image after task generation to include task branches"""
+        repo_name = self._get_repo_name()
+        docker_config = self.config.docker_image
+        
+        logger.info(f"Rebuilding Docker image for {repo_name} to include task branches")
+        
+        # Use SWE-smith's profile system to rebuild
+        # The gather step should have set repush_image, but we can also do it explicitly
+        # This requires the repo profile, which SWE-smith manages internally
+        
+        # For now, we'll rely on SWE-smith's gather to handle this if repush_image is set
+        # Or we can call the profile's push_image method directly
+        logger.info("Docker image will be rebuilt by gather step if repush_image is enabled")
+        # Note: This is handled by gather.py if --repush_image flag is passed
     
     def _get_repo_name(self) -> str:
         """Extract repo name from GitHub URL"""

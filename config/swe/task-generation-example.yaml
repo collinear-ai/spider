@@ -15,6 +15,28 @@ job:
     repository:
       github_url: "pandas-dev/pandas"
       commit: "70c3acf62950be5dfb28743c7a719bfdecebcd84"  # Optional: specific commit
+      
+      # Mirror repository configuration
+      # Option 1: Just specify organization/user
+      mirror_org: "your-github-username"  # Creates: your-github-username/pandas-dev__pandas.70c3acf6
+      
+      # Option 2: Specify full path (org/repo-prefix)
+      # mirror_org: "your-org/mirrors"  # Creates: your-org/mirrors-pandas-dev__pandas.70c3acf6
+      
+      # Option 3: Custom template for repo name
+      # mirror_repo_template: "custom-{owner}-{repo}-{commit}"  # Creates: your-org/custom-pandas-dev-pandas-70c3acf6
+    
+    # Docker image configuration
+    docker_image:
+      enabled: true
+      build_before_tasks: true  # Required: build image before validation
+      rebuild_after_tasks: false  # Optional: rebuild after tasks to include branches
+      push: false  # Optional: push to Docker Hub
+      # Can override mirror settings here
+      # mirror_org: "different-org"
+      # mirror_repo_template: "custom-{owner}-{repo}-{commit}"
+      options:
+        workers: 4  # Parallel workers for building
     
     # Bug generation methods
     bug_generation:

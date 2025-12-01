@@ -183,6 +183,14 @@ class RepositoryConfig(BaseModel):
         default=None,
         description="Commit hash, branch, or tag to use (default: HEAD)"
     )
+    mirror_org: Optional[str] = Field(
+        default=None,
+        description="GitHub organization/user for mirror repositories (default: 'swesmith'). Can be 'owner/repo' format for custom location."
+    )
+    mirror_repo_template: Optional[str] = Field(
+        default=None,
+        description="Template for mirror repo name. Use {owner}, {repo}, {commit} placeholders. Default: '{owner}__{repo}.{commit}'"
+    )
 
 class BugGenerationMethodConfig(BaseModel):
     """Configuration for a single bug generation method"""
@@ -267,10 +275,42 @@ class IssueGenerationConfig(BaseModel):
         description="Additional issue generation options"
     )
 
+class DockerImageConfig(BaseModel):
+    """Configuration for Docker image creation"""
+    enabled: bool = Field(default=True, description="Whether to build Docker image")
+    build_before_tasks: bool = Field(
+        default=True,
+        description="Build image before task generation (required for validation)"
+    )
+    rebuild_after_tasks: bool = Field(
+        default=False,
+        description="Rebuild image after tasks to include task branches"
+    )
+    push: bool = Field(
+        default=False,
+        description="Push image to Docker Hub after building"
+    )
+    mirror_org: Optional[str] = Field(
+        default=None,
+        description="GitHub organization/user for mirror repositories (overrides repository.mirror_org)"
+    )
+    mirror_repo_template: Optional[str] = Field(
+        default=None,
+        description="Template for mirror repo name (overrides repository.mirror_repo_template)"
+    )
+    options: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional Docker build options"
+    )
+
 class TaskGenerationConfig(BaseModel):
     """Configuration for SWE task generation pipeline"""
     enabled: bool = Field(default=True)
     repository: RepositoryConfig = Field(..., description="Repository to generate tasks for")
+    docker_image: Optional[DockerImageConfig] = Field(
+        default=None,
+        description="Docker image creation configuration"
+    )
     bug_generation: BugGenerationConfig = Field(..., description="Bug generation configuration")
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
     gather: GatherConfig = Field(default_factory=GatherConfig)
