@@ -1,0 +1,63 @@
+# Example configuration for PR Mirror task generation
+# PR Mirror inverts real PR patches to create realistic bugs
+
+server:
+  base_url: http://localhost:9000
+  api_key: 
+  request_timeout: 600
+
+job:
+  task_generation:
+    enabled: true
+    
+    repository:
+      github_url: "grpc/grpc-go"  # Match the repo in your PR data file
+      commit: "192c8a2a3506bb69336f5c135733a3435a04fb30"  # Base commit from PR data
+      mirror_org: "collinear-ai"  # ⚠️ REQUIRED: Your GitHub username
+    
+    docker_image:
+      enabled: true
+      build_before_tasks: true
+      rebuild_after_tasks: false
+      push: false
+    
+    bug_generation:
+      methods:
+        # PR Mirror: Inverts PR patches to create bugs
+        # Best training effectiveness (9.2% resolve rate)
+        - type: "pr_mirror"
+          # Option 1: Provide existing PR data file
+          # file: "pr_data/grpc__grpc-go_dataset.jsonl"
+          
+          # Option 2: Auto-collect PRs from repository (default)
+          auto_collect_prs: true  # Automatically collect PRs if file not provided
+          max_pulls: 2  # Optional: Limit number of PRs to collect
+          
+          # Optional: model for recovery (if needed)
+          # model: "claude-3-7-sonnet-20250219"
+    
+    validation:
+      enabled: true
+      workers: 2  # Start with fewer workers
+    
+    gather:
+      enabled: true
+    
+    issue_generation:
+      enabled: false  # Skip for testing
+  
+  task_output:
+    mode: "return"  # Save locally (or use "upload_hf" to upload to HuggingFace)
+  
+  # Required dummy fields (not used)
+  model:
+    provider: "vllm"
+    name: "dummy"
+  source:
+    dataset: "dummy"
+    split: "train"
+  generation:
+    max_turns: 1
+  output:
+    mode: "return"
+

@@ -49,24 +49,96 @@ with SpiderClient(config=config) as client:
 
 ## Requirements
 
+### Required for All Methods
 - SWE-smith must be installed: `pip install swesmith`
-- SWE-smith config files must be available (e.g., `configs/bug_gen/lm_modify.yml`)
 - Docker must be installed and running (for validation)
+- GitHub token: `export GITHUB_TOKEN=your_token` (for creating mirror repos)
+
+### Optional
 - HuggingFace token (if uploading to HF): `export HF_TOKEN=your_token`
+- LLM API keys (only if using `lm_modify` or `lm_rewrite`):
+  - `export ANTHROPIC_API_KEY=your_key` (for Claude)
+  - `export OPENAI_API_KEY=your_key` (for GPT-4)
+- PR data file (for `pr_mirror` method)
+
+### Important: No vllm Needed!
+- **Task generation does NOT require vllm or LLM hosting**
+- The `model` field in job config is just a placeholder (not used)
+- For `pr_mirror` and `procedural`: **No LLM needed at all**
+- For `lm_modify`/`lm_rewrite`: SWE-smith uses API keys directly (not vllm)
+
+See `BUG_GENERATION_METHODS.md` for detailed comparison of all four methods.
 
 ## Bug Generation Methods
 
-### LM Modify
-Uses language models to modify code entities to introduce bugs.
+SWE-smith supports four bug generation methods, with different trade-offs:
+
+### PR Mirror (Recommended for Training) ⭐
+**Best for training effectiveness** - Inverts real pull requests to create realistic bug instances.
+
+- **Training Performance**: 9.2% ± 1.7 resolve rate (best)
+- **Realism**: Most reflective of SWE-bench
+- **Cost**: Free (uses existing PRs)
+- **Requirements**: PR data file (SWE-bench task instances format, see `PR_MIRROR_FILE_FORMAT.md`)
+
+```yaml
+bug_generation:
+  methods:
+    - type: "pr_mirror"
+      file: "path/to/pr_data.json"  # PR data file
+```
 
 ### LM Rewrite
 Uses language models to rewrite code entities from scratch with bugs.
 
+- **Training Performance**: 8.8% ± 1.7 resolve rate (strong)
+- **Requirements**: LLM API key (Claude/OpenAI)
+- **Cost**: API costs per bug
+
+```yaml
+bug_generation:
+  methods:
+    - type: "lm_rewrite"
+      model: "claude-3-7-sonnet-20250219"
+      n_bugs: 10
+```
+
 ### Procedural
 Uses AST-based transformations to procedurally generate bugs.
 
-### PR Mirror
-Reverses real pull requests to create bug instances.
+- **Training Performance**: 8.6% ± 1.8 resolve rate (strong)
+- **Requirements**: None (no LLM needed)
+- **Cost**: Free
+- **Scalability**: High
+
+```yaml
+bug_generation:
+  methods:
+    - type: "procedural"
+      max_bugs: 20
+```
+
+### LM Modify
+Uses language models to modify code entities to introduce bugs.
+
+- **Training Performance**: 5.7% ± 1.5 resolve rate (weaker)
+- **Requirements**: LLM API key (Claude/OpenAI)
+- **Cost**: API costs per bug
+
+```yaml
+bug_generation:
+  methods:
+    - type: "lm_modify"
+      model: "claude-3-7-sonnet-20250219"
+      n_bugs: 10
+```
+
+## Recommended Strategy
+
+Based on SWE-smith research (arXiv:2504.21798):
+- **Best overall**: PR Mirror (realism + training effectiveness)
+- **Strong complements**: Procedural + LM Rewrite (scalable)
+- **Avoid alone**: LM Modify (weaker training signal despite decent yield)
 
 ## Next Steps
 

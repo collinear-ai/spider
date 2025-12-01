@@ -41,16 +41,31 @@ job:
     # Bug generation methods
     bug_generation:
       methods:
-        # Method 1: LM Modify - Use LLM to modify code to introduce bugs
-        - type: "lm_modify"
-          config_file: "configs/bug_gen/lm_modify.yml"  # SWE-smith config file
+        # Method 1: PR Mirror (RECOMMENDED) - Invert real PRs for realistic bugs
+        # Best training effectiveness (9.2% resolve rate)
+        # Requires PR data file from SWE-smith
+        - type: "pr_mirror"
+          file: "path/to/pr_data.json"  # Path to PR data file
+        
+        # Method 2: LM Rewrite - LLM rewrites code with bugs
+        # Strong training performance (8.8% resolve rate)
+        - type: "lm_rewrite"
+          config_file: "configs/bug_gen/lm_rewrite.yml"  # SWE-smith config file
           model: "claude-3-7-sonnet-20250219"
           n_bugs: 10
           n_workers: 20
         
-        # Method 2: Procedural - AST-based code modifications
+        # Method 3: Procedural - AST-based code modifications
+        # Strong training performance (8.6% resolve rate), no LLM needed
         - type: "procedural"
           max_bugs: 20
+        
+        # Method 4: LM Modify - LLM modifies code to introduce bugs
+        # Weaker training performance (5.7% resolve rate)
+        # - type: "lm_modify"
+        #   config_file: "configs/bug_gen/lm_modify.yml"
+        #   model: "claude-3-7-sonnet-20250219"
+        #   n_bugs: 10
       
       # Optional: Combine bugs from multiple methods
       combine:

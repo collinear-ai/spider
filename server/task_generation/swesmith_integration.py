@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from spider.config import TaskGenerationConfig
+from .. import events
 
 logger = logging.getLogger(__name__)
 
@@ -158,45 +159,65 @@ class SWESmithTaskGenerator:
             List of task instances in SWE-smith format
         """
         logger.info("Starting SWE task generation pipeline")
+        events.emit("Starting task generation pipeline.", code="task_gen.start")
         
         # Step 0: Build Docker image (if enabled and required)
         docker_config = self.config.docker_image
         if docker_config and docker_config.enabled and docker_config.build_before_tasks:
+            events.emit("Building Docker image...", code="task_gen.docker_build")
             self._build_docker_image()
+            events.emit("Docker image built successfully.", code="task_gen.docker_build_done")
         
         # Step 1: Generate bugs
+        events.emit("Generating bugs...", code="task_gen.bug_generation")
         bug_patches = self._generate_bugs()
         
         if not bug_patches:
             logger.warning("No bugs generated")
+            events.emit("No bugs generated.", code="task_gen.no_bugs", level="warning")
             return []
         
+        events.emit(f"Generated {len(bug_patches)} bug patches.", code="task_gen.bugs_generated", data={"count": len(bug_patches)})
+        
         # Step 2: Collect patches
+        events.emit("Collecting patches...", code="task_gen.collect")
         collected_patches = self._collect_patches(bug_patches)
+        events.emit("Patches collected.", code="task_gen.collect_done")
         
         # Step 3: Validate bugs
         if self.config.validation.enabled:
+            events.emit("Validating bugs (running tests)...", code="task_gen.validation")
             validated_patches = self._validate_bugs(collected_patches)
+            events.emit("Validation complete.", code="task_gen.validation_done")
         else:
             logger.info("Skipping validation")
+            events.emit("Skipping validation.", code="task_gen.validation_skipped")
             validated_patches = collected_patches
         
         # Step 4: Gather tasks
         if self.config.gather.enabled:
+            events.emit("Gathering tasks into instances...", code="task_gen.gather")
             tasks = self._gather_tasks(validated_patches)
+            events.emit(f"Gathered {len(tasks)} task instances.", code="task_gen.gather_done", data={"count": len(tasks)})
         else:
             logger.info("Skipping gather, using validated patches as tasks")
+            events.emit("Skipping gather.", code="task_gen.gather_skipped")
             tasks = validated_patches
         
         # Step 5: Generate issue text (optional)
         if self.config.issue_generation and self.config.issue_generation.enabled:
+            events.emit("Generating issue text...", code="task_gen.issue_gen")
             tasks = self._generate_issues(tasks)
+            events.emit("Issue text generated.", code="task_gen.issue_gen_done")
         
         # Step 6: Rebuild Docker image with task branches (optional)
         if docker_config and docker_config.enabled and docker_config.rebuild_after_tasks:
+            events.emit("Rebuilding Docker image with task branches...", code="task_gen.docker_rebuild")
             self._rebuild_docker_image()
+            events.emit("Docker image rebuilt.", code="task_gen.docker_rebuild_done")
         
         logger.info(f"Generated {len(tasks)} task instances")
+        events.emit(f"Task generation complete: {len(tasks)} tasks generated.", code="task_gen.complete", data={"task_count": len(tasks)})
         return tasks
     
     def _generate_bugs(self) -> List[Path]:
@@ -210,6 +231,7 @@ class SWESmithTaskGenerator:
         
         for method in self.config.bug_generation.methods:
             logger.info(f"Running bug generation method: {method.type}")
+            events.emit(f"Running bug generation: {method.type}...", code="task_gen.bug_method", data={"method": method.type})
             
             try:
                 if method.type == "lm_modify":
@@ -225,9 +247,11 @@ class SWESmithTaskGenerator:
                 
                 bug_patches.extend(patches)
                 logger.info(f"Generated {len(patches)} bugs using {method.type}")
+                events.emit(f"Generated {len(patches)} bugs using {method.type}.", code="task_gen.bug_method_done", data={"method": method.type, "count": len(patches)})
                 
             except Exception as e:
                 logger.error(f"Error in {method.type}: {e}", exc_info=True)
+                events.emit(f"Error in {method.type}: {str(e)}", code="task_gen.bug_method_error", level="error", data={"method": method.type})
                 raise TaskGenerationError(f"Failed to generate bugs with {method.type}: {e}") from e
         
         return bug_patches
@@ -326,12 +350,30 @@ class SWESmithTaskGenerator:
     
     def _run_pr_mirror(self, method_config) -> List[Path]:
         """Run PR mirror bug generation"""
-        if not method_config.file:
-            raise TaskGenerationError("PR mirror method requires 'file' parameter")
+        # If file is not provided and auto_collect is enabled, collect PRs automatically
+        pr_data_file = method_config.file
+        if not pr_data_file and method_config.auto_collect_prs:
+            logger.info("No PR data file provided, automatically collecting PRs from repository...")
+            pr_data_file = self._collect_and_convert_prs(method_config)
+        elif not pr_data_file:
+            raise TaskGenerationError(
+                "PR mirror method requires 'file' parameter or enable 'auto_collect_prs'"
+            )
+        
+        # Check if file exists
+        pr_data_path = Path(pr_data_file)
+        if not pr_data_path.is_absolute():
+            # Try relative to workspace first, then current directory
+            pr_data_path = self.workspace / pr_data_file
+            if not pr_data_path.exists():
+                pr_data_path = Path(pr_data_file)
+        
+        if not pr_data_path.exists():
+            raise TaskGenerationError(f"PR data file not found: {pr_data_file}")
         
         cmd = [
             sys.executable, "-m", "swesmith.bug_gen.mirror.generate",
-            method_config.file,
+            str(pr_data_path),
         ]
         
         if method_config.model:
@@ -340,7 +382,7 @@ class SWESmithTaskGenerator:
         for key, value in method_config.options.items():
             cmd.extend([f"--{key}", str(value)])
         
-        logger.info(f"Running: {' '.join(cmd)}")
+        logger.info(f"Running PR mirror: {' '.join(cmd)}")
         result = subprocess.run(cmd, cwd=str(self.workspace), capture_output=True, text=True)
         
         if result.returncode != 0:
@@ -353,6 +395,92 @@ class SWESmithTaskGenerator:
         if bug_dir.exists():
             return list(bug_dir.rglob("bug__*.diff"))
         return []
+    
+    def _collect_and_convert_prs(self, method_config) -> str:
+        """Automatically collect PRs from repository and convert to task instance format.
+        
+        Returns:
+            Path to the generated task instances file
+        """
+        repo_name = self._get_repo_name()
+        repo_url = self.config.repository.github_url
+        
+        # Create directory for PR data
+        pr_data_dir = self.workspace / "pr_data"
+        pr_data_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Step 1: Collect PRs from GitHub
+        raw_prs_file = pr_data_dir / f"{repo_name.replace('/', '__')}-prs.jsonl"
+        
+        if not raw_prs_file.exists():
+            logger.info(f"Collecting PRs from {repo_url}...")
+            events.emit(f"Collecting PRs from {repo_url}...", code="task_gen.pr_collect")
+            cmd = [
+                sys.executable, "-m", "swesmith.bug_gen.mirror.collect.print_pulls",
+                repo_url,
+                str(raw_prs_file),
+            ]
+            
+            if method_config.max_pulls:
+                cmd.extend(["--max_pulls", str(method_config.max_pulls)])
+            
+            # Get GitHub token from environment
+            github_token = os.environ.get("GITHUB_TOKEN")
+            if not github_token:
+                logger.warning("GITHUB_TOKEN not set - PR collection may be rate-limited")
+            else:
+                cmd.extend(["--token", github_token])
+            
+            logger.info(f"Running PR collection: {' '.join(cmd)}")
+            result = subprocess.run(cmd, cwd=str(self.workspace), capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                raise TaskGenerationError(
+                    f"PR collection failed: {result.stderr}\n{result.stdout}"
+                )
+            
+            if not raw_prs_file.exists():
+                raise TaskGenerationError(f"PR collection completed but file not found: {raw_prs_file}")
+            
+            logger.info(f"✓ Collected PRs saved to {raw_prs_file}")
+            events.emit(f"PRs collected and saved.", code="task_gen.pr_collect_done")
+        else:
+            logger.info(f"PR data already exists at {raw_prs_file}, skipping collection")
+            events.emit("Using existing PR data.", code="task_gen.pr_collect_cached")
+        
+        # Step 2: Convert PRs to task instance format
+        task_instances_file = pr_data_dir / f"{repo_name.replace('/', '__')}-task-instances.jsonl"
+        
+        if not task_instances_file.exists():
+            logger.info("Converting PRs to task instance format...")
+            events.emit("Converting PRs to task instance format...", code="task_gen.pr_convert")
+            cmd = [
+                sys.executable, "-m", "swesmith.bug_gen.mirror.collect.build_dataset",
+                str(raw_prs_file),
+                str(task_instances_file),
+            ]
+            
+            # Get GitHub token from environment
+            github_token = os.environ.get("GITHUB_TOKEN")
+            if github_token:
+                cmd.extend(["--token", github_token])
+            
+            logger.info(f"Running dataset build: {' '.join(cmd)}")
+            result = subprocess.run(cmd, cwd=str(self.workspace), capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                raise TaskGenerationError(
+                    f"Dataset build failed: {result.stderr}\n{result.stdout}"
+                )
+            
+            logger.info(f"✓ Task instances saved to {task_instances_file}")
+            events.emit("PRs converted to task instance format.", code="task_gen.pr_convert_done")
+        else:
+            logger.info(f"Task instances already exist at {task_instances_file}, skipping conversion")
+            events.emit("Using existing task instances.", code="task_gen.pr_convert_cached")
+        
+        # Return relative path from workspace
+        return str(task_instances_file.relative_to(self.workspace))
     
     def _collect_patches(self, bug_patches: List[Path]) -> Path:
         """Collect all bug patches into a single file"""

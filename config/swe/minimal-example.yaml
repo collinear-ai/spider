@@ -1,0 +1,61 @@
+# Minimal example for testing SWE task generation
+# Start with this to test the pipeline
+
+server:
+  base_url: http://localhost:9000
+  api_key: 
+  request_timeout: 600
+
+job:
+  task_generation:
+    enabled: true
+    
+    repository:
+      github_url: "pandas-dev/pandas"  # Change to your test repo
+      commit: "70c3acf62950be5dfb28743c7a719bfdecebcd84"
+      mirror_org: "your-github-username"  # ⚠️ REQUIRED: Your GitHub username
+    
+    docker_image:
+      enabled: true
+      build_before_tasks: true
+      rebuild_after_tasks: false
+      push: false
+    
+    bug_generation:
+      methods:
+        # Option 1: PR Mirror (BEST for training - 9.2% resolve rate)
+        # Requires PR data file from SWE-smith
+        # - type: "pr_mirror"
+        #   file: "path/to/pr_data.json"
+        
+        # Option 2: Procedural (fast, no LLM needed - 8.6% resolve rate)
+        - type: "procedural"
+          max_bugs: 3  # Small number for testing
+    
+    validation:
+      enabled: true
+      workers: 2  # Start with fewer workers
+    
+    gather:
+      enabled: true
+    
+    issue_generation:
+      enabled: false  # Skip for testing
+  
+  # Not uploading to HF for testing
+  task_output:
+    mode: "return"  # Just save locally
+  
+  # Required dummy fields (NOT USED for task generation - just placeholders)
+  # These are required by JobConfig schema but task generation doesn't use them
+  model:
+    provider: "vllm"  # Not used - task generation doesn't need vllm
+    name: "dummy"
+  source:
+    dataset: "dummy"
+    split: "train"
+  generation:
+    max_turns: 1
+  output:
+    mode: "return"
+

@@ -223,7 +223,15 @@ class BugGenerationMethodConfig(BaseModel):
     )
     file: Optional[str] = Field(
         default=None,
-        description="Input file for pr_mirror method"
+        description="Input file for pr_mirror method. If not provided, PRs will be collected automatically from the repository."
+    )
+    auto_collect_prs: Optional[bool] = Field(
+        default=True,
+        description="For pr_mirror: If True and file is not provided, automatically collect PRs from repository"
+    )
+    max_pulls: Optional[int] = Field(
+        default=None,
+        description="For pr_mirror auto-collect: Maximum number of PRs to collect"
     )
     options: Dict[str, Any] = Field(
         default_factory=dict,
