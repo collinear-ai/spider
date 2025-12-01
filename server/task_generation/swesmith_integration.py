@@ -10,10 +10,11 @@ import logging
 import os
 import subprocess
 import sys
+from dataclasses import dataclass, field, make_dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from spider.config import TaskGenerationConfig
+from spider.config import TaskGenerationConfig, CustomProfileConfig
 from .. import events
 
 logger = logging.getLogger(__name__)
@@ -40,8 +41,116 @@ class SWESmithTaskGenerator:
         for dir_path in [self.bug_gen_dir, self.validation_dir, self.tasks_dir, self.issue_gen_dir]:
             dir_path.mkdir(parents=True, exist_ok=True)
         
+        # Register custom profiles before any SWE-smith operations
+        self._register_custom_profiles()
+        
         # Set mirror organization for SWE-smith
         self._setup_mirror_org()
+    
+    def _register_custom_profiles(self) -> None:
+        """Dynamically create and register custom profiles with SWE-smith's registry.
+        
+        This allows users to add repos not in SWE-smith's built-in registry
+        without modifying SWE-smith code.
+        """
+        from swesmith.profiles import registry
+        
+        # Collect all custom profiles to register
+        profiles_to_register = []
+        
+        # Add profile from repository.custom_profile if specified
+        if self.config.repository.custom_profile:
+            profiles_to_register.append(self.config.repository.custom_profile)
+        
+        # Add profiles from task_generation.custom_profiles
+        if self.config.custom_profiles:
+            profiles_to_register.extend(self.config.custom_profiles)
+        
+        if not profiles_to_register:
+            return
+        
+        logger.info(f"Registering {len(profiles_to_register)} custom profile(s) with SWE-smith")
+        
+        for profile_config in profiles_to_register:
+            try:
+                profile_class = self._create_profile_class(profile_config)
+                registry.register_profile(profile_class)
+                logger.info(f"Registered custom profile: {profile_config.owner}/{profile_config.repo} ({profile_config.language})")
+            except Exception as e:
+                logger.error(f"Failed to register custom profile {profile_config.owner}/{profile_config.repo}: {e}", exc_info=True)
+                raise TaskGenerationError(f"Failed to register custom profile: {e}") from e
+    
+    def _create_profile_class(self, profile_config: CustomProfileConfig):
+        """Dynamically create a RepoProfile subclass from config.
+        
+        Args:
+            profile_config: Custom profile configuration
+            
+        Returns:
+            A dataclass subclass of the appropriate base profile
+        """
+        # Import base profiles
+        from swesmith.profiles.python import PythonProfile
+        from swesmith.profiles.golang import GoProfile
+        from swesmith.profiles.rust import RustProfile
+        from swesmith.profiles.javascript import JavaScriptProfile
+        from swesmith.profiles.java import JavaProfile
+        from swesmith.profiles.cpp import CppProfile
+        from swesmith.profiles.c import CProfile
+        from swesmith.profiles.csharp import CSharpProfile
+        from swesmith.profiles.php import PhpProfile
+        
+        # Map language to base profile class
+        language_map = {
+            "python": PythonProfile,
+            "golang": GoProfile,
+            "rust": RustProfile,
+            "javascript": JavaScriptProfile,
+            "java": JavaProfile,
+            "cpp": CppProfile,
+            "c": CProfile,
+            "csharp": CSharpProfile,
+            "php": PhpProfile,
+        }
+        
+        base_class = language_map.get(profile_config.language)
+        if not base_class:
+            raise ValueError(f"Unsupported language: {profile_config.language}")
+        
+        # Generate a unique class name based on owner, repo, and commit
+        class_name = f"{profile_config.owner.capitalize()}{profile_config.repo.capitalize()}{profile_config.commit[:8]}"
+        # Remove special characters that aren't valid in class names
+        class_name = ''.join(c if c.isalnum() or c == '_' else '_' for c in class_name)
+        
+        # Build field definitions for make_dataclass
+        fields = [
+            ("owner", str, field(default=profile_config.owner)),
+            ("repo", str, field(default=profile_config.repo)),
+            ("commit", str, field(default=profile_config.commit)),
+        ]
+        
+        # Add optional fields
+        if profile_config.install_cmds:
+            install_cmds_val = profile_config.install_cmds.copy()
+            fields.append(("install_cmds", "list[str]", field(default_factory=lambda: install_cmds_val.copy())))
+        if profile_config.timeout:
+            fields.append(("timeout", int, field(default=profile_config.timeout)))
+        if profile_config.timeout_ref:
+            fields.append(("timeout_ref", int, field(default=profile_config.timeout_ref)))
+        if profile_config.test_cmd:
+            fields.append(("test_cmd", str, field(default=profile_config.test_cmd)))
+        if profile_config.language == "python" and profile_config.python_version:
+            fields.append(("python_version", str, field(default=profile_config.python_version)))
+        
+        # Create the dataclass using make_dataclass
+        profile_class = make_dataclass(
+            class_name,
+            fields=fields,
+            bases=(base_class,),
+            frozen=False
+        )
+        
+        return profile_class
     
     def _setup_mirror_org(self) -> None:
         """Configure SWE-smith to use custom mirror repository location.
@@ -689,10 +798,23 @@ class SWESmithTaskGenerator:
         # Note: This is handled by gather.py if --repush_image flag is passed
     
     def _get_repo_name(self) -> str:
-        """Extract repo name from GitHub URL"""
+        """Extract repo name in SWE-smith format (owner__repo.commit).
+        
+        If custom_profile is provided, uses that. Otherwise constructs from github_url.
+        """
+        if self.config.repository.custom_profile:
+            # Use custom profile format: owner__repo.commit (first 8 chars)
+            cp = self.config.repository.custom_profile
+            commit_short = cp.commit[:8] if len(cp.commit) >= 8 else cp.commit
+            return f"{cp.owner}__{cp.repo}.{commit_short}"
+        
+        # Fallback: construct from github_url
         repo_url = self.config.repository.github_url
         # Remove https://github.com/ if present
         repo_url = repo_url.replace("https://github.com/", "").replace("http://github.com/", "")
         # Replace / with __ for SWE-smith format
-        return repo_url.replace("/", "__")
+        owner, repo = repo_url.split("/", 1)
+        commit = self.config.repository.commit or "HEAD"
+        commit_short = commit[:8] if len(commit) >= 8 else commit
+        return f"{owner}__{repo}.{commit_short}"
 

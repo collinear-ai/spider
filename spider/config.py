@@ -176,6 +176,40 @@ class RuntimeDependencyConfig(BaseModel):
 # SWE Task Generation Configs (Separate from main Spider configs)
 # ============================================================================
 
+class CustomProfileConfig(BaseModel):
+    """Configuration for a custom SWE-smith profile (for repos not in built-in registry)"""
+    language: Literal["python", "golang", "rust", "javascript", "java", "cpp", "c", "csharp", "php"] = Field(
+        ...,
+        description="Programming language of the repository"
+    )
+    owner: str = Field(..., description="GitHub owner/org")
+    repo: str = Field(..., description="Repository name")
+    commit: str = Field(..., description="Commit hash to use")
+    install_cmds: Optional[List[str]] = Field(
+        default=None,
+        description="Custom installation commands (if default doesn't work)"
+    )
+    timeout: Optional[int] = Field(
+        default=None,
+        description="Custom test timeout in seconds"
+    )
+    timeout_ref: Optional[int] = Field(
+        default=None,
+        description="Custom reference test timeout in seconds"
+    )
+    test_cmd: Optional[str] = Field(
+        default=None,
+        description="Custom test command (overrides language default)"
+    )
+    python_version: Optional[str] = Field(
+        default=None,
+        description="Python version (for Python profiles only)"
+    )
+    options: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional profile-specific options"
+    )
+
 class RepositoryConfig(BaseModel):
     """Repository configuration for task generation"""
     github_url: str = Field(..., description="GitHub repository URL (e.g., 'owner/repo')")
@@ -190,6 +224,10 @@ class RepositoryConfig(BaseModel):
     mirror_repo_template: Optional[str] = Field(
         default=None,
         description="Template for mirror repo name. Use {owner}, {repo}, {commit} placeholders. Default: '{owner}__{repo}.{commit}'"
+    )
+    custom_profile: Optional[CustomProfileConfig] = Field(
+        default=None,
+        description="Custom profile definition (for repos not in SWE-smith's built-in registry)"
     )
 
 class BugGenerationMethodConfig(BaseModel):
@@ -325,6 +363,10 @@ class TaskGenerationConfig(BaseModel):
     issue_generation: Optional[IssueGenerationConfig] = Field(
         default=None,
         description="Optional issue text generation"
+    )
+    custom_profiles: Optional[List[CustomProfileConfig]] = Field(
+        default=None,
+        description="Additional custom profiles to register (useful for multi-repo workflows)"
     )
 
 class TaskSourceConfig(BaseModel):
