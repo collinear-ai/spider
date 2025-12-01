@@ -1,0 +1,84 @@
+# Example configuration for SWE task generation
+# This generates bug instances from a GitHub repository using SWE-smith
+
+server:
+  base_url: http://localhost:9000
+  api_key: 
+  request_timeout: 600  # Task generation can take a while
+
+job:
+  # Task Generation Pipeline
+  task_generation:
+    enabled: true
+    
+    # Repository to generate tasks for
+    repository:
+      github_url: "pandas-dev/pandas"
+      commit: "70c3acf62950be5dfb28743c7a719bfdecebcd84"  # Optional: specific commit
+    
+    # Bug generation methods
+    bug_generation:
+      methods:
+        # Method 1: LM Modify - Use LLM to modify code to introduce bugs
+        - type: "lm_modify"
+          config_file: "configs/bug_gen/lm_modify.yml"  # SWE-smith config file
+          model: "claude-3-7-sonnet-20250219"
+          n_bugs: 10
+          n_workers: 20
+        
+        # Method 2: Procedural - AST-based code modifications
+        - type: "procedural"
+          max_bugs: 20
+      
+      # Optional: Combine bugs from multiple methods
+      combine:
+        enabled: true
+        same_file:
+          num_patches: 3
+          limit_per_file: 15
+        same_module:
+          num_patches: 2
+          depth: 2
+    
+    # Validation: Run test harness to ensure bugs break tests
+    validation:
+      enabled: true
+      workers: 8
+    
+    # Gather: Collect validated tasks into task instances
+    gather:
+      enabled: true
+    
+    # Optional: Generate issue text for tasks
+    issue_generation:
+      enabled: false
+      config_file: "configs/issue_gen/ig_v2.yaml"
+      model: "claude-3-7-sonnet-20250219"
+      workers: 2
+  
+  # Task Output: Upload generated tasks to HuggingFace
+  task_output:
+    mode: "upload_hf"
+    hf:
+      repo_id: "my-org/pandas-swe-tasks"
+      repo_type: "dataset"
+      private: false
+  
+  # Model config (not used for task generation, but required by JobConfig)
+  model:
+    provider: "vllm"
+    name: "dummy"  # Not used for task generation
+  
+  # Source config (not used for task generation, but required by JobConfig)
+  source:
+    dataset: "dummy"
+    split: "train"
+  
+  # Generation config (not used for task generation, but required by JobConfig)
+  generation:
+    max_turns: 1
+  
+  # Output config (not used for task generation, but required by JobConfig)
+  output:
+    mode: "return"
+

@@ -18,6 +18,7 @@ from .sources import collect_prompts
 from .writers import JSONLBatchWriter
 from .hf_upload import HFUploadError, publish_to_hub
 from .on_policy import run_on_policy_job
+from .task_generation import SWESmithTaskGenerator, TaskGenerationError, convert_swesmith_to_hf_format
 
 logger = logging.getLogger(__name__)
 if logger.level == logging.NOTSET:
@@ -50,6 +51,22 @@ def run_generation_job(
     with _job_env_context(job_env or {}):
         workspace = workspace.resolve()
         workspace.mkdir(parents=True, exist_ok=True)
+
+        # Check if this is a SWE task generation job
+        if job.task_generation:
+            logger.info("Job %s: starting SWE task generation pipeline", job_id)
+            events.emit(
+                "Launching SWE task generation pipeline.",
+                code="job.pipeline",
+                data={"mode": "swe_task_generation"},
+            )
+            result = _run_task_generation_job(
+                job_id,
+                job,
+                workspace=workspace,
+                job_env=job_env or {},
+            )
+            return result
 
         if job.generation.on_policy:
             if (
@@ -188,6 +205,116 @@ def _run_off_policy_job(
                 "Runtime sandbox cleaned.",
                 code="runtime.cleaned"
             )
+
+def _run_task_generation_job(
+    job_id: str,
+    job: JobConfig,
+    *,
+    workspace: Path,
+    job_env: Dict[str, str],
+) -> JobExecutionResult:
+    """Run SWE task generation pipeline using SWE-smith"""
+    if not job.task_generation:
+        raise JobExecutionError("task_generation config is required for task generation jobs")
+    
+    task_gen_config = job.task_generation
+    artifact_path = workspace / "tasks.jsonl"
+    metadata_path = workspace / "metadata.json"
+    
+    try:
+        # Initialize task generator
+        generator = SWESmithTaskGenerator(task_gen_config, workspace / "task_generation")
+        
+        # Generate tasks
+        events.emit("Starting task generation pipeline.", code="task_gen.start")
+        tasks = generator.generate_tasks()
+        
+        if not tasks:
+            artifact_path.write_text("", encoding="utf-8")
+            events.emit(
+                "No tasks generated.",
+                level="warning",
+                code="task_gen.no_tasks",
+            )
+            return JobExecutionResult(
+                artifacts_path=artifact_path,
+                metadata_path=metadata_path,
+                metrics={"tasks": 0},
+                messages=["No tasks generated."]
+            )
+        
+        # Convert to HF format if needed
+        if job.task_output and job.task_output.mode == OutputMode.HF_UPLOAD:
+            hf_tasks = [convert_swesmith_to_hf_format(task) for task in tasks]
+            tasks_to_save = hf_tasks
+        else:
+            tasks_to_save = tasks
+        
+        # Write tasks to file
+        # SWE-smith stores as JSON array, but for HF upload we use JSONL
+        import json
+        if job.task_output and job.task_output.mode == OutputMode.HF_UPLOAD:
+            # Write as JSONL for HF datasets
+            with open(artifact_path, "w") as f:
+                for task in tasks_to_save:
+                    f.write(json.dumps(task, ensure_ascii=False) + "\n")
+        else:
+            # Write as JSON array (SWE-smith format) for local storage
+            with open(artifact_path, "w") as f:
+                json.dump(tasks_to_save, f, indent=2, ensure_ascii=False)
+        
+        events.emit(
+            f"Generated {len(tasks)} task instances.",
+            code="task_gen.completed",
+            data={"num_tasks": len(tasks)}
+        )
+        
+        # Upload to HF if configured
+        remote_artifact = None
+        if job.task_output and job.task_output.mode == OutputMode.HF_UPLOAD and job.task_output.hf:
+            try:
+                remote_artifact = publish_to_hub(
+                    job_id=job_id,
+                    artifact=artifact_path,
+                    metadata=metadata_path,
+                    config=job.task_output.hf
+                )
+                events.emit(
+                    "Published tasks to HuggingFace.",
+                    code="task_gen.uploaded",
+                    data={"remote_artifact": remote_artifact}
+                )
+            except HFUploadError as exc:
+                logger.warning(f"Failed to upload tasks to HF: {exc}")
+                events.emit(
+                    f"Failed to upload tasks to HF: {exc}",
+                    level="warning",
+                    code="task_gen.upload_failed"
+                )
+        
+        # Write metadata
+        metadata = {
+            "job_id": job_id,
+            "num_tasks": len(tasks),
+            "repository": task_gen_config.repository.github_url,
+            "generation_methods": [m.type for m in task_gen_config.bug_generation.methods],
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+        }
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        
+        return JobExecutionResult(
+            artifacts_path=artifact_path,
+            metadata_path=metadata_path,
+            remote_artifact=remote_artifact,
+            metrics={"tasks": len(tasks)},
+            messages=[f"Generated {len(tasks)} task instances."]
+        )
+        
+    except TaskGenerationError as exc:
+        raise JobExecutionError(f"Task generation failed: {exc}") from exc
+    except Exception as exc:
+        raise JobExecutionError(f"Unexpected error in task generation: {exc}") from exc
 
 def _run_tool_on_policy_job(
     job_id: str,

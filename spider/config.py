@@ -171,6 +171,178 @@ class RuntimeDependencyConfig(BaseModel):
         default_factory=dict,
         description="Environment variables to expose the runetime sandbox when using dependencies"
     )
+
+# ============================================================================
+# SWE Task Generation Configs (Separate from main Spider configs)
+# ============================================================================
+
+class RepositoryConfig(BaseModel):
+    """Repository configuration for task generation"""
+    github_url: str = Field(..., description="GitHub repository URL (e.g., 'owner/repo')")
+    commit: Optional[str] = Field(
+        default=None,
+        description="Commit hash, branch, or tag to use (default: HEAD)"
+    )
+
+class BugGenerationMethodConfig(BaseModel):
+    """Configuration for a single bug generation method"""
+    type: Literal["lm_modify", "lm_rewrite", "procedural", "pr_mirror"] = Field(
+        ...,
+        description="Bug generation method type"
+    )
+    config_file: Optional[str] = Field(
+        default=None,
+        description="Path to SWE-smith config file for this method"
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description="Model to use for LM-based methods"
+    )
+    n_bugs: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Number of bugs to generate (for LM methods)"
+    )
+    max_bugs: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Maximum bugs to generate (for procedural)"
+    )
+    n_workers: Optional[int] = Field(
+        default=1,
+        ge=1,
+        description="Number of parallel workers"
+    )
+    file: Optional[str] = Field(
+        default=None,
+        description="Input file for pr_mirror method"
+    )
+    options: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional method-specific options"
+    )
+
+class BugGenerationConfig(BaseModel):
+    """Configuration for bug generation"""
+    methods: List[BugGenerationMethodConfig] = Field(
+        ...,
+        description="List of bug generation methods to run"
+    )
+    combine: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Configuration for combining bugs (same_file, same_module)"
+    )
+
+class ValidationConfig(BaseModel):
+    """Configuration for bug validation"""
+    enabled: bool = Field(default=True)
+    workers: int = Field(default=8, ge=1)
+    options: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional validation options"
+    )
+
+class GatherConfig(BaseModel):
+    """Configuration for gathering validated tasks"""
+    enabled: bool = Field(default=True)
+    options: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional gather options"
+    )
+
+class IssueGenerationConfig(BaseModel):
+    """Configuration for issue text generation"""
+    enabled: bool = Field(default=False)
+    config_file: Optional[str] = Field(
+        default=None,
+        description="Path to SWE-smith issue generation config"
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description="Model to use for issue generation"
+    )
+    workers: int = Field(default=2, ge=1)
+    options: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional issue generation options"
+    )
+
+class TaskGenerationConfig(BaseModel):
+    """Configuration for SWE task generation pipeline"""
+    enabled: bool = Field(default=True)
+    repository: RepositoryConfig = Field(..., description="Repository to generate tasks for")
+    bug_generation: BugGenerationConfig = Field(..., description="Bug generation configuration")
+    validation: ValidationConfig = Field(default_factory=ValidationConfig)
+    gather: GatherConfig = Field(default_factory=GatherConfig)
+    issue_generation: Optional[IssueGenerationConfig] = Field(
+        default=None,
+        description="Optional issue text generation"
+    )
+
+class TaskSourceConfig(BaseModel):
+    """Configuration for loading existing tasks"""
+    type: Literal["file", "hf_dataset", "swesmith", "swe_bench"] = Field(
+        ...,
+        description="Task source type"
+    )
+    source: str = Field(
+        ...,
+        description="Source path (file path, HF dataset ID, etc.)"
+    )
+    split: Optional[str] = Field(
+        default=None,
+        description="Split to use (for HF datasets)"
+    )
+    filter: Optional[str] = Field(
+        default=None,
+        description="Filter pattern (regex) for instance IDs"
+    )
+    slice: Optional[str] = Field(
+        default=None,
+        description="Slice specification (e.g., '0:100')"
+    )
+    shuffle: bool = Field(default=False, description="Shuffle instances")
+    options: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional source-specific options"
+    )
+
+class ScaffoldConfig(BaseModel):
+    """Configuration for SWE agent scaffold"""
+    type: Literal["swe-agent", "openhands", "mini-swe-agent"] = Field(
+        ...,
+        description="Scaffold type"
+    )
+    agent_type: Optional[str] = Field(
+        default=None,
+        description="Agent variant (e.g., 'codeact', 'react', 'default')"
+    )
+    config_file: Optional[str] = Field(
+        default=None,
+        description="Path to scaffold-specific config file"
+    )
+    options: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Scaffold-specific options"
+    )
+
+class TaskOutputConfig(BaseModel):
+    """Configuration for task output (uploading generated tasks)"""
+    mode: OutputMode = Field(default=OutputMode.RETURN)
+    hf: Optional[HFUploadConfig] = Field(
+        default=None,
+        description="HF upload config for tasks"
+    )
+    local_path: Optional[str] = Field(
+        default=None,
+        description="Local path to save tasks"
+    )
+    
+    @model_validator(mode="after")
+    def validate_mode(self) -> "TaskOutputConfig":
+        if self.mode == OutputMode.HF_UPLOAD and not self.hf:
+            raise ValueError("`hf` is required when mode='upload_hf'")
+        return self
     
 class JobConfig(BaseModel):
     model: ModelConfig
@@ -197,6 +369,24 @@ class JobConfig(BaseModel):
         default=None,
         description="Optional runtime dependency requirements declared by the client"
     )
+    
+    # SWE-specific optional fields (separate from main Spider functionality)
+    task_generation: Optional[TaskGenerationConfig] = Field(
+        default=None,
+        description="Optional SWE task generation pipeline configuration"
+    )
+    tasks: Optional[TaskSourceConfig] = Field(
+        default=None,
+        description="Optional task source for loading existing tasks"
+    )
+    scaffold: Optional[ScaffoldConfig] = Field(
+        default=None,
+        description="Optional scaffold configuration for SWE trajectory generation"
+    )
+    task_output: Optional[TaskOutputConfig] = Field(
+        default=None,
+        description="Optional task output configuration (for uploading generated tasks)"
+    )
 
     @model_validator(mode="after")
     def validate_on_policy_output(self) -> "JobConfig":
@@ -206,6 +396,27 @@ class JobConfig(BaseModel):
             raise ValueError("`output.mode` must be `upload_hf` when `generation.on_policy` is true")
         if not self.output.hf or not self.output.hf.repo_id.strip():
             raise ValueError("`output.hf.repo_id` is required when `generation.on_policy` is true")
+        return self
+    
+    @model_validator(mode="after")
+    def validate_swe_config(self) -> "JobConfig":
+        """Validate SWE-specific config combinations"""
+        has_task_gen = self.task_generation is not None
+        has_tasks = self.tasks is not None
+        has_scaffold = self.scaffold is not None
+        
+        # Can't have both task generation and task loading
+        if has_task_gen and has_tasks:
+            raise ValueError("Cannot specify both `task_generation` and `tasks`. Use one or the other.")
+        
+        # Scaffold requires either task generation or task loading
+        if has_scaffold and not (has_task_gen or has_tasks):
+            raise ValueError("`scaffold` requires either `task_generation` or `tasks` to be specified")
+        
+        # Task output only makes sense with task generation
+        if self.task_output is not None and not has_task_gen:
+            raise ValueError("`task_output` can only be used with `task_generation`")
+        
         return self
 
 class ServerConfig(BaseModel):
