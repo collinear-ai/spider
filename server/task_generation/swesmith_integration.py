@@ -372,8 +372,26 @@ class SWESmithTaskGenerator:
             repo_name,
         ]
         
+        # config_file is required for lm_modify, use default if not provided
         if method_config.config_file:
-            cmd.extend(["--config_file", method_config.config_file])
+            config_file = method_config.config_file
+        else:
+            # Use default SWE-smith config file
+            default_config = Path("/home/ubuntu/SWE-smith/configs/bug_gen/lm_modify.yml")
+            if not default_config.exists():
+                # Try relative to current directory or find it
+                import swesmith
+                swesmith_path = Path(swesmith.__file__).parent.parent
+                default_config = swesmith_path / "configs" / "bug_gen" / "lm_modify.yml"
+            if not default_config.exists():
+                raise TaskGenerationError(
+                    "config_file is required for lm_modify. Please specify it in your config or ensure "
+                    "SWE-smith's default config exists at configs/bug_gen/lm_modify.yml"
+                )
+            config_file = str(default_config)
+        
+        cmd.extend(["--config_file", config_file])
+        
         if method_config.model:
             cmd.extend(["--model", method_config.model])
         if method_config.n_bugs:
@@ -406,12 +424,36 @@ class SWESmithTaskGenerator:
             repo_name,
         ]
         
+        # config_file is required for lm_rewrite, use default if not provided
         if method_config.config_file:
-            cmd.extend(["--config_file", method_config.config_file])
+            config_file = method_config.config_file
+            logger.info(f"Using provided config_file: {config_file}")
+        else:
+            # Use default SWE-smith config file
+            default_config = Path("/home/ubuntu/SWE-smith/configs/bug_gen/lm_rewrite.yml")
+            if not default_config.exists():
+                # Try relative to current directory or find it
+                import swesmith
+                swesmith_path = Path(swesmith.__file__).parent.parent
+                default_config = swesmith_path / "configs" / "bug_gen" / "lm_rewrite.yml"
+            if not default_config.exists():
+                raise TaskGenerationError(
+                    "config_file is required for lm_rewrite. Please specify it in your config or ensure "
+                    "SWE-smith's default config exists at configs/bug_gen/lm_rewrite.yml"
+                )
+            config_file = str(default_config)
+            logger.info(f"Using default config_file: {config_file}")
+        
+        cmd.extend(["--config_file", config_file])
+        
         if method_config.model:
             cmd.extend(["--model", method_config.model])
-        if method_config.n_bugs:
-            cmd.extend(["--n_bugs", str(method_config.n_bugs)])
+        # lm_rewrite uses --max_bugs, not --n_bugs
+        if method_config.max_bugs:
+            cmd.extend(["--max_bugs", str(method_config.max_bugs)])
+        elif method_config.n_bugs:
+            # Fallback: use n_bugs as max_bugs for compatibility
+            cmd.extend(["--max_bugs", str(method_config.n_bugs)])
         if method_config.n_workers:
             cmd.extend(["--n_workers", str(method_config.n_workers)])
         

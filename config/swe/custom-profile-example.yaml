@@ -11,16 +11,16 @@ job:
     enabled: true
     
     repository:
-      github_url: "grpc/grpc-go"  # Your repo
-      commit: "192c8a2a3506bb69336f5c135733a3435a04fb30"  # Specific commit
+      github_url: "python/typing_extensions"  # Your repo
+      commit: "2638b86aad48a3d25704caac9d7e37368fd87815"  # Specific commit
       mirror_org: "collinear-ai"  # Your GitHub org for mirrors
       
       # Define custom profile for repos not in SWE-smith's registry
       custom_profile:
-        language: "golang"  # Options: python, golang, rust, javascript, java, cpp, c, csharp, php
-        owner: "grpc"
-        repo: "grpc-go"
-        commit: "192c8a2a3506bb69336f5c135733a3435a04fb30"
+        language: "python"  # Options: python, golang, rust, javascript, java, cpp, c, csharp, php
+        owner: "python"
+        repo: "typing_extensions"
+        commit: "2638b86aad48a3d25704caac9d7e37368fd87815"
         # Optional: Custom installation commands (if default doesn't work)
         # install_cmds:
         #   - "go mod tidy"
@@ -39,8 +39,10 @@ job:
     
     bug_generation:
       methods:
-        - type: "procedural"  # Procedural works well for any repo
+        - type: "lm_rewrite"  # Procedural works well for any repo
           max_bugs: 10
+          model: "gpt-5"
+          n_bugs: 3
         # Or use LM methods (require API keys)
         # - type: "lm_rewrite"
         #   model: "gpt-4o"
