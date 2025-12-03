@@ -34,8 +34,9 @@ def main():
         def on_update(status):
             nonlocal last_event_key
             status_str = status.get("status", "unknown")
-            # Print status on a single line
-            print(f"  Status: {status_str}", end="\r")
+            # Print status on a single line, clear any leftover characters
+            print(f"\r  Status: {status_str}\033[K", end="")  # \033[K clears to end of line
+            sys.stdout.flush()  # Ensure it's displayed immediately
             
             events = status.get("events") or []
             if not events:
@@ -59,13 +60,19 @@ def main():
             elif level == "WARNING":
                 print(f"\n  ⚠ {msg}")
             else:
-                print(f"\n  → {msg}")
+                    print(f"\n  → {msg}")
         
         try:
+            # Validation can take a long time, especially with many bugs
+            # Default timeout: 4 hours (14400 seconds) for large batches
+            # Can override with JOB_TIMEOUT environment variable
+            import os
+            timeout = float(os.getenv("JOB_TIMEOUT", "14400"))  # 4 hours default
+            
             status = client.poll_job(
                 job_id,
                 interval=10.0,
-                timeout=3600,
+                timeout=timeout,
                 wait_for_completion=True,
                 on_update=on_update
             )

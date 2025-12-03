@@ -11,15 +11,23 @@ job:
     enabled: true
     
     repository:
-      github_url: "grpc/grpc-go"  # Match the repo in your PR data file
-      commit: "192c8a2a3506bb69336f5c135733a3435a04fb30"  # Base commit from PR data
-      mirror_org: "collinear-ai"  # ⚠️ REQUIRED: Your GitHub username
+      github_url: "python/typing_extensions"  # Match the repo in your PR data file
+      commit: "2638b86aad48a3d25704caac9d7e37368fd87815"  # Base commit from PR data
+      mirror_org: "collinear-ai"  # Github Username
+      
+      # Define custom profile for repos not in SWE-smith's registry
+      custom_profile:
+        language: "python"  # Options: python, golang, rust, javascript, java, cpp, c, csharp, php
+        owner: "python"
+        repo: "typing_extensions"
+        commit: "2638b86aad48a3d25704caac9d7e37368fd87815"
     
     docker_image:
       enabled: true
       build_before_tasks: true
       rebuild_after_tasks: false
-      push: false
+      push: true  # Set to true to push images to Docker Hub
+      docker_hub_org: "meghanaarakkal"  # Optional: Your Docker Hub org/username (default: "jyangballin")
     
     bug_generation:
       methods:
@@ -31,7 +39,7 @@ job:
           
           # Option 2: Auto-collect PRs from repository (default)
           auto_collect_prs: true  # Automatically collect PRs if file not provided
-          max_pulls: 2  # Optional: Limit number of PRs to collect
+          max_pulls: 25  # Optional: Limit number of PRs to collect
           
           # Optional: model for recovery (if needed)
           # model: "claude-3-7-sonnet-20250219"
@@ -47,7 +55,13 @@ job:
       enabled: false  # Skip for testing
   
   task_output:
-    mode: "return"  # Save locally (or use "upload_hf" to upload to HuggingFace)
+    mode: "upload_hf"  # Upload to HuggingFace
+    # If mode is "upload_hf", configure hf section below:
+    hf:
+      repo_id: "collinear-ai/TEMP-spider-swe-task-generation-test-pr-mirror"  # e.g., "collinear-ai/swe-tasks"
+      repo_type: "dataset"  # or "model"
+      private: true  # Set to true for private datasets
+      # config_name: "default"  # Optional: subset config name for the dataset
   
   # Required dummy fields (not used)
   model:

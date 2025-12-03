@@ -52,7 +52,21 @@ with SpiderClient(config=config) as client:
 ### Required for All Methods
 - SWE-smith must be installed: `pip install swesmith`
 - Docker must be installed and running (for validation)
-- GitHub token: `export GITHUB_TOKEN=your_token` (for creating mirror repos)
+- **GitHub token**: Set in `.env` file or `export GITHUB_TOKEN=your_token` (for creating mirror repos)
+  - Token needs `repo` scope (full control of private repositories)
+  - If using an organization, token needs `admin:org` scope and the token owner must be an org admin
+- **SSH keys for GitHub**: Required for git clone/push operations
+  - SWE-smith uses SSH (`git@github.com:...`) for all git operations
+  - Generate SSH key: `ssh-keygen -t ed25519 -C "your_email@example.com"`
+  - Add to SSH agent: `eval "$(ssh-agent -s)" && ssh-add ~/.ssh/id_ed25519`
+  - Add public key to GitHub: https://github.com/settings/keys
+  - Test: `ssh -T git@github.com` (should show "You've successfully authenticated")
+
+**Note on Mirror Repositories:**
+- SWE-smith creates mirror repositories in your specified GitHub organization/user
+- These mirrors contain the repository code at the specified commit
+- The mirror repository must be populated with code before bug generation can proceed
+- If a mirror repository exists but is empty, you may need to manually populate it or delete it and let SWE-smith recreate it
 
 ### Optional
 - HuggingFace token (if uploading to HF): `export HF_TOKEN=your_token`

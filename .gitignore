@@ -6,3 +6,6 @@ artifacts/
 .artifacts/
 *private.yaml
 *private.py
+gh_ssh
+gh_ssh.pub
+.env

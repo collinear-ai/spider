@@ -11,38 +11,30 @@ job:
     enabled: true
     
     repository:
-      github_url: "python/typing_extensions"  # Your repo
-      commit: "2638b86aad48a3d25704caac9d7e37368fd87815"  # Specific commit
-      mirror_org: "collinear-ai"  # Your GitHub org for mirrors
+      github_url: "pallets/click"  # Repo already in SWE-smith registry
+      commit: "fde47b4b4f978f179b9dff34583cb2b99021f482"  # Specific commit from SWE-smith registry
+      mirror_org: "collinear-ai"  # Your GitHub username (not org) - no admin permissions needed
       
-      # Define custom profile for repos not in SWE-smith's registry
-      custom_profile:
-        language: "python"  # Options: python, golang, rust, javascript, java, cpp, c, csharp, php
-        owner: "python"
-        repo: "typing_extensions"
-        commit: "2638b86aad48a3d25704caac9d7e37368fd87815"
-        # Optional: Custom installation commands (if default doesn't work)
-        # install_cmds:
-        #   - "go mod tidy"
-        #   - "go test ./..."
-        # Optional: Custom timeouts
-        # timeout: 120
-        # timeout_ref: 900
-        # Optional: Custom test command
-        # test_cmd: "go test -v ./..."
+      # No custom_profile needed - this repo is already in SWE-smith's registry!
+      # Uncomment below if using a repo NOT in SWE-smith's registry:
+      # custom_profile:
+      #   language: "python"  # Options: python, golang, rust, javascript, java, cpp, c, csharp, php
+      #   owner: "pallets"
+      #   repo: "click"
+      #   commit: "fde47b4b4f978f179b9dff34583cb2b99021f482"
     
     docker_image:
       enabled: true
       build_before_tasks: true
       rebuild_after_tasks: false
-      push: false
+      push: true  # Set to true to push images to Docker Hub
+      docker_hub_org: "meghanaarakkal"  # Optional: Your Docker Hub org/username (default: "jyangballin")
     
     bug_generation:
       methods:
-        - type: "lm_rewrite"  # Procedural works well for any repo
-          max_bugs: 10
-          model: "gpt-5"
-          n_bugs: 3
+        - type: "procedural"  # Procedural works well for any repo
+          max_bugs: 100
+          # model: "o3-mini-2025-01-31"
         # Or use LM methods (require API keys)
         # - type: "lm_rewrite"
         #   model: "gpt-4o"
@@ -50,7 +42,7 @@ job:
     
     validation:
       enabled: true
-      workers: 2
+      workers: 12
     
     gather:
       enabled: true
@@ -59,7 +51,13 @@ job:
       enabled: false
   
   task_output:
-    mode: "return"  # or "upload_hf" to push to HuggingFace
+    mode: "upload_hf"  # Options: "return" (return in response) or "upload_hf" (push to HuggingFace)
+    # If mode is "upload_hf", configure hf section below:
+    hf:
+      repo_id: "collinear-ai/spider-swe-task-generation-test"  # e.g., "collinear-ai/swe-tasks"
+      repo_type: "dataset"  # or "model"
+      private: true  # Set to true for private datasets
+      # config_name: "default"  # Optional: subset config name for the dataset
   
   # Required dummy fields (not used)
   model:

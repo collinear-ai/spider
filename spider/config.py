@@ -171,7 +171,7 @@ class RuntimeDependencyConfig(BaseModel):
         default_factory=dict,
         description="Environment variables to expose the runetime sandbox when using dependencies"
     )
-
+    
 # ============================================================================
 # SWE Task Generation Configs (Separate from main Spider configs)
 # ============================================================================
@@ -335,6 +335,10 @@ class DockerImageConfig(BaseModel):
     push: bool = Field(
         default=False,
         description="Push image to Docker Hub after building"
+    )
+    docker_hub_org: Optional[str] = Field(
+        default=None,
+        description="Docker Hub organization/username for pushing images (default: 'jyangballin')"
     )
     mirror_org: Optional[str] = Field(
         default=None,

@@ -8,11 +8,21 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field, make_dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# Load .env file if it exists (for GITHUB_TOKEN, etc.)
+try:
+    from dotenv import load_dotenv
+    env_path = Path(__file__).parent.parent.parent / ".env"
+    if env_path.exists():
+        load_dotenv(env_path, override=False)  # Don't override existing env vars
+except ImportError:
+    pass  # python-dotenv not available, skip
 
 from spider.config import TaskGenerationConfig, CustomProfileConfig
 from .. import events
@@ -46,6 +56,7 @@ class SWESmithTaskGenerator:
         
         # Set mirror organization for SWE-smith
         self._setup_mirror_org()
+        self._patch_git_user_config()
     
     def _register_custom_profiles(self) -> None:
         """Dynamically create and register custom profiles with SWE-smith's registry.
@@ -75,7 +86,20 @@ class SWESmithTaskGenerator:
             try:
                 profile_class = self._create_profile_class(profile_config)
                 registry.register_profile(profile_class)
+                
+                # Verify registration by checking repo_name
+                profile_instance = profile_class()
+                repo_name = profile_instance.repo_name
+                mirror_name = profile_instance.mirror_name
                 logger.info(f"Registered custom profile: {profile_config.owner}/{profile_config.repo} ({profile_config.language})")
+                logger.info(f"  Profile repo_name: {repo_name}, mirror_name: {mirror_name}")
+                
+                # Verify it's in the registry
+                if repo_name in registry.data:
+                    logger.info(f"  ✓ Verified: {repo_name} is in registry")
+                else:
+                    logger.warning(f"  ⚠ Warning: {repo_name} not found in registry after registration")
+                    
             except Exception as e:
                 logger.error(f"Failed to register custom profile {profile_config.owner}/{profile_config.repo}: {e}", exc_info=True)
                 raise TaskGenerationError(f"Failed to register custom profile: {e}") from e
@@ -152,6 +176,609 @@ class SWESmithTaskGenerator:
         
         return profile_class
     
+    def _create_profile_wrapper_script(self, module_name: str, cmd_args: List[str]) -> str:
+        """Create a Python script that registers custom profiles and runs a SWE-smith command.
+        
+        This is needed because subprocess calls start fresh Python interpreters that don't
+        have access to profiles registered in the parent process.
+        """
+        script_lines = [
+            "#!/usr/bin/env python3",
+            "import sys",
+            "import os",
+            "from pathlib import Path",
+            "from dataclasses import dataclass, field, make_dataclass",
+            "",
+            "# Load .env file if it exists (for GITHUB_TOKEN, etc.)",
+            "try:",
+            "    from dotenv import load_dotenv",
+            "    # Try to find .env file relative to spider directory",
+            "    env_paths = [",
+            "        Path(__file__).parent.parent.parent.parent / '.env',  # spider/.env",
+            "        Path(__file__).parent.parent.parent / '.env',  # Alternative path",
+            "        Path.cwd() / '.env',  # Current working directory",
+            "    ]",
+            "    for env_path in env_paths:",
+            "        if env_path.exists():",
+            "            load_dotenv(env_path, override=False)",
+            "            print(f'Loaded .env from {env_path}')",
+            "            break",
+            "except ImportError:",
+            "    pass  # python-dotenv not available",
+            "",
+        ]
+        
+        # Add profile registration code for each custom profile
+        profiles_to_register = []
+        if self.config.repository.custom_profile:
+            profiles_to_register.append(self.config.repository.custom_profile)
+        if self.config.custom_profiles:
+            profiles_to_register.extend(self.config.custom_profiles)
+        
+        # Import base profiles (only import what we need)
+        base_imports = set()
+        for profile_config in profiles_to_register:
+            base_imports.add(profile_config.language)
+        
+        base_import_map = {
+            "python": "from swesmith.profiles.python import PythonProfile",
+            "golang": "from swesmith.profiles.golang import GoProfile",
+            "rust": "from swesmith.profiles.rust import RustProfile",
+            "javascript": "from swesmith.profiles.javascript import JavaScriptProfile",
+            "java": "from swesmith.profiles.java import JavaProfile",
+            "cpp": "from swesmith.profiles.cpp import CppProfile",
+            "c": "from swesmith.profiles.c import CProfile",
+            "csharp": "from swesmith.profiles.csharp import CSharpProfile",
+            "php": "from swesmith.profiles.php import PhpProfile",
+        }
+        
+        for lang in base_imports:
+            if lang in base_import_map:
+                script_lines.append(base_import_map[lang])
+        
+        script_lines.extend([
+            "from swesmith.profiles import registry",
+            "",
+        ])
+        
+        # Apply mirror org configuration if specified
+        # Get mirror org from config (same logic as _setup_mirror_org)
+        mirror_org = None
+        mirror_repo_template = None
+        
+        if self.config.docker_image:
+            if self.config.docker_image.mirror_org:
+                mirror_org = self.config.docker_image.mirror_org
+            if self.config.docker_image.mirror_repo_template:
+                mirror_repo_template = self.config.docker_image.mirror_repo_template
+        
+        if not mirror_org and self.config.repository.mirror_org:
+            mirror_org = self.config.repository.mirror_org
+        if not mirror_repo_template and self.config.repository.mirror_repo_template:
+            mirror_repo_template = self.config.repository.mirror_repo_template
+        
+        if mirror_org:
+            # Parse mirror_org - could be "org" or "org/repo"
+            if "/" in mirror_org:
+                parts = mirror_org.split("/", 1)
+                mirror_org_name = parts[0]
+                mirror_repo_prefix = parts[1]
+            else:
+                mirror_org_name = mirror_org
+                mirror_repo_prefix = None
+            
+            script_lines.extend([
+                "# Apply mirror org configuration BEFORE importing profiles",
+                "import swesmith.constants as swesmith_constants",
+                f"swesmith_constants.ORG_NAME_GH = '{mirror_org_name}'",
+                f"print('Set mirror org to: {mirror_org_name}')",
+                "",
+                "# Patch git user config to use 'spider' instead of 'swesmith'",
+                "from swesmith.profiles.base import RepoProfile",
+                "import shutil",
+                "import subprocess",
+                "import os",
+                "",
+                "original_create_mirror = RepoProfile.create_mirror",
+                "",
+                "def patched_create_mirror(self):",
+                "    \"\"\"Patched version that uses 'spider' as git user name\"\"\"",
+                "    if self._mirror_exists():",
+                "        return",
+                "    if self.repo_name in os.listdir():",
+                "        shutil.rmtree(self.repo_name)",
+                "    self.api.repos.create_in_org(self.org_gh, self.repo_name)",
+                "",
+                "    # Clone the repository",
+                "    subprocess.run(",
+                "        f'git clone git@github.com:{self.owner}/{self.repo}.git {self.repo_name}',",
+                "        shell=True,",
+                "        check=True,",
+                "        stdout=subprocess.DEVNULL,",
+                "        stderr=subprocess.DEVNULL,",
+                "    )",
+                "",
+                "    # Build the git commands (using 'spider' instead of 'swesmith')",
+                "    git_cmds = [",
+                "        f'cd {self.repo_name}',",
+                "        f'git checkout {self.commit}',",
+                "    ]",
+                "",
+                "    # Add submodule update if submodules exist",
+                "    if os.path.exists(os.path.join(self.repo_name, '.gitmodules')):",
+                "        git_cmds.append('git submodule update --init --recursive')",
+                "",
+                "    # Add the rest of the commands (with 'spider' as user name)",
+                "    git_cmds.extend([",
+                "        'rm -rf .git',",
+                "        'git init',",
+                "        'git config user.name \"spider\"',",
+                "        'git config user.email \"spider@collinear.ai\"',",
+                "        'rm -rf .github/workflows',",
+                "        'rm -rf .github/dependabot.y*',",
+                "        'git add .',",
+                "        'git commit --no-gpg-sign -m \\'Initial commit\\'',",
+                "        'git branch -M main',",
+                "        f'git remote add origin git@github.com:{self.mirror_name}.git',",
+                "        'git push -u origin main',",
+                "    ])",
+                "",
+                "    # Execute the commands",
+                "    subprocess.run(",
+                "        '; '.join(git_cmds),",
+                "        shell=True,",
+                "        check=True,",
+                "        stdout=subprocess.DEVNULL,",
+                "        stderr=subprocess.DEVNULL,",
+                "    )",
+                "",
+                "RepoProfile.create_mirror = patched_create_mirror",
+                "print('Patched RepoProfile.create_mirror() to use \\'spider\\' as git user name')",
+                "",
+            ])
+        
+        # Generate profile class definitions and registration
+        for profile_config in profiles_to_register:
+            class_name = f"{profile_config.owner.capitalize()}{profile_config.repo.capitalize()}{profile_config.commit[:8]}"
+            class_name = ''.join(c if c.isalnum() or c == '_' else '_' for c in class_name)
+            
+            base_class_map = {
+                "python": "PythonProfile",
+                "golang": "GoProfile",
+                "rust": "RustProfile",
+                "javascript": "JavaScriptProfile",
+                "java": "JavaProfile",
+                "cpp": "CppProfile",
+                "c": "CProfile",
+                "csharp": "CSharpProfile",
+                "php": "PhpProfile",
+            }
+            base_class = base_class_map.get(profile_config.language, "PythonProfile")
+            
+            # Build fields list
+            fields_parts = [
+                f'("owner", str, field(default="{profile_config.owner}"))',
+                f'("repo", str, field(default="{profile_config.repo}"))',
+                f'("commit", str, field(default="{profile_config.commit}"))',
+            ]
+            if profile_config.install_cmds:
+                install_cmds_str = str(profile_config.install_cmds)
+                fields_parts.append(f'("install_cmds", "list[str]", field(default_factory=lambda: {install_cmds_str}))')
+            if profile_config.timeout:
+                fields_parts.append(f'("timeout", int, field(default={profile_config.timeout}))')
+            if profile_config.timeout_ref:
+                fields_parts.append(f'("timeout_ref", int, field(default={profile_config.timeout_ref}))')
+            if profile_config.test_cmd:
+                fields_parts.append(f'("test_cmd", str, field(default="{profile_config.test_cmd}"))')
+            if profile_config.language == "python" and profile_config.python_version:
+                fields_parts.append(f'("python_version", str, field(default="{profile_config.python_version}"))')
+            
+            fields_str = "[" + ", ".join(fields_parts) + "]"
+            
+            script_lines.extend([
+                f"# Register {profile_config.owner}/{profile_config.repo}",
+                f"{class_name} = make_dataclass(",
+                f'    "{class_name}",',
+                f"    fields={fields_str},",
+                f"    bases=({base_class},),",
+                "    frozen=False",
+                ")",
+                f"registry.register_profile({class_name})",
+                "",
+            ])
+        
+        # After all profiles are registered, update their org_gh if mirror_org is set
+        if mirror_org:
+            script_lines.extend([
+                "# Update org_gh for all registered profiles",
+                "for profile_class in registry.values():",
+                f"    profile_class.org_gh = '{mirror_org_name}'",
+                "    profile_class._cache_mirror_exists = None  # Clear cache",
+                f"print('Updated all profiles org_gh to: {mirror_org_name}')",
+                "",
+            ])
+        
+        # Add the actual command execution
+        # SWE-smith's main() functions are called via argparse from __main__
+        # We need to use argparse to parse the arguments properly
+        script_lines.extend([
+            "# Run the SWE-smith command",
+            f"from {module_name} import main",
+            "import argparse",
+            "",
+            "# Parse command arguments using argparse (same as SWE-smith does)",
+            f"sys.argv = ['{module_name.split('.')[-1]}'] + {repr(cmd_args)}",
+            "",
+            "# Create parser and parse args (matching SWE-smith's argument structure)",
+            "parser = argparse.ArgumentParser()",
+            "parser.add_argument('repo', type=str)",
+            "parser.add_argument('-c', '--config_file', required=True)",
+            "parser.add_argument('--model', type=str, default=None)",
+            "parser.add_argument('-w', '--n_workers', type=int, default=1)",
+            "parser.add_argument('--redo_existing', action='store_true')",
+            "parser.add_argument('-m', '--max_bugs', type=int, default=None)",
+            "args = parser.parse_args()",
+            "",
+            "# Ensure mirror repository exists before running",
+            "# SWE-smith requires mirror repos to exist before cloning",
+            "github_token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GITHUB_JWT_TOKEN')",
+            "if not github_token:",
+            "    print('ERROR: GITHUB_TOKEN or GITHUB_JWT_TOKEN environment variable is required')",
+            "    print('Please set it in your .env file or as an environment variable')",
+            "    print(f'Current working directory: {os.getcwd()}')",
+            "    print(f'Checked .env paths but token not found')",
+            "    sys.exit(1)",
+            "else:",
+            "    print(f'Found GITHUB_TOKEN (length: {len(github_token)})')",
+            "",
+            "try:",
+            "    profile = registry.get(args.repo)",
+            f"    # Ensure org_gh is set correctly",
+            f"    if '{mirror_org_name if mirror_org else ''}':",
+            f"        if profile.org_gh != '{mirror_org_name if mirror_org else ''}':",
+            f"            profile.org_gh = '{mirror_org_name if mirror_org else ''}'",
+            f"            print('Updated profile.org_gh from ' + str(profile.org_gh) + f' to {mirror_org_name if mirror_org else ''}')",
+            f"    print('Using mirror org: ' + str(profile.org_gh) + ', repo: ' + str(profile.mirror_name))",
+            "    # Clear cache to force fresh check",
+            "    profile._cache_mirror_exists = None",
+            "    ",
+            "    # Check if mirror exists (with retry in case of race condition)",
+            "    import time",
+            "    mirror_exists = False",
+            "    for attempt in range(3):",
+            "        # Force fresh check by clearing cache each time",
+            "        profile._cache_mirror_exists = None",
+            "        if profile._mirror_exists():",
+            "            mirror_exists = True",
+            "            print(f'Mirror repository exists: {profile.mirror_name}')",
+            "            # Check if repository is empty (has no commits)",
+            "            try:",
+            "                import subprocess",
+            "                result = subprocess.run(",
+            "                    ['git', 'ls-remote', f'https://github.com/{profile.mirror_name}.git'],",
+            "                    capture_output=True,",
+            "                    text=True,",
+            "                    timeout=10",
+            "                )",
+            "                if result.returncode == 0 and result.stdout.strip():",
+            "                    print('Repository has content')",
+            "                else:",
+            "                    print('WARNING: Repository exists but appears to be empty')",
+            "                    print('This may cause issues. The repository should be populated.')",
+            "            except Exception as e:",
+            "                print(f'Could not check repository content: {e}')",
+            "            break",
+            "        if attempt < 2:",
+            "            time.sleep(1)  # Wait a bit before retrying",
+            "    ",
+            "    if not mirror_exists:",
+            "        print(f'Mirror repository not found, attempting to create: {profile.mirror_name}...')",
+            "        try:",
+            "            profile.create_mirror()",
+            "            print(f'Mirror repository created: {profile.mirror_name}')",
+            "        except Exception as create_error:",
+            "            error_str = str(create_error)",
+            "            # If creation fails due to SSH/auth issues, check if repo exists but is empty",
+            "            if 'Permission denied' in error_str or 'publickey' in error_str:",
+            "                print('WARNING: Git operations require SSH keys to be set up')",
+            "                print('The repository may exist but be empty. Please ensure:')",
+            "                print('  1. SSH keys are configured for git@github.com')",
+            "                print('  2. Or manually populate the repository')",
+            "                # Continue anyway - SWE-smith will try to clone and may fail",
+            "            else:",
+            "                # Check if repo was created despite the error (race condition or permission issue)",
+            "                time.sleep(2)  # Give GitHub API time to propagate",
+            "                profile._cache_mirror_exists = None  # Clear cache before checking",
+            "                if profile._mirror_exists():",
+            "                    print(f'Mirror repository exists (may have been created by another process): {profile.mirror_name}')",
+            "                    print('Continuing with bug generation...')",
+            "                else:",
+            "                    # Real error - repo doesn't exist",
+            "                    print(f'ERROR: Could not create mirror repository: {create_error}')",
+            "                    if '403' in error_str or 'Forbidden' in error_str:",
+            "                        print('')",
+            "                        print('Permission denied. This usually means:')",
+            "                        print('  1. The token does not have admin access to the organization')",
+            "                        print('  2. OR the repository already exists but you do not have access to it')",
+            "                        print('')",
+            "                        print('Solutions:')",
+            "                        print('  - Use a personal GitHub username instead of an organization')",
+            "                        print('  - Grant admin permissions to your token for the organization')",
+            "                        print('  - Manually create the repository and ensure your token has access')",
+            "                    else:",
+            "                        print('This is required for bug generation. Please check:')",
+            "                        print('  1. GITHUB_TOKEN is set and valid')",
+            "                        print('  2. Token has permissions to create repos')",
+            "                    sys.exit(1)",
+            "except Exception as e:",
+            "    print(f'ERROR: Could not ensure mirror exists: {e}')",
+            "    # Check if repo exists despite the error",
+            "    try:",
+            "        import time",
+            "        time.sleep(1)",
+            "        if profile._mirror_exists():",
+            "            print(f'Mirror repository exists: {profile.mirror_name}')",
+            "            print('Continuing despite error...')",
+            "        else:",
+            "            print('This is required for bug generation. Please check:')",
+            "            print('  1. GITHUB_TOKEN is set and valid')",
+            "            print('  2. Token has permissions to create repos in the organization')",
+            "            sys.exit(1)",
+            "    except:",
+            "        sys.exit(1)",
+            "",
+            "# Call main with parsed arguments",
+            "main(**vars(args))",
+        ])
+        
+        return "\n".join(script_lines)
+    
+    def _create_validation_wrapper_script(self, patches_file: str, workers: int) -> str:
+        """Create a Python script that registers custom profiles and runs validation.
+        
+        This is needed because subprocess calls start fresh Python interpreters that don't
+        have access to profiles registered in the parent process.
+        """
+        script_lines = [
+            "#!/usr/bin/env python3",
+            "import sys",
+            "import os",
+            "from pathlib import Path",
+            "from dataclasses import dataclass, field, make_dataclass",
+            "",
+            "# Load .env file if it exists (for GITHUB_TOKEN, etc.)",
+            "try:",
+            "    from dotenv import load_dotenv",
+            "    env_paths = [",
+            "        Path(__file__).parent.parent.parent.parent / '.env',  # spider/.env",
+            "        Path(__file__).parent.parent.parent / '.env',  # Alternative path",
+            "        Path.cwd() / '.env',  # Current working directory",
+            "    ]",
+            "    for env_path in env_paths:",
+            "        if env_path.exists():",
+            "            load_dotenv(env_path, override=False)",
+            "            print(f'Loaded .env from {env_path}')",
+            "            break",
+            "except ImportError:",
+            "    pass  # python-dotenv not available",
+            "",
+        ]
+        
+        # Add profile registration code (reuse logic from _create_profile_wrapper_script)
+        profiles_to_register = []
+        if self.config.repository.custom_profile:
+            profiles_to_register.append(self.config.repository.custom_profile)
+        if self.config.custom_profiles:
+            profiles_to_register.extend(self.config.custom_profiles)
+        
+        if not profiles_to_register:
+            # No custom profiles, just run the command directly
+            script_lines.extend([
+                "# No custom profiles to register, running validation directly",
+                "from swesmith.harness.valid import main",
+                "",
+                "# Run validation with required arguments",
+                f"main('{patches_file}', {workers})",
+            ])
+            return "\n".join(script_lines)
+        
+        # Import base profiles
+        base_imports = set()
+        for profile_config in profiles_to_register:
+            base_imports.add(profile_config.language)
+        
+        base_import_map = {
+            "python": "from swesmith.profiles.python import PythonProfile",
+            "golang": "from swesmith.profiles.golang import GoProfile",
+            "rust": "from swesmith.profiles.rust import RustProfile",
+            "javascript": "from swesmith.profiles.javascript import JavaScriptProfile",
+            "java": "from swesmith.profiles.java import JavaProfile",
+            "cpp": "from swesmith.profiles.cpp import CppProfile",
+            "c": "from swesmith.profiles.c import CProfile",
+            "csharp": "from swesmith.profiles.csharp import CSharpProfile",
+            "php": "from swesmith.profiles.php import PhpProfile",
+        }
+        
+        for lang in base_imports:
+            if lang in base_import_map:
+                script_lines.append(base_import_map[lang])
+        
+        script_lines.extend([
+            "from swesmith.profiles import registry",
+            "",
+        ])
+        
+        # Apply mirror org configuration if specified
+        mirror_org = None
+        if self.config.docker_image:
+            if self.config.docker_image.mirror_org:
+                mirror_org = self.config.docker_image.mirror_org
+        
+        if not mirror_org and self.config.repository.mirror_org:
+            mirror_org = self.config.repository.mirror_org
+        
+        mirror_org_name = None
+        if mirror_org:
+            if "/" in mirror_org:
+                parts = mirror_org.split("/", 1)
+                mirror_org_name = parts[0]
+            else:
+                mirror_org_name = mirror_org
+            
+            script_lines.extend([
+                "# Apply mirror org configuration",
+                "import swesmith.constants as swesmith_constants",
+                f"swesmith_constants.ORG_NAME_GH = '{mirror_org_name}'",
+                f"print('Set mirror org to: {mirror_org_name}')",
+                "",
+            ])
+        
+        # Generate profile class definitions and registration
+        for profile_config in profiles_to_register:
+            class_name = f"{profile_config.owner.capitalize()}{profile_config.repo.capitalize()}{profile_config.commit[:8]}"
+            class_name = ''.join(c if c.isalnum() or c == '_' else '_' for c in class_name)
+            
+            base_class_map = {
+                "python": "PythonProfile",
+                "golang": "GoProfile",
+                "rust": "RustProfile",
+                "javascript": "JavaScriptProfile",
+                "java": "JavaProfile",
+                "cpp": "CppProfile",
+                "c": "CProfile",
+                "csharp": "CSharpProfile",
+                "php": "PhpProfile",
+            }
+            base_class = base_class_map.get(profile_config.language, "PythonProfile")
+            
+            # Build fields list
+            fields_parts = [
+                f'("owner", str, field(default="{profile_config.owner}"))',
+                f'("repo", str, field(default="{profile_config.repo}"))',
+                f'("commit", str, field(default="{profile_config.commit}"))',
+            ]
+            if profile_config.install_cmds:
+                install_cmds_str = str(profile_config.install_cmds)
+                fields_parts.append(f'("install_cmds", "list[str]", field(default_factory=lambda: {install_cmds_str}))')
+            if profile_config.timeout:
+                fields_parts.append(f'("timeout", int, field(default={profile_config.timeout}))')
+            if profile_config.timeout_ref:
+                fields_parts.append(f'("timeout_ref", int, field(default={profile_config.timeout_ref}))')
+            if profile_config.test_cmd:
+                fields_parts.append(f'("test_cmd", str, field(default="{profile_config.test_cmd}"))')
+            if profile_config.language == "python" and profile_config.python_version:
+                fields_parts.append(f'("python_version", str, field(default="{profile_config.python_version}"))')
+            
+            fields_str = "[" + ", ".join(fields_parts) + "]"
+            
+            script_lines.extend([
+                f"# Register {profile_config.owner}/{profile_config.repo}",
+                f"{class_name} = make_dataclass(",
+                f'    "{class_name}",',
+                f"    fields={fields_str},",
+                f"    bases=({base_class},),",
+                "    frozen=False",
+                ")",
+                f"registry.register_profile({class_name})",
+                "",
+            ])
+        
+        # Update org_gh for all registered profiles if mirror_org is set
+        if mirror_org_name:
+            script_lines.extend([
+                "# Update org_gh for all registered profiles",
+                "for profile_class in registry.values():",
+                f"    profile_class.org_gh = '{mirror_org_name}'",
+                "    profile_class._cache_mirror_exists = None  # Clear cache",
+                f"print('Updated all profiles org_gh to: {mirror_org_name}')",
+                "",
+            ])
+        
+        # Run the validation command
+        # Parse arguments using argparse (same as validation harness does)
+        script_lines.extend([
+            "# Run the validation harness",
+            "from swesmith.harness.valid import main",
+            "",
+            "# Run validation with required arguments",
+            "# The validation harness expects: main(bug_patches, workers)",
+            f"main('{patches_file}', {workers})",
+        ])
+        
+        return "\n".join(script_lines)
+    
+    def _patch_git_user_config(self) -> None:
+        """Patch SWE-smith's create_mirror() to use 'spider' instead of 'swesmith' for git commits."""
+        try:
+            from swesmith.profiles.base import RepoProfile
+            original_create_mirror = RepoProfile.create_mirror
+            
+            def patched_create_mirror(self):
+                """Patched version that uses 'spider' as git user name"""
+                # Call original method but we need to patch the git commands
+                # Since create_mirror builds commands as a list, we'll need to intercept it differently
+                # Instead, let's patch it after the fact by overriding the method
+                import shutil
+                import subprocess
+                import os
+                
+                if self._mirror_exists():
+                    return
+                if self.repo_name in os.listdir():
+                    shutil.rmtree(self.repo_name)
+                self.api.repos.create_in_org(self.org_gh, self.repo_name)
+
+                # Clone the repository
+                subprocess.run(
+                    f"git clone git@github.com:{self.owner}/{self.repo}.git {self.repo_name}",
+                    shell=True,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+
+                # Build the git commands (using 'spider' instead of 'swesmith')
+                git_cmds = [
+                    f"cd {self.repo_name}",
+                    f"git checkout {self.commit}",
+                ]
+
+                # Add submodule update if submodules exist
+                if os.path.exists(os.path.join(self.repo_name, ".gitmodules")):
+                    git_cmds.append("git submodule update --init --recursive")
+
+                # Add the rest of the commands (with 'spider' as user name)
+                git_cmds.extend(
+                    [
+                        "rm -rf .git",
+                        "git init",
+                        'git config user.name "spider"',
+                        'git config user.email "spider@collinear.ai"',
+                        "rm -rf .github/workflows",
+                        "rm -rf .github/dependabot.y*",
+                        "git add .",
+                        "git commit --no-gpg-sign -m 'Initial commit'",
+                        "git branch -M main",
+                        f"git remote add origin git@github.com:{self.mirror_name}.git",
+                        "git push -u origin main",
+                    ]
+                )
+
+                # Execute the commands
+                subprocess.run(
+                    "; ".join(git_cmds),
+                    shell=True,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            
+            # Replace the method
+            RepoProfile.create_mirror = patched_create_mirror
+            logger.info("Patched RepoProfile.create_mirror() to use 'spider' as git user name")
+        except Exception as e:
+            logger.warning(f"Could not patch git user config: {e}")
+    
     def _setup_mirror_org(self) -> None:
         """Configure SWE-smith to use custom mirror repository location.
         
@@ -190,6 +817,23 @@ class SWESmithTaskGenerator:
             else:
                 # Just org/user like "spider"
                 mirror_org_name = mirror_org
+        
+        # Patch Docker Hub organization if configured
+        docker_hub_org = None
+        if self.config.docker_image and self.config.docker_image.docker_hub_org:
+            docker_hub_org = self.config.docker_image.docker_hub_org
+            try:
+                import swesmith.constants as swesmith_constants
+                original_dh_org = getattr(swesmith_constants, 'ORG_NAME_DH', 'jyangballin')
+                swesmith_constants.ORG_NAME_DH = docker_hub_org
+                logger.info(f"Patched SWE-smith ORG_NAME_DH: '{original_dh_org}' -> '{docker_hub_org}'")
+                # Store for use in subprocesses
+                self._docker_hub_org = docker_hub_org
+            except Exception as e:
+                logger.warning(f"Could not patch SWE-smith ORG_NAME_DH: {e}")
+                self._docker_hub_org = None
+        else:
+            self._docker_hub_org = None
         
         if mirror_org_name:
             # Patch SWE-smith's constant before any profiles are created
@@ -306,7 +950,7 @@ class SWESmithTaskGenerator:
         # Step 4: Gather tasks
         if self.config.gather.enabled:
             events.emit("Gathering tasks into instances...", code="task_gen.gather")
-            tasks = self._gather_tasks(validated_patches)
+            tasks = self._gather_tasks(validated_patches, collected_patches)
             events.emit(f"Gathered {len(tasks)} task instances.", code="task_gen.gather_done", data={"count": len(tasks)})
         else:
             logger.info("Skipping gather, using validated patches as tasks")
@@ -336,30 +980,52 @@ class SWESmithTaskGenerator:
             List of paths to bug patch files
         """
         repo_name = self._get_repo_name()
+        
+        # Ensure mirror repository exists before generating bugs
+        # This is required for all bug generation methods
+        self._ensure_mirror_exists(repo_name)
+        
         bug_patches = []
         
         for method in self.config.bug_generation.methods:
+            logger.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
             logger.info(f"Running bug generation method: {method.type}")
+            logger.info(f"  Method config: {method}")
             events.emit(f"Running bug generation: {method.type}...", code="task_gen.bug_method", data={"method": method.type})
             
             try:
                 if method.type == "lm_modify":
+                    logger.info(f"Starting lm_modify for {repo_name}...")
+                    logger.info(f"  Model: {method.model}")
+                    logger.info(f"  Max bugs: {method.max_bugs or method.n_bugs}")
                     patches = self._run_lm_modify(repo_name, method)
                 elif method.type == "lm_rewrite":
+                    logger.info(f"Starting lm_rewrite for {repo_name}...")
+                    logger.info(f"  Model: {method.model}")
+                    logger.info(f"  Max bugs: {method.max_bugs or method.n_bugs}")
+                    logger.info(f"  Workers: {method.n_workers}")
                     patches = self._run_lm_rewrite(repo_name, method)
                 elif method.type == "procedural":
+                    logger.info(f"Starting procedural bug generation for {repo_name}...")
+                    logger.info(f"  Max bugs: {method.max_bugs}")
                     patches = self._run_procedural(repo_name, method)
                 elif method.type == "pr_mirror":
+                    logger.info(f"Starting PR mirror bug generation...")
+                    logger.info(f"  File: {method.file}")
+                    logger.info(f"  Auto collect PRs: {method.auto_collect_prs}")
                     patches = self._run_pr_mirror(method)
                 else:
                     raise TaskGenerationError(f"Unknown bug generation method: {method.type}")
                 
+                logger.info(f"✓ Generated {len(patches)} bug patches using {method.type}")
+                if patches:
+                    logger.info(f"  Patch files found: {len(patches)}")
+                    logger.info(f"  First few: {[str(p.name) for p in patches[:3]]}{'...' if len(patches) > 3 else ''}")
                 bug_patches.extend(patches)
-                logger.info(f"Generated {len(patches)} bugs using {method.type}")
                 events.emit(f"Generated {len(patches)} bugs using {method.type}.", code="task_gen.bug_method_done", data={"method": method.type, "count": len(patches)})
                 
             except Exception as e:
-                logger.error(f"Error in {method.type}: {e}", exc_info=True)
+                logger.error(f"✗ Error in {method.type}: {e}", exc_info=True)
                 events.emit(f"Error in {method.type}: {str(e)}", code="task_gen.bug_method_error", level="error", data={"method": method.type})
                 raise TaskGenerationError(f"Failed to generate bugs with {method.type}: {e}") from e
         
@@ -367,10 +1033,10 @@ class SWESmithTaskGenerator:
     
     def _run_lm_modify(self, repo_name: str, method_config) -> List[Path]:
         """Run LM modify bug generation"""
-        cmd = [
-            sys.executable, "-m", "swesmith.bug_gen.llm.modify",
-            repo_name,
-        ]
+        # Ensure mirror repository exists before running
+        self._ensure_mirror_exists(repo_name)
+        
+        cmd_args = [repo_name]
         
         # config_file is required for lm_modify, use default if not provided
         if method_config.config_file:
@@ -390,18 +1056,29 @@ class SWESmithTaskGenerator:
                 )
             config_file = str(default_config)
         
-        cmd.extend(["--config_file", config_file])
+        cmd_args.extend(["--config_file", config_file])
         
         if method_config.model:
-            cmd.extend(["--model", method_config.model])
+            cmd_args.extend(["--model", method_config.model])
         if method_config.n_bugs:
-            cmd.extend(["--n_bugs", str(method_config.n_bugs)])
+            cmd_args.extend(["--n_bugs", str(method_config.n_bugs)])
         if method_config.n_workers:
-            cmd.extend(["--n_workers", str(method_config.n_workers)])
+            cmd_args.extend(["--n_workers", str(method_config.n_workers)])
         
         # Add any additional options
         for key, value in method_config.options.items():
-            cmd.extend([f"--{key}", str(value)])
+            cmd_args.extend([f"--{key}", str(value)])
+        
+        # Use unified wrapper script if we have custom profiles
+        if self.config.repository.custom_profile or self.config.custom_profiles:
+            wrapper_script = self._create_unified_wrapper_script(
+                "swesmith.bug_gen.llm.modify",
+                cmd_args,
+                "main()"
+            )
+            cmd = [sys.executable, str(wrapper_script)]
+        else:
+            cmd = [sys.executable, "-m", "swesmith.bug_gen.llm.modify"] + cmd_args
         
         logger.info(f"Running: {' '.join(cmd)}")
         result = subprocess.run(cmd, cwd=str(self.workspace), capture_output=True, text=True)
@@ -417,12 +1094,36 @@ class SWESmithTaskGenerator:
             return list(bug_dir.rglob("bug__*.diff"))
         return []
     
+    def _ensure_mirror_exists(self, repo_name: str) -> None:
+        """Ensure the mirror repository exists on GitHub before running operations.
+        
+        SWE-smith requires mirror repositories to exist before cloning.
+        """
+        from swesmith.profiles import registry
+        
+        try:
+            profile = registry.get(repo_name)
+            if not profile._mirror_exists():
+                logger.info(f"Creating mirror repository for {repo_name}...")
+                profile.create_mirror()
+                logger.info(f"Mirror repository created: {profile.mirror_name}")
+            else:
+                logger.debug(f"Mirror repository already exists: {profile.mirror_name}")
+        except Exception as e:
+            logger.warning(f"Could not ensure mirror exists for {repo_name}: {e}")
+            # Continue anyway - SWE-smith will handle the error
+    
     def _run_lm_rewrite(self, repo_name: str, method_config) -> List[Path]:
         """Run LM rewrite bug generation"""
-        cmd = [
-            sys.executable, "-m", "swesmith.bug_gen.llm.rewrite",
-            repo_name,
-        ]
+        # Ensure mirror repository exists before running
+        self._ensure_mirror_exists(repo_name)
+        
+        # Create a wrapper script that registers custom profiles before running
+        # This is needed because subprocess calls start fresh Python interpreters
+        wrapper_script = self.workspace / "run_lm_rewrite.py"
+        
+        # Build the command arguments
+        cmd_args = [repo_name]
         
         # config_file is required for lm_rewrite, use default if not provided
         if method_config.config_file:
@@ -444,60 +1145,694 @@ class SWESmithTaskGenerator:
             config_file = str(default_config)
             logger.info(f"Using default config_file: {config_file}")
         
-        cmd.extend(["--config_file", config_file])
+        cmd_args.extend(["--config_file", config_file])
         
         if method_config.model:
-            cmd.extend(["--model", method_config.model])
+            cmd_args.extend(["--model", method_config.model])
         # lm_rewrite uses --max_bugs, not --n_bugs
         if method_config.max_bugs:
-            cmd.extend(["--max_bugs", str(method_config.max_bugs)])
+            cmd_args.extend(["--max_bugs", str(method_config.max_bugs)])
         elif method_config.n_bugs:
             # Fallback: use n_bugs as max_bugs for compatibility
-            cmd.extend(["--max_bugs", str(method_config.n_bugs)])
+            cmd_args.extend(["--max_bugs", str(method_config.n_bugs)])
         if method_config.n_workers:
-            cmd.extend(["--n_workers", str(method_config.n_workers)])
+            cmd_args.extend(["--n_workers", str(method_config.n_workers)])
         
         for key, value in method_config.options.items():
-            cmd.extend([f"--{key}", str(value)])
+            cmd_args.extend([f"--{key}", str(value)])
         
-        logger.info(f"Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, cwd=str(self.workspace), capture_output=True, text=True)
+        # Use unified wrapper script if we have custom profiles
+        if self.config.repository.custom_profile or self.config.custom_profiles:
+            wrapper_script = self._create_unified_wrapper_script(
+                "swesmith.bug_gen.llm.rewrite",
+                cmd_args,
+                "main()"
+            )
+            cmd = [sys.executable, str(wrapper_script)]
+        else:
+            # No custom profiles, can use direct command
+            cmd = [sys.executable, "-m", "swesmith.bug_gen.llm.rewrite"] + cmd_args
+        
+        logger.info(f"Running lm_rewrite command: {' '.join(cmd)}")
+        logger.info(f"  Working directory: {self.workspace}")
+        logger.info(f"  Config file: {config_file}")
+        # Pass environment variables (especially GITHUB_TOKEN) to subprocess
+        env = os.environ.copy()
+        # Ensure GITHUB_TOKEN is available (load from .env if needed)
+        if not env.get('GITHUB_TOKEN') and not env.get('GITHUB_JWT_TOKEN'):
+            # Try to load from .env file
+            try:
+                from dotenv import load_dotenv
+                env_path = Path(__file__).parent.parent.parent / ".env"
+                if env_path.exists():
+                    # Load into a temporary dict first
+                    with open(env_path) as f:
+                        for line in f:
+                            line = line.strip()
+                            if line and not line.startswith('#') and '=' in line:
+                                key, value = line.split('=', 1)
+                                key = key.strip()
+                                value = value.strip().strip('"').strip("'")
+                                if key == 'GITHUB_TOKEN' or key == 'GITHUB_JWT_TOKEN':
+                                    env[key] = value
+                                    logger.info(f"Loaded {key} from .env file")
+            except Exception as e:
+                logger.warning(f"Could not load GITHUB_TOKEN from .env: {e}")
+        
+        # Verify GITHUB_TOKEN is available
+        if not env.get('GITHUB_TOKEN') and not env.get('GITHUB_JWT_TOKEN'):
+            logger.warning("GITHUB_TOKEN not found in environment. Mirror creation may fail.")
+            logger.warning("Please ensure GITHUB_TOKEN is set in .env file or as an environment variable.")
+        else:
+            token_key = 'GITHUB_TOKEN' if env.get('GITHUB_TOKEN') else 'GITHUB_JWT_TOKEN'
+            logger.info(f"Using {token_key} for GitHub authentication")
+        
+        max_bugs = method_config.max_bugs or method_config.n_bugs or "unknown"
+        model = method_config.model or "default"
+        n_workers = method_config.n_workers or 1
+        
+        logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        logger.info("Starting lm_rewrite subprocess")
+        logger.info(f"  Model: {model}")
+        logger.info(f"  Max bugs: {max_bugs}")
+        logger.info(f"  Workers: {n_workers}")
+        logger.info(f"  Config file: {config_file}")
+        logger.info("  ⏳ This may take 5-30+ minutes depending on:")
+        logger.info("     - Number of bugs requested")
+        logger.info("     - LLM API response time")
+        logger.info("     - Number of workers (sequential if n_workers=1)")
+        logger.info("  📊 Streaming output in real-time...")
+        logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        
+        # Stream output in real-time instead of capturing it all
+        import threading
+        import queue
+        
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(self.workspace),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            bufsize=1,  # Line buffered
+        )
+        
+        stdout_lines = []
+        stderr_lines = []
+        
+        def read_output(pipe, lines_list, log_func):
+            """Read from pipe and log in real-time"""
+            try:
+                for line in iter(pipe.readline, ''):
+                    if line:
+                        line = line.rstrip()
+                        lines_list.append(line)
+                        # Log important lines immediately
+                        if any(keyword in line.lower() for keyword in ['error', 'warning', 'bug', 'progress', 'generating', 'completed', 'failed']):
+                            log_func(f"  [lm_rewrite] {line}")
+                        # Also log every 10th line to show progress
+                        elif len(lines_list) % 10 == 0:
+                            log_func(f"  [lm_rewrite] {line}")
+            except Exception as e:
+                log_func(f"  [lm_rewrite] Error reading output: {e}")
+            finally:
+                pipe.close()
+        
+        # Start threads to read stdout and stderr
+        stdout_thread = threading.Thread(
+            target=read_output,
+            args=(process.stdout, stdout_lines, logger.info),
+            daemon=True
+        )
+        stderr_thread = threading.Thread(
+            target=read_output,
+            args=(process.stderr, stderr_lines, logger.warning),
+            daemon=True
+        )
+        
+        stdout_thread.start()
+        stderr_thread.start()
+        
+        # Wait for process to complete
+        return_code = process.wait()
+        
+        # Wait for threads to finish reading
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
+        
+        logger.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        logger.info(f"lm_rewrite subprocess completed")
+        logger.info(f"  Return code: {return_code}")
+        logger.info(f"  Captured {len(stdout_lines)} stdout lines, {len(stderr_lines)} stderr lines")
+        
+        # Create a result-like object for compatibility
+        class ProcessResult:
+            def __init__(self, returncode, stdout, stderr):
+                self.returncode = returncode
+                self.stdout = stdout
+                self.stderr = stderr
+        
+        result = ProcessResult(return_code, '\n'.join(stdout_lines), '\n'.join(stderr_lines))
         
         if result.returncode != 0:
+            logger.error(f"✗ lm_rewrite failed with return code {result.returncode}")
             raise TaskGenerationError(
                 f"LM rewrite failed: {result.stderr}\n{result.stdout}"
             )
         
+        logger.info("✓ lm_rewrite completed successfully")
+        
+        # SWE-smith stores bugs in logs/bug_gen/, not directly in bug_gen/
+        # Check both locations for compatibility
         bug_dir = self.bug_gen_dir / repo_name
+        logs_bug_dir = self.workspace / "logs" / "bug_gen" / repo_name
+        
+        logger.info(f"  Looking for bug patches in: {bug_dir}")
+        logger.info(f"  Also checking logs directory: {logs_bug_dir}")
+        
+        # Log some diagnostic info about what happened
+        if result.stdout:
+            stdout_lines_list = result.stdout.strip().split('\n')
+            logger.info(f"  SWE-smith stdout ({len(stdout_lines_list)} lines):")
+            # Show last 30 lines to see what happened
+            for line in stdout_lines_list[-30:]:
+                if line.strip():  # Skip empty lines
+                    logger.info(f"    {line}")
+        
+        # Search for bugs in both locations
+        patches = []
         if bug_dir.exists():
-            return list(bug_dir.rglob("bug__*.diff"))
-        return []
+            patches.extend(list(bug_dir.rglob("bug__*.diff")))
+        if logs_bug_dir.exists():
+            patches.extend(list(logs_bug_dir.rglob("bug__*.diff")))
+        
+        # Also search recursively from workspace root in case SWE-smith uses a different structure
+        if not patches:
+            all_patches = list(self.workspace.rglob("bug__*.diff"))
+            if all_patches:
+                logger.info(f"  Found {len(all_patches)} bug patches in alternative locations")
+                patches = all_patches
+        
+        if patches:
+            logger.info(f"  ✓ Found {len(patches)} bug patch files")
+            logger.info(f"    Examples: {[p.name for p in patches[:3]]}")
+            return patches
+        else:
+            logger.warning(f"  ⚠ No bug patches found")
+            logger.warning(f"  Checked locations:")
+            logger.warning(f"    - {bug_dir} (exists: {bug_dir.exists()})")
+            logger.warning(f"    - {logs_bug_dir} (exists: {logs_bug_dir.exists()})")
+            logger.warning(f"  This could mean:")
+            logger.warning(f"    - SWE-smith's lm_rewrite couldn't generate bugs for this repo")
+            logger.warning(f"    - The LLM failed to produce valid bug patches")
+            logger.warning(f"    - Bugs were generated in a different location")
+            return []
+    
+    def _create_unified_wrapper_script(self, module_name: str, cmd_args: List[str], main_call: str = "main()") -> Path:
+        """Create a unified wrapper script that registers custom profiles and runs any SWE-smith command.
+        
+        This works for ALL bug generation methods (procedural, lm_rewrite, lm_modify, pr_mirror, etc.)
+        """
+        script_lines = [
+            "#!/usr/bin/env python3",
+            "import sys",
+            "import os",
+            "from pathlib import Path",
+            "",
+            "# Load .env file if it exists (for GITHUB_TOKEN, etc.)",
+            "try:",
+            "    from dotenv import load_dotenv",
+            "    env_paths = [",
+            "        Path(__file__).parent.parent.parent.parent / '.env',  # spider/.env",
+            "        Path(__file__).parent.parent.parent / '.env',  # Alternative path",
+            "        Path.cwd() / '.env',  # Current working directory",
+            "    ]",
+            "    for env_path in env_paths:",
+            "        if env_path.exists():",
+            "            load_dotenv(env_path, override=False)",
+            "            print(f'Loaded .env from {env_path}')",
+            "            break",
+            "except ImportError:",
+            "    pass  # python-dotenv not available",
+            "",
+        ]
+        
+        # Collect profiles to register
+        profiles_to_register = []
+        if self.config.repository.custom_profile:
+            profiles_to_register.append(self.config.repository.custom_profile)
+        if self.config.custom_profiles:
+            profiles_to_register.extend(self.config.custom_profiles)
+        
+        if profiles_to_register:
+            # Import base profiles
+            base_imports = set()
+            for profile_config in profiles_to_register:
+                base_imports.add(profile_config.language)
+            
+            base_import_map = {
+                "python": "from swesmith.profiles.python import PythonProfile",
+                "golang": "from swesmith.profiles.golang import GoProfile",
+                "rust": "from swesmith.profiles.rust import RustProfile",
+                "javascript": "from swesmith.profiles.javascript import JavaScriptProfile",
+                "java": "from swesmith.profiles.java import JavaProfile",
+                "cpp": "from swesmith.profiles.cpp import CppProfile",
+                "c": "from swesmith.profiles.c import CProfile",
+                "csharp": "from swesmith.profiles.csharp import CSharpProfile",
+                "php": "from swesmith.profiles.php import PhpProfile",
+            }
+            
+            for lang in base_imports:
+                if lang in base_import_map:
+                    script_lines.append(base_import_map[lang])
+            
+            script_lines.extend([
+                "from swesmith.profiles import registry",
+                "from dataclasses import make_dataclass, field",
+                "",
+            ])
+            
+            # Apply mirror org configuration
+            mirror_org = None
+            if self.config.docker_image and self.config.docker_image.mirror_org:
+                mirror_org = self.config.docker_image.mirror_org
+            if not mirror_org and self.config.repository.mirror_org:
+                mirror_org = self.config.repository.mirror_org
+            
+            if mirror_org:
+                if "/" in mirror_org:
+                    mirror_org_name = mirror_org.split("/", 1)[0]
+                else:
+                    mirror_org_name = mirror_org
+                
+                script_lines.extend([
+                    "# Apply mirror org configuration BEFORE importing profiles",
+                    "import swesmith.constants as swesmith_constants",
+                    f"swesmith_constants.ORG_NAME_GH = '{mirror_org_name}'",
+                    f"print('Set mirror org to: {mirror_org_name}')",
+                    "",
+                ])
+            
+            # Generate profile class definitions and registration
+            for profile_config in profiles_to_register:
+                class_name = f"{profile_config.owner.capitalize()}{profile_config.repo.capitalize()}{profile_config.commit[:8]}"
+                class_name = ''.join(c if c.isalnum() or c == '_' else '_' for c in class_name)
+                
+                base_class_map = {
+                    "python": "PythonProfile",
+                    "golang": "GoProfile",
+                    "rust": "RustProfile",
+                    "javascript": "JavaScriptProfile",
+                    "java": "JavaProfile",
+                    "cpp": "CppProfile",
+                    "c": "CProfile",
+                    "csharp": "CSharpProfile",
+                    "php": "PhpProfile",
+                }
+                base_class = base_class_map.get(profile_config.language, "PythonProfile")
+                
+                fields_parts = [
+                    f'("owner", str, field(default="{profile_config.owner}"))',
+                    f'("repo", str, field(default="{profile_config.repo}"))',
+                    f'("commit", str, field(default="{profile_config.commit}"))',
+                ]
+                if profile_config.install_cmds:
+                    install_cmds_str = str(profile_config.install_cmds)
+                    fields_parts.append(f'("install_cmds", "list[str]", field(default_factory=lambda: {install_cmds_str}))')
+                if profile_config.timeout:
+                    fields_parts.append(f'("timeout", int, field(default={profile_config.timeout}))')
+                if profile_config.timeout_ref:
+                    fields_parts.append(f'("timeout_ref", int, field(default={profile_config.timeout_ref}))')
+                if profile_config.test_cmd:
+                    fields_parts.append(f'("test_cmd", str, field(default="{profile_config.test_cmd}"))')
+                if profile_config.language == "python" and profile_config.python_version:
+                    fields_parts.append(f'("python_version", str, field(default="{profile_config.python_version}"))')
+                
+                fields_str = "[" + ", ".join(fields_parts) + "]"
+                
+                script_lines.extend([
+                    f"# Register {profile_config.owner}/{profile_config.repo}",
+                    f"{class_name} = make_dataclass(",
+                    f'    "{class_name}",',
+                    f"    fields={fields_str},",
+                    f"    bases=({base_class},),",
+                    "    frozen=False",
+                    ")",
+                    f"registry.register_profile({class_name})",
+                    f"print(f'Registered profile: {profile_config.owner}__{profile_config.repo}')",
+                    "",
+                ])
+            
+            # Update org_gh for all registered profiles if mirror_org is set
+            if mirror_org:
+                script_lines.extend([
+                    "# Update org_gh for all registered profiles",
+                    "for profile_class in registry.values():",
+                    f"    profile_class.org_gh = '{mirror_org_name}'",
+                    "    profile_class._cache_mirror_exists = None  # Clear cache",
+                    f"print('Updated all profiles org_gh to: {mirror_org_name}')",
+                    "",
+                ])
+        
+        # Run the SWE-smith command
+        module_short_name = module_name.split('.')[-1]
+        
+        # Check if main_call contains argparse (needs import at top level)
+        needs_argparse = 'import argparse' in main_call or 'parser.parse_args' in main_call
+        
+        # Extract argparse import if needed
+        argparse_import = ""
+        if needs_argparse:
+            # Extract import argparse line from main_call if present
+            if 'import argparse' in main_call:
+                argparse_import = "import argparse"
+        
+        script_lines.extend([
+            f"# Run {module_name}",
+        ])
+        
+        # Add argparse import at top if needed
+        if argparse_import:
+            script_lines.append(argparse_import)
+        
+        script_lines.extend([
+            f"from {module_name} import main",
+            "",
+            "try:",
+            f"    sys.argv = ['{module_short_name}'] + {repr(cmd_args)}",
+        ])
+        
+        # Properly indent multi-line main_call strings
+        if '\n' in main_call:
+            # Split into lines and indent each non-empty line
+            main_call_lines = main_call.split('\n')
+            for line in main_call_lines:
+                if line.strip():  # Non-empty line - indent it
+                    # Skip import argparse line if we already added it at top
+                    if needs_argparse and line.strip() == 'import argparse':
+                        continue
+                    script_lines.append(f"    {line}")
+                else:
+                    # Empty lines are preserved as-is (they don't need indentation)
+                    script_lines.append("")
+        else:
+            # Single line, just indent it
+            script_lines.append(f"    {main_call}")
+        
+        script_lines.extend([
+            "except SystemExit as e:",
+            "    sys.exit(e.code if e.code is not None else 0)",
+            "except Exception as e:",
+            f"    print('ERROR in {module_short_name}: ' + str(e), file=sys.stderr)",
+            "    import traceback",
+            "    traceback.print_exc()",
+            "    sys.exit(1)",
+        ])
+        
+        # Write wrapper script
+        script_name = module_name.split('.')[-1] + "_wrapper.py"
+        wrapper_script = self.workspace / script_name
+        wrapper_script.write_text("\n".join(script_lines))
+        wrapper_script.chmod(0o755)
+        
+        return wrapper_script
     
     def _run_procedural(self, repo_name: str, method_config) -> List[Path]:
         """Run procedural bug generation"""
-        cmd = [
-            sys.executable, "-m", "swesmith.bug_gen.procedural.generate",
-            repo_name,
-        ]
+        # Ensure mirror repository exists before running
+        self._ensure_mirror_exists(repo_name)
+        
+        cmd_args = [repo_name]
         
         if method_config.max_bugs:
-            cmd.extend(["--max_bugs", str(method_config.max_bugs)])
+            cmd_args.extend(["--max_bugs", str(method_config.max_bugs)])
         
         for key, value in method_config.options.items():
-            cmd.extend([f"--{key}", str(value)])
+            cmd_args.extend([f"--{key}", str(value)])
+        
+        # Use unified wrapper script if we have custom profiles
+        if self.config.repository.custom_profile or self.config.custom_profiles:
+            # Procedural uses argparse, so parse arguments and call main with them
+            # Use same defaults as procedural's __main__ block: seed=24, max_bugs=-1
+            procedural_main_call = """import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('repo', type=str)
+parser.add_argument('--seed', type=int, default=24)
+parser.add_argument('--max_bugs', type=int, default=-1)
+args = parser.parse_args()
+# Call main with parsed arguments (same as procedural's __main__ block)
+main(**vars(args))"""
+            
+            wrapper_script = self._create_unified_wrapper_script(
+                "swesmith.bug_gen.procedural.generate",
+                cmd_args,
+                procedural_main_call
+            )
+            cmd = [sys.executable, str(wrapper_script)]
+        else:
+            cmd = [sys.executable, "-m", "swesmith.bug_gen.procedural.generate"] + cmd_args
         
         logger.info(f"Running: {' '.join(cmd)}")
         result = subprocess.run(cmd, cwd=str(self.workspace), capture_output=True, text=True)
+        
+        # Log output for debugging
+        if result.stdout:
+            logger.info(f"Procedural stdout: {result.stdout}")
+        if result.stderr:
+            logger.info(f"Procedural stderr: {result.stderr}")
         
         if result.returncode != 0:
             raise TaskGenerationError(
                 f"Procedural generation failed: {result.stderr}\n{result.stdout}"
             )
         
-        bug_dir = self.bug_gen_dir / repo_name
-        if bug_dir.exists():
-            return list(bug_dir.rglob("bug__*.diff"))
+        # Procedural writes bugs to logs/bug_gen/ (SWE-smith's LOG_DIR_BUG_GEN)
+        # Check both our bug_gen_dir and SWE-smith's logs/bug_gen location
+        # Resolve paths to handle relative vs absolute path issues
+        bug_dirs_to_check = [
+            (self.bug_gen_dir / repo_name).resolve(),  # Our location
+            (self.workspace / "logs" / "bug_gen" / repo_name).resolve(),  # SWE-smith's location
+        ]
+        
+        for bug_dir in bug_dirs_to_check:
+            logger.info(f"Looking for bug patches in: {bug_dir}")
+            if bug_dir.exists():
+                patches = list(bug_dir.rglob("bug__*.diff"))
+                logger.info(f"Found {len(patches)} bug patch files in {bug_dir}")
+                if patches:
+                    logger.info(f"  First few patches: {[str(p.name) for p in patches[:3]]}")
+                    return patches
+            else:
+                logger.debug(f"Bug directory does not exist: {bug_dir}")
+        
+        # Also check alternative locations (legacy)
+        alt_dirs = [
+            self.workspace / "run_procedural" / repo_name,
+            self.workspace / "logs" / "run_procedural" / repo_name,
+        ]
+        for alt_dir in alt_dirs:
+            if alt_dir.exists():
+                patches = list(alt_dir.rglob("bug__*.diff"))
+                if patches:
+                    logger.info(f"Found {len(patches)} patches in alternative location: {alt_dir}")
+                    return patches
+        
+        logger.warning(f"No bug patches found for {repo_name} in any checked location")
         return []
+    
+    def _create_pr_mirror_wrapper_script(self, cmd_args: List[str]) -> str:
+        """Create a Python script that registers custom profiles and runs PR Mirror.
+        
+        This is needed because subprocess calls start fresh Python interpreters that don't
+        have access to profiles registered in the parent process.
+        """
+        script_lines = [
+            "#!/usr/bin/env python3",
+            "import sys",
+            "import os",
+            "from pathlib import Path",
+            "from dataclasses import dataclass, field, make_dataclass",
+            "",
+            "# Load .env file if it exists (for GITHUB_TOKEN, etc.)",
+            "try:",
+            "    from dotenv import load_dotenv",
+            "    env_paths = [",
+            "        Path(__file__).parent.parent.parent.parent / '.env',  # spider/.env",
+            "        Path(__file__).parent.parent.parent / '.env',  # Alternative path",
+            "        Path.cwd() / '.env',  # Current working directory",
+            "    ]",
+            "    for env_path in env_paths:",
+            "        if env_path.exists():",
+            "            load_dotenv(env_path, override=False)",
+            "            print(f'Loaded .env from {env_path}')",
+            "            break",
+            "except ImportError:",
+            "    pass  # python-dotenv not available",
+            "",
+        ]
+        
+        # Add profile registration code (reuse logic from _create_profile_wrapper_script)
+        profiles_to_register = []
+        if self.config.repository.custom_profile:
+            profiles_to_register.append(self.config.repository.custom_profile)
+        if self.config.custom_profiles:
+            profiles_to_register.extend(self.config.custom_profiles)
+        
+        if not profiles_to_register:
+            # No custom profiles - PR Mirror should use built-in profiles
+            script_lines.extend([
+                "# No custom profiles to register",
+                "# PR Mirror will use built-in SWE-smith profiles",
+                "",
+            ])
+        else:
+            # Import base profiles (only import what we need)
+            base_imports = set()
+            for profile_config in profiles_to_register:
+                base_imports.add(profile_config.language)
+            
+            base_import_map = {
+                "python": "from swesmith.profiles.python import PythonProfile",
+                "golang": "from swesmith.profiles.golang import GoProfile",
+                "rust": "from swesmith.profiles.rust import RustProfile",
+                "javascript": "from swesmith.profiles.javascript import JavaScriptProfile",
+                "java": "from swesmith.profiles.java import JavaProfile",
+                "cpp": "from swesmith.profiles.cpp import CppProfile",
+                "c": "from swesmith.profiles.c import CProfile",
+                "csharp": "from swesmith.profiles.csharp import CSharpProfile",
+                "php": "from swesmith.profiles.php import PhpProfile",
+            }
+            
+            for lang in base_imports:
+                if lang in base_import_map:
+                    script_lines.append(base_import_map[lang])
+            
+            script_lines.extend([
+                "from swesmith.profiles import registry",
+                "",
+            ])
+            
+            # Apply mirror org configuration if specified
+            mirror_org = None
+            if self.config.docker_image:
+                if self.config.docker_image.mirror_org:
+                    mirror_org = self.config.docker_image.mirror_org
+            
+            if not mirror_org and self.config.repository.mirror_org:
+                mirror_org = self.config.repository.mirror_org
+            
+            if mirror_org:
+                if "/" in mirror_org:
+                    parts = mirror_org.split("/", 1)
+                    mirror_org_name = parts[0]
+                else:
+                    mirror_org_name = mirror_org
+                
+                script_lines.extend([
+                    "# Apply mirror org configuration BEFORE importing profiles",
+                    "import swesmith.constants as swesmith_constants",
+                    f"swesmith_constants.ORG_NAME_GH = '{mirror_org_name}'",
+                    f"print('Set mirror org to: {mirror_org_name}')",
+                    "",
+                ])
+            
+            # Generate profile class definitions and registration
+            for profile_config in profiles_to_register:
+                class_name = f"{profile_config.owner.capitalize()}{profile_config.repo.capitalize()}{profile_config.commit[:8]}"
+                class_name = ''.join(c if c.isalnum() or c == '_' else '_' for c in class_name)
+                
+                base_class_map = {
+                    "python": "PythonProfile",
+                    "golang": "GoProfile",
+                    "rust": "RustProfile",
+                    "javascript": "JavaScriptProfile",
+                    "java": "JavaProfile",
+                    "cpp": "CppProfile",
+                    "c": "CProfile",
+                    "csharp": "CSharpProfile",
+                    "php": "PhpProfile",
+                }
+                base_class = base_class_map.get(profile_config.language, "PythonProfile")
+                
+                # Build fields list
+                fields_parts = [
+                    f'("owner", str, field(default="{profile_config.owner}"))',
+                    f'("repo", str, field(default="{profile_config.repo}"))',
+                    f'("commit", str, field(default="{profile_config.commit}"))',
+                ]
+                if profile_config.install_cmds:
+                    install_cmds_str = str(profile_config.install_cmds)
+                    fields_parts.append(f'("install_cmds", "list[str]", field(default_factory=lambda: {install_cmds_str}))')
+                if profile_config.timeout:
+                    fields_parts.append(f'("timeout", int, field(default={profile_config.timeout}))')
+                if profile_config.timeout_ref:
+                    fields_parts.append(f'("timeout_ref", int, field(default={profile_config.timeout_ref}))')
+                if profile_config.test_cmd:
+                    fields_parts.append(f'("test_cmd", str, field(default="{profile_config.test_cmd}"))')
+                if profile_config.language == "python" and profile_config.python_version:
+                    fields_parts.append(f'("python_version", str, field(default="{profile_config.python_version}"))')
+                
+                fields_str = "[" + ", ".join(fields_parts) + "]"
+                
+                script_lines.extend([
+                    f"# Register {profile_config.owner}/{profile_config.repo}",
+                    f"{class_name} = make_dataclass(",
+                    f'    "{class_name}",',
+                    f"    fields={fields_str},",
+                    f"    bases=({base_class},),",
+                    "    frozen=False",
+                    ")",
+                    f"registry.register_profile({class_name})",
+                    f"print(f'Registered profile: {profile_config.owner}__{profile_config.repo}')",
+                    "",
+                ])
+            
+            # Update org_gh for all registered profiles if mirror_org is set
+            if mirror_org:
+                script_lines.extend([
+                    "# Update org_gh for all registered profiles",
+                    "for profile_class in registry.values():",
+                    f"    profile_class.org_gh = '{mirror_org_name}'",
+                    "    profile_class._cache_mirror_exists = None  # Clear cache",
+                    f"print('Updated all profiles org_gh to: {mirror_org_name}')",
+                    "",
+                ])
+        
+        # Run PR Mirror command
+        # PR Mirror's __main__ uses argparse, so set up sys.argv to match
+        script_lines.extend([
+            "# Run PR Mirror",
+            "# PR Mirror's __main__ block expects sys.argv with file path and optional args",
+            "import argparse",
+            f"sys.argv = ['pr_mirror'] + {repr(cmd_args)}",
+            "",
+            "# Import PR Mirror module to trigger __main__ block when run as script",
+            "# But we'll call main() directly with parsed arguments",
+            "from swesmith.bug_gen.mirror.generate import main",
+            "",
+            "# Parse arguments like PR Mirror's __main__ block does",
+            "parser = argparse.ArgumentParser()",
+            "parser.add_argument('sweb_insts_files', type=str, nargs='+')",
+            "parser.add_argument('--model', type=str, default=None)",
+            "parser.add_argument('--redo_existing', action='store_true', default=False)",
+            "parser.add_argument('--redo_skipped', action='store_true', default=False)",
+            "parser.add_argument('--num_processes', type=int, default=1)",
+            "args = parser.parse_args()",
+            "",
+            "# Call main with parsed arguments",
+            "try:",
+            "    main(**vars(args))",
+            "except SystemExit as e:",
+            "    sys.exit(e.code if e.code is not None else 0)",
+            "except Exception as e:",
+            "    print(f'ERROR in PR Mirror: {e}', file=sys.stderr)",
+            "    import traceback",
+            "    traceback.print_exc()",
+            "    sys.exit(1)",
+        ])
+        
+        return "\n".join(script_lines)
     
     def _run_pr_mirror(self, method_config) -> List[Path]:
         """Run PR mirror bug generation"""
@@ -522,18 +1857,41 @@ class SWESmithTaskGenerator:
         if not pr_data_path.exists():
             raise TaskGenerationError(f"PR data file not found: {pr_data_file}")
         
-        cmd = [
-            sys.executable, "-m", "swesmith.bug_gen.mirror.generate",
-            str(pr_data_path),
-        ]
+        # Build command arguments
+        cmd_args = [str(pr_data_path.relative_to(self.workspace) if pr_data_path.is_relative_to(self.workspace) else pr_data_path)]
         
         if method_config.model:
-            cmd.extend(["--model", method_config.model])
+            cmd_args.extend(["--model", method_config.model])
         
         for key, value in method_config.options.items():
-            cmd.extend([f"--{key}", str(value)])
+            cmd_args.extend([f"--{key}", str(value)])
         
-        logger.info(f"Running PR mirror: {' '.join(cmd)}")
+        # Use unified wrapper script if we have custom profiles
+        if self.config.repository.custom_profile or self.config.custom_profiles:
+            # PR Mirror uses argparse, so we need special main call
+            pr_mirror_main_call = """import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('sweb_insts_files', type=str, nargs='+')
+parser.add_argument('--model', type=str, default=None)
+parser.add_argument('--redo_existing', action='store_true', default=False)
+parser.add_argument('--redo_skipped', action='store_true', default=False)
+parser.add_argument('--num_processes', type=int, default=1)
+args = parser.parse_args()
+main(**vars(args))"""
+            
+            wrapper_script = self._create_unified_wrapper_script(
+                "swesmith.bug_gen.mirror.generate",
+                cmd_args,
+                pr_mirror_main_call
+            )
+            cmd = [sys.executable, str(wrapper_script)]
+        else:
+            # No custom profiles, run directly
+            cmd = [
+                sys.executable, "-m", "swesmith.bug_gen.mirror.generate",
+            ] + cmd_args
+            logger.info(f"Running PR mirror: {' '.join(cmd)}")
+        
         result = subprocess.run(cmd, cwd=str(self.workspace), capture_output=True, text=True)
         
         if result.returncode != 0:
@@ -542,10 +1900,33 @@ class SWESmithTaskGenerator:
             )
         
         # PR mirror output location may vary
-        bug_dir = self.bug_gen_dir
+        # SWE-smith stores bugs in logs/bug_gen/, not directly in bug_gen/
+        repo_name = self._get_repo_name()
+        bug_dir = self.bug_gen_dir / repo_name
+        logs_bug_dir = self.workspace / "logs" / "bug_gen" / repo_name
+        
+        patches = []
+        
+        # Check logs directory first (preferred location)
+        if logs_bug_dir.exists():
+            logger.info(f"Checking for bugs in logs directory: {logs_bug_dir}")
+            patches.extend(list(logs_bug_dir.rglob("bug__*.diff")))
+        
+        # Also check bug_gen directory
         if bug_dir.exists():
-            return list(bug_dir.rglob("bug__*.diff"))
-        return []
+            logger.info(f"Checking for bugs in bug_gen directory: {bug_dir}")
+            patches.extend(list(bug_dir.rglob("bug__*.diff")))
+        
+        # Fallback: search recursively from workspace root
+        if not patches:
+            logger.info("No bugs found in standard locations, searching recursively...")
+            all_patches = list(self.workspace.rglob("bug__*.diff"))
+            if all_patches:
+                logger.info(f"Found {len(all_patches)} bug patches in workspace")
+                patches.extend(all_patches)
+        
+        logger.info(f"Found {len(patches)} bug patches from PR mirror")
+        return patches
     
     def _collect_and_convert_prs(self, method_config) -> str:
         """Automatically collect PRs from repository and convert to task instance format.
@@ -636,10 +2017,45 @@ class SWESmithTaskGenerator:
     def _collect_patches(self, bug_patches: List[Path]) -> Path:
         """Collect all bug patches into a single file"""
         repo_name = self._get_repo_name()
-        bug_dir = self.bug_gen_dir / repo_name
         
-        if not bug_dir.exists():
-            raise TaskGenerationError(f"Bug directory not found: {bug_dir}")
+        # Check both bug_gen_dir and logs/bug_gen (SWE-smith stores bugs in logs/bug_gen/)
+        bug_dir = self.bug_gen_dir / repo_name
+        logs_bug_dir = self.workspace / "logs" / "bug_gen" / repo_name
+        
+        # Use logs_bug_dir if it exists (preferred location), otherwise fall back to bug_dir
+        if logs_bug_dir.exists():
+            bug_dir = logs_bug_dir
+            logger.info(f"Using bug directory: {bug_dir}")
+        elif bug_dir.exists():
+            logger.info(f"Using bug directory: {bug_dir}")
+        else:
+            # Neither exists - this shouldn't happen if patches were found
+            # But let's check if patches exist in subdirectories
+            all_patches_dir = None
+            if bug_patches:
+                # Find the common parent directory of all patches
+                patch_dirs = {p.parent for p in bug_patches}
+                if patch_dirs:
+                    # Get the repo_name directory (should be parent of all patch dirs)
+                    for patch_path in bug_patches:
+                        # Walk up from patch to find the repo_name directory
+                        current = patch_path.parent
+                        while current != self.workspace and current.name != repo_name:
+                            current = current.parent
+                        if current.name == repo_name:
+                            all_patches_dir = current
+                            break
+            
+            if all_patches_dir and all_patches_dir.exists():
+                bug_dir = all_patches_dir
+                logger.info(f"Using bug directory from patch locations: {bug_dir}")
+            else:
+                raise TaskGenerationError(
+                    f"Bug directory not found. Checked:\n"
+                    f"  - {bug_dir} (exists: {bug_dir.exists()})\n"
+                    f"  - {logs_bug_dir} (exists: {logs_bug_dir.exists()})\n"
+                    f"  Found {len(bug_patches)} patch files but couldn't determine bug directory."
+                )
         
         output_file = bug_dir / f"{repo_name}_all_patches.json"
         
@@ -671,17 +2087,67 @@ class SWESmithTaskGenerator:
         """Validate bugs using SWE-smith harness"""
         validation_output = self.validation_dir / collected_patches.stem
         
-        cmd = [
-            sys.executable, "-m", "swesmith.harness.valid",
-            str(collected_patches),
+        # Build command arguments (excluding the patches file)
+        cmd_args = [
             "--workers", str(self.config.validation.workers),
         ]
         
         for key, value in self.config.validation.options.items():
-            cmd.extend([f"--{key}", str(value)])
+            cmd_args.extend([f"--{key}", str(value)])
+        
+        # Extract workers value from cmd_args for easier passing to wrapper
+        workers = self.config.validation.workers
+        
+        # If we have custom profiles, create a wrapper script that registers them
+        # before running validation (subprocesses don't see parent's registry)
+        if self.config.repository.custom_profile or self.config.custom_profiles:
+            wrapper_script = self.workspace / "validate_wrapper.py"
+            wrapper_content = self._create_validation_wrapper_script(
+                str(collected_patches),
+                workers
+            )
+            wrapper_script.write_text(wrapper_content)
+            wrapper_script.chmod(0o755)
+            cmd = [sys.executable, str(wrapper_script)]
+            logger.info(f"Using validation wrapper script with custom profiles")
+        else:
+            # No custom profiles, can use direct command
+            cmd = [
+                sys.executable, "-m", "swesmith.harness.valid",
+                str(collected_patches),
+            ] + cmd_args
         
         logger.info(f"Validating bugs: {' '.join(cmd)}")
-        result = subprocess.run(cmd, cwd=str(self.workspace), capture_output=True, text=True)
+        # Count patches in the collected patches file for logging
+        patch_count = "unknown"
+        if collected_patches.exists():
+            try:
+                import json
+                with open(collected_patches, 'r') as f:
+                    patches_data = json.load(f)
+                    if isinstance(patches_data, list):
+                        patch_count = len(patches_data)
+                    elif isinstance(patches_data, dict) and "patches" in patches_data:
+                        patch_count = len(patches_data["patches"])
+            except Exception:
+                pass  # If we can't read it, just use "unknown"
+        logger.info(f"Validation may take a while - processing {patch_count} bugs with {self.config.validation.workers} workers")
+        
+        # Run validation with timeout (default 2 hours for large batches)
+        # Validation can take a long time, especially with many bugs
+        result = subprocess.run(
+            cmd, 
+            cwd=str(self.workspace), 
+            capture_output=True, 
+            text=True,
+            timeout=7200  # 2 hour timeout
+        )
+        
+        # Log validation output for debugging
+        if result.stdout:
+            logger.debug(f"Validation stdout (last 1000 chars): {result.stdout[-1000:]}")
+        if result.stderr:
+            logger.debug(f"Validation stderr (last 1000 chars): {result.stderr[-1000:]}")
         
         if result.returncode != 0:
             raise TaskGenerationError(
@@ -691,48 +2157,246 @@ class SWESmithTaskGenerator:
         # Validation output is in validation_dir
         return self.validation_dir
     
-    def _gather_tasks(self, validation_output: Path) -> List[Dict[str, Any]]:
+    def _gather_tasks(self, validation_output: Path, collected_patches: Path) -> List[Dict[str, Any]]:
         """Gather validated tasks into task instances.
         
         SWE-smith stores tasks as a JSON file (not JSONL) containing an array of task objects.
         Location: logs/task_insts/{run_id}.json
+        
+        validation_output can be either:
+        - A collected patches file path (when validation was skipped)
+        - A validation directory (when validation ran)
         """
         import json
         
-        # Find the validation run directory
-        validation_dirs = [d for d in self.validation_dir.iterdir() if d.is_dir()]
-        if not validation_dirs:
-            raise TaskGenerationError("No validation output directories found")
+        # Check if validation_output is a file (collected patches) or directory
+        if validation_output.is_file():
+            # It's a collected patches file - gather can work with this directly
+            logger.info(f"Using collected patches file for gather: {validation_output}")
+            # Use the parent directory (where the patches file is) as the run directory
+            validation_run_dir = validation_output.parent
+        else:
+            # It's a directory - find validation run directories
+            # SWE-smith might store validation output in run_validation/ or logs/run_validation/
+            validation_dirs = []
+            
+            # Check standard location
+            if validation_output.exists():
+                dirs = [d for d in validation_output.iterdir() if d.is_dir()]
+                validation_dirs.extend(dirs)
+                logger.info(f"Checked {validation_output}: found {len(dirs)} directories")
+            
+            # Check logs location (SWE-smith sometimes stores things in logs/)
+            logs_validation_dir = self.workspace / "logs" / "run_validation"
+            if logs_validation_dir.exists():
+                logs_dirs = [d for d in logs_validation_dir.iterdir() if d.is_dir()]
+                validation_dirs.extend(logs_dirs)
+                logger.info(f"Checked {logs_validation_dir}: found {len(logs_dirs)} additional directories")
+            
+            # If no subdirectories found, try fallback options
+            if not validation_dirs:
+                # Check if validation_dir itself should be used (if it has files)
+                if validation_output.exists() and any(validation_output.iterdir()):
+                    logger.info(f"Using validation_dir directly: {validation_output}")
+                    validation_run_dir = validation_output
+                elif logs_validation_dir.exists() and any(logs_validation_dir.iterdir()):
+                    logger.info(f"Using logs_validation_dir directly: {logs_validation_dir}")
+                    validation_run_dir = logs_validation_dir
+                elif collected_patches.exists() and collected_patches.is_file():
+                    # Fallback: use collected patches file if validation directories don't exist
+                    logger.warning(f"No validation directories found, using collected patches file: {collected_patches}")
+                    validation_run_dir = collected_patches.parent
+                else:
+                    # Log what directories exist to help debug
+                    logger.error(f"Validation directory exists: {validation_output.exists()}")
+                    logger.error(f"Logs validation directory exists: {logs_validation_dir.exists()}")
+                    logger.error(f"Collected patches file exists: {collected_patches.exists() if collected_patches else False}")
+                    if validation_output.parent.exists():
+                        workspace_contents = list(validation_output.parent.iterdir())
+                        logger.error(f"Workspace contents: {[str(p.name) for p in workspace_contents]}")
+                    if (self.workspace / "logs").exists():
+                        logs_contents = list((self.workspace / "logs").iterdir())
+                        logger.error(f"Logs directory contents: {[str(p.name) for p in logs_contents]}")
+                    raise TaskGenerationError(
+                        f"No validation output found. Checked:\n"
+                        f"  - {validation_output} (exists: {validation_output.exists()})\n"
+                        f"  - {logs_validation_dir} (exists: {logs_validation_dir.exists()})\n"
+                        f"  - Collected patches: {collected_patches} (exists: {collected_patches.exists() if collected_patches else False})"
+                    )
+            else:
+                # Use the most recent validation run directory
+                validation_run_dir = validation_dirs[-1]
+                logger.info(f"Using validation run directory: {validation_run_dir}")
         
-        # Use the most recent or specified validation run
-        validation_run_dir = validation_dirs[-1]  # Most recent
+        # Gather needs a fresh clone, but rp.clone() REUSES existing clones if they exist.
+        # Why cleanup? Gather creates branches and pushes them. If the repo has leftover branches
+        # from validation (that don't exist on remote), gather's branch operations can fail.
+        #
+        # Note: Bug generation and validation typically don't clone repos locally
+        # (validation runs in Docker), so cleanup is mainly defensive. If nothing cloned
+        # before gather, cleanup is harmless (just won't find anything to remove).
+        repo_name_full = self._get_repo_name()
         
-        cmd = [
-            sys.executable, "-m", "swesmith.harness.gather",
-            str(validation_run_dir),
+        # Clean up repo clones - check both full name and base name
+        cleanup_paths = [
+            self.workspace / repo_name_full,  # Full name: "pallets__click.fde47b4b"
+            self.workspace / repo_name_full.split('.')[0],  # Base: "pallets__click"
         ]
+        
+        # Also check for any matching directories
+        if self.workspace.exists():
+            for item in self.workspace.iterdir():
+                if item.is_dir() and item.name.startswith(repo_name_full.split('.')[0]):
+                    cleanup_paths.append(item)
+        
+        # Remove duplicates
+        cleanup_paths = list(set(cleanup_paths))
+        
+        for path_to_remove in cleanup_paths:
+            if path_to_remove.exists() and path_to_remove.is_dir():
+                logger.info(f"Cleaning up existing repo clone before gather: {path_to_remove}")
+                logger.debug(f"  (rp.clone() reuses existing clones, so cleanup forces fresh clone)")
+                import shutil
+                try:
+                    shutil.rmtree(path_to_remove)
+                    logger.info(f"Successfully removed {path_to_remove}")
+                except Exception as e:
+                    logger.warning(f"Could not remove repo clone {path_to_remove}: {e}")
+        
+        # Gather expects validation_logs_path to be relative to the workspace
+        # (it uses relative paths like ../{path_patch} from inside the repo)
+        # Convert to relative path from workspace if needed
+        validation_run_dir_abs = validation_run_dir.resolve()
+        workspace_abs = self.workspace.resolve()
+        
+        try:
+            # Try to get relative path from workspace
+            gather_path = str(validation_run_dir_abs.relative_to(workspace_abs))
+            logger.info(f"Using relative path for gather (from workspace): {gather_path}")
+        except ValueError:
+            # Not under workspace - use absolute path (gather should handle it)
+            gather_path = str(validation_run_dir_abs)
+            logger.warning(f"Validation path is not under workspace, using absolute path: {gather_path}")
+        
+        # Build gather command arguments
+        gather_cmd_args = [gather_path]
         
         # Add repush_image flag if Docker rebuild is enabled
         docker_config = self.config.docker_image
         if docker_config and docker_config.enabled and docker_config.rebuild_after_tasks:
-            cmd.append("--repush_image")
+            gather_cmd_args.append("--repush_image")
         
         for key, value in self.config.gather.options.items():
-            cmd.extend([f"--{key}", str(value)])
+            gather_cmd_args.extend([f"--{key}", str(value)])
+        
+        # Add override_branch flag to allow gather to work with existing branches
+        # This helps when validation created branches that don't exist on remote
+        if "--override_branch" not in gather_cmd_args:
+            gather_cmd_args.append("--override_branch")
+        
+        # Always use wrapper script for gather to ensure mirror org is configured
+        # Gather needs mirror org to push branches to the correct GitHub org
+        # Without this, gather will push to default 'swesmith' org which user may not have access to
+        mirror_org = None
+        if self.config.docker_image and self.config.docker_image.mirror_org:
+            mirror_org = self.config.docker_image.mirror_org
+        if not mirror_org and self.config.repository.mirror_org:
+            mirror_org = self.config.repository.mirror_org
+        
+        if mirror_org or self.config.repository.custom_profile or self.config.custom_profiles:
+            # Gather uses argparse, so we need to parse arguments first
+            # The wrapper imports main, sets sys.argv, then needs to parse args before calling main
+            gather_main_call = """import argparse
+parser = argparse.ArgumentParser(description="Convert validation logs to SWE-bench style dataset")
+parser.add_argument("validation_logs_path", type=str, help="Path to the validation logs")
+parser.add_argument("-v", "--verbose", action="store_true", help="Verbose mode")
+parser.add_argument("-o", "--override_branch", action="store_true", help="Override existing branches")
+parser.add_argument("-d", "--debug_subprocess", action="store_true", help="Debug mode")
+parser.add_argument("-p", "--repush_image", action="store_true", help="Rebuild and push Docker image")
+args = parser.parse_args()
+main(**vars(args))"""
+            
+            wrapper_script = self._create_unified_wrapper_script(
+                "swesmith.harness.gather",
+                gather_cmd_args,
+                gather_main_call
+            )
+            cmd = [sys.executable, str(wrapper_script)]
+            logger.info(f"Using wrapper script for gather to ensure mirror org '{mirror_org}' is configured")
+        else:
+            cmd = [sys.executable, "-m", "swesmith.harness.gather"] + gather_cmd_args
         
         logger.info(f"Gathering tasks: {' '.join(cmd)}")
-        result = subprocess.run(cmd, cwd=str(self.workspace), capture_output=True, text=True)
+        logger.info(f"Gather will clone repo fresh - ensure GITHUB_TOKEN is set for authenticated git")
+        
+        # Ensure GITHUB_TOKEN is available for gather (it needs authenticated git)
+        env = os.environ.copy()
+        if "GITHUB_TOKEN" not in env:
+            # Try to load from .env file
+            try:
+                from dotenv import load_dotenv
+                env_path = Path(__file__).parent.parent.parent / ".env"
+                if env_path.exists():
+                    load_dotenv(env_path, override=False)
+                    if "GITHUB_TOKEN" in os.environ:
+                        env["GITHUB_TOKEN"] = os.environ["GITHUB_TOKEN"]
+                        logger.info("Loaded GITHUB_TOKEN from .env for gather")
+            except Exception:
+                pass
+        
+        result = subprocess.run(cmd, cwd=str(self.workspace), capture_output=True, text=True, env=env)
+        
+        # Log gather command output for debugging
+        if result.stdout:
+            # Show more of the output for debugging gather failures
+            logger.info(f"Gather command stdout (last 2000 chars): {result.stdout[-2000:]}")
+        if result.stderr:
+            logger.info(f"Gather command stderr (last 2000 chars): {result.stderr[-2000:]}")
         
         if result.returncode != 0:
+            # Extract more detailed error information
+            error_msg = result.stderr + "\n" + result.stdout
+            logger.error(f"Gather failed with return code {result.returncode}")
+            logger.error(f"Full error output: {error_msg[-3000:]}")  # Last 3000 chars
+            
             raise TaskGenerationError(
                 f"Gather failed: {result.stderr}\n{result.stdout}"
             )
         
         # SWE-smith saves to logs/task_insts/{run_id}.json
         # The run_id is the validation_run_dir.name
-        tasks_file = self.tasks_dir / f"{validation_run_dir.name}.json"
-        if not tasks_file.exists():
-            raise TaskGenerationError(f"Gathered tasks file not found: {tasks_file}")
+        # Check both task_insts/ and logs/task_insts/
+        run_id = validation_run_dir.name
+        logger.info(f"Looking for tasks file with run_id: {run_id}")
+        logger.info(f"Validation run directory: {validation_run_dir}")
+        tasks_file = self.tasks_dir / f"{run_id}.json"
+        logs_tasks_file = self.workspace / "logs" / "task_insts" / f"{run_id}.json"
+        
+        # Also check if there are any task files with different names
+        if (self.workspace / "logs" / "task_insts").exists():
+            all_task_files = list((self.workspace / "logs" / "task_insts").glob("*.json"))
+            if all_task_files:
+                logger.info(f"All task files in logs/task_insts: {[str(f.name) for f in all_task_files]}")
+        
+        # Prefer logs/task_insts/ (where SWE-smith actually saves)
+        if logs_tasks_file.exists():
+            tasks_file = logs_tasks_file
+            logger.info(f"Found tasks file in logs: {tasks_file}")
+        elif tasks_file.exists():
+            logger.info(f"Found tasks file: {tasks_file}")
+        else:
+            # Check if either directory exists and what files are in it
+            if self.tasks_dir.exists():
+                task_files = list(self.tasks_dir.glob("*.json"))
+                logger.error(f"Task files in {self.tasks_dir}: {[str(f.name) for f in task_files]}")
+            if (self.workspace / "logs" / "task_insts").exists():
+                logs_task_files = list((self.workspace / "logs" / "task_insts").glob("*.json"))
+                logger.error(f"Task files in logs/task_insts: {[str(f.name) for f in logs_task_files]}")
+            raise TaskGenerationError(
+                f"Gathered tasks file not found. Checked:\n"
+                f"  - {tasks_file}\n"
+                f"  - {logs_tasks_file}"
+            )
         
         # Load tasks - SWE-smith stores as JSON array (not JSONL)
         with open(tasks_file) as f:
@@ -784,6 +2448,160 @@ class SWESmithTaskGenerator:
         # This is a simplified version - may need adjustment based on SWE-smith behavior
         return tasks
     
+    def _create_docker_build_wrapper_script(self, cmd_args: List[str]) -> Path:
+        """Create a wrapper script for Docker building that patches Docker Hub org and registers profiles"""
+        script_lines = [
+            "#!/usr/bin/env python3",
+            "# Wrapper script for Docker image building",
+            "import sys",
+            "import os",
+            "",
+            "# Load environment variables",
+            "from dotenv import load_dotenv",
+            "load_dotenv()",
+            "",
+        ]
+        
+        # Patch Docker Hub org if configured
+        docker_hub_org = None
+        if self.config.docker_image and self.config.docker_image.docker_hub_org:
+            docker_hub_org = self.config.docker_image.docker_hub_org
+            script_lines.extend([
+                "# Patch Docker Hub organization",
+                "import swesmith.constants as swesmith_constants",
+                f"swesmith_constants.ORG_NAME_DH = '{docker_hub_org}'",
+                f"print('Set Docker Hub org to: {docker_hub_org}')",
+                "",
+            ])
+        
+        # Register custom profiles if needed
+        profiles_to_register = []
+        if self.config.repository.custom_profile:
+            profiles_to_register.append(self.config.repository.custom_profile)
+        if self.config.custom_profiles:
+            profiles_to_register.extend(self.config.custom_profiles)
+        
+        if profiles_to_register:
+            # Import base profiles
+            base_imports = set()
+            for profile_config in profiles_to_register:
+                base_imports.add(profile_config.language)
+            
+            base_import_map = {
+                "python": "from swesmith.profiles.python import PythonProfile",
+                "golang": "from swesmith.profiles.golang import GoProfile",
+                "rust": "from swesmith.profiles.rust import RustProfile",
+                "javascript": "from swesmith.profiles.javascript import JavaScriptProfile",
+                "java": "from swesmith.profiles.java import JavaProfile",
+                "cpp": "from swesmith.profiles.cpp import CppProfile",
+                "c": "from swesmith.profiles.c import CProfile",
+                "csharp": "from swesmith.profiles.csharp import CSharpProfile",
+                "php": "from swesmith.profiles.php import PhpProfile",
+            }
+            
+            for lang in base_imports:
+                if lang in base_import_map:
+                    script_lines.append(base_import_map[lang])
+            
+            script_lines.extend([
+                "from swesmith.profiles import registry",
+                "from dataclasses import make_dataclass, field",
+                "",
+            ])
+            
+            # Apply mirror org configuration
+            mirror_org = None
+            if self.config.docker_image and self.config.docker_image.mirror_org:
+                mirror_org = self.config.docker_image.mirror_org
+            if not mirror_org and self.config.repository.mirror_org:
+                mirror_org = self.config.repository.mirror_org
+            
+            if mirror_org:
+                if "/" in mirror_org:
+                    mirror_org_name = mirror_org.split("/", 1)[0]
+                else:
+                    mirror_org_name = mirror_org
+                
+                script_lines.extend([
+                    "# Apply mirror org configuration BEFORE importing profiles",
+                    "import swesmith.constants as swesmith_constants",
+                    f"swesmith_constants.ORG_NAME_GH = '{mirror_org_name}'",
+                    f"print('Set mirror org to: {mirror_org_name}')",
+                    "",
+                ])
+            
+            # Generate profile class definitions and registration (similar to other wrappers)
+            for profile_config in profiles_to_register:
+                class_name = f"{profile_config.owner.capitalize()}{profile_config.repo.capitalize()}{profile_config.commit[:8]}"
+                class_name = ''.join(c if c.isalnum() or c == '_' else '_' for c in class_name)
+                
+                base_class_map = {
+                    "python": "PythonProfile",
+                    "golang": "GoProfile",
+                    "rust": "RustProfile",
+                    "javascript": "JavaScriptProfile",
+                    "java": "JavaProfile",
+                    "cpp": "CppProfile",
+                    "c": "CProfile",
+                    "csharp": "CSharpProfile",
+                    "php": "PhpProfile",
+                }
+                base_class = base_class_map.get(profile_config.language, "PythonProfile")
+                
+                fields_parts = [
+                    f'("owner", str, field(default="{profile_config.owner}"))',
+                    f'("repo", str, field(default="{profile_config.repo}"))',
+                    f'("commit", str, field(default="{profile_config.commit}"))',
+                ]
+                if profile_config.install_cmds:
+                    install_cmds_str = str(profile_config.install_cmds)
+                    fields_parts.append(f'("install_cmds", "list[str]", field(default_factory=lambda: {install_cmds_str}))')
+                if profile_config.timeout:
+                    fields_parts.append(f'("timeout", int, field(default={profile_config.timeout}))')
+                if profile_config.timeout_ref:
+                    fields_parts.append(f'("timeout_ref", int, field(default={profile_config.timeout_ref}))')
+                if profile_config.test_cmd:
+                    fields_parts.append(f'("test_cmd", str, field(default="{profile_config.test_cmd}"))')
+                if profile_config.language == "python" and profile_config.python_version:
+                    fields_parts.append(f'("python_version", str, field(default="{profile_config.python_version}"))')
+                
+                fields_str = "[" + ", ".join(fields_parts) + "]"
+                
+                script_lines.extend([
+                    f"# Register {profile_config.owner}/{profile_config.repo}",
+                    f"{class_name} = make_dataclass(",
+                    f'    "{class_name}",',
+                    f"    fields={fields_str},",
+                    f"    bases=({base_class},),",
+                    "    frozen=False",
+                    ")",
+                    f"registry.register_profile({class_name})",
+                    f"print(f'Registered profile: {profile_config.owner}__{profile_config.repo}')",
+                    "",
+                ])
+        
+        # Run Docker build command
+        script_lines.extend([
+            "# Run Docker build command",
+            "from swesmith.build_repo.create_images import main",
+            "",
+            "try:",
+            f"    sys.argv = ['create_images'] + {repr(cmd_args)}",
+            "    main()",
+            "except Exception as e:",
+            "    print(f'ERROR in Docker build: {e}', file=sys.stderr)",
+            "    import traceback",
+            "    traceback.print_exc()",
+            "    sys.exit(1)",
+        ])
+        
+        # Write wrapper script
+        wrapper_script = self.workspace / "docker_build_wrapper.py"
+        wrapper_script.write_text("\n".join(script_lines))
+        wrapper_script.chmod(0o755)
+        
+        return wrapper_script
+    
     def _build_docker_image(self) -> None:
         """Build Docker image for the repository before task generation"""
         repo_name = self._get_repo_name()
@@ -791,26 +2609,101 @@ class SWESmithTaskGenerator:
         
         logger.info(f"Building Docker image for {repo_name}")
         
-        # Use SWE-smith's build_repo.create_images
-        # First, we need to ensure the repo profile is registered
-        # SWE-smith auto-detects based on repo, but we can also call it directly
+        # Check if this is a custom profile (not in SWE-smith's registry)
+        has_custom_profile = (
+            self.config.repository.custom_profile is not None or
+            (self.config.custom_profiles and len(self.config.custom_profiles) > 0)
+        )
         
-        cmd = [
-            sys.executable, "-m", "swesmith.build_repo.create_images",
-            "--repos", self.config.repository.github_url,
+        if has_custom_profile:
+            # For custom profiles, we need to build the image directly using the profile
+            # because create_images only works with pre-registered profiles
+            logger.info(f"Building Docker image for custom profile: {repo_name}")
+            self._build_custom_profile_image(repo_name, docker_config)
+            return
+        
+        # For repos in SWE-smith's registry, use create_images
+        # Find the correct profile image name from the registry
+        # e.g., jyangballin/swesmith.x86_64.pallets_1776_click.fde47b4b
+        image_name = self._find_profile_name(repo_name)
+        
+        # If push is enabled and we have a custom org, try to retag/push existing image first
+        # This is independent of SWE-smith - we only care about our org
+        if docker_config and docker_config.push and docker_config.docker_hub_org:
+            docker_hub_org = docker_config.docker_hub_org
+            logger.info(f"Docker push enabled. Target Docker Hub org: {docker_hub_org}")
+            
+            # Check Docker Hub authentication
+            auth_check = subprocess.run(
+                ["docker", "info"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if auth_check.returncode != 0:
+                logger.warning("Docker daemon may not be running or accessible. Push may fail.")
+            else:
+                login_check = subprocess.run(
+                    ["docker", "system", "info"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if "Username" not in login_check.stdout and "docker.io" not in login_check.stdout:
+                    logger.warning("Docker Hub authentication not detected. Ensure 'docker login' has been run before pushing.")
+            
+            # Try to retag and push existing image to our org
+            if self._retag_and_push_if_needed(image_name, docker_hub_org):
+                logger.info(f"Successfully handled Docker image for {docker_hub_org}")
+                return  # Done - image is in our org and pushed
+            
+            # If retag/push failed, we'll continue to build from scratch
+            logger.info(f"Will build Docker image from scratch for {docker_hub_org}")
+        
+        # Build command arguments
+        # create_images uses --profiles with the image_name from the registry
+        cmd_args = [
+            "--profiles", image_name,
         ]
         
         if docker_config and docker_config.push:
-            cmd.append("--push")
+            cmd_args.append("--push")
+            docker_hub_org = docker_config.docker_hub_org or "jyangballin"
+            logger.info(f"Building and pushing to Docker Hub org: {docker_hub_org}")
         
         if docker_config and docker_config.options.get("workers"):
-            cmd.extend(["--workers", str(docker_config.options["workers"])])
+            cmd_args.extend(["--workers", str(docker_config.options["workers"])])
         
         if docker_config and docker_config.options.get("proceed"):
-            cmd.append("--proceed")
+            cmd_args.append("--proceed")
+        
+        # Use wrapper script if Docker Hub org is configured (to patch constant in subprocess)
+        # or if we have custom profiles that need registration
+        use_wrapper = (
+            (docker_config and docker_config.docker_hub_org) or
+            (self.config.repository.custom_profile or self.config.custom_profiles)
+        )
+        
+        if use_wrapper:
+            wrapper_script = self._create_docker_build_wrapper_script(cmd_args)
+            cmd = [sys.executable, str(wrapper_script)]
+        else:
+            cmd = [
+                sys.executable, "-m", "swesmith.build_repo.create_images",
+            ] + cmd_args
         
         logger.info(f"Building Docker image: {' '.join(cmd)}")
+        if docker_config and docker_config.push:
+            logger.info("Starting Docker build and push operation...")
+        
         result = subprocess.run(cmd, cwd=str(self.workspace), capture_output=True, text=True)
+        
+        # Log output for debugging (more verbose for push operations)
+        log_level = logger.info if (docker_config and docker_config.push) else logger.debug
+        if result.stdout:
+            log_level(f"Docker build stdout: {result.stdout}")
+        if result.stderr:
+            log_level(f"Docker build stderr: {result.stderr}")
         
         if result.returncode != 0:
             # Check if image already exists (that's OK)
@@ -822,6 +2715,55 @@ class SWESmithTaskGenerator:
                 )
         else:
             logger.info("Docker image built successfully")
+            if docker_config and docker_config.push:
+                docker_hub_org = docker_config.docker_hub_org or "jyangballin"
+                logger.info(f"Docker push completed. Checking push status...")
+                
+                # Extract image name from output if possible
+                image_name = None
+                combined_output = result.stdout + result.stderr
+                
+                # Look for image push patterns in output
+                # Pattern: "pushed" or "Pushed" followed by image name
+                push_patterns = [
+                    r'pushed\s+([^\s]+)',
+                    r'Pushed\s+([^\s]+)',
+                    r'Successfully\s+pushed\s+([^\s]+)',
+                    r'([^\s]+docker\.io/[^\s]+)',
+                ]
+                
+                for pattern in push_patterns:
+                    match = re.search(pattern, combined_output, re.IGNORECASE)
+                    if match:
+                        image_name = match.group(1) if match.lastindex else match.group(0)
+                        break
+                
+                # Check for push success indicators
+                push_succeeded = False
+                push_failed = False
+                
+                if "pushed" in combined_output.lower() or "successfully pushed" in combined_output.lower():
+                    push_succeeded = True
+                    logger.info(f"Docker image push succeeded!")
+                    if image_name:
+                        logger.info(f"Pushed image: {image_name}")
+                    else:
+                        logger.info(f"Docker image should be available at: docker.io/{docker_hub_org}/<repo-name>")
+                
+                # Check for push failure indicators
+                failure_keywords = ["denied", "unauthorized", "authentication", "login", "unauthorized: authentication required"]
+                if any(keyword in combined_output.lower() for keyword in failure_keywords):
+                    push_failed = True
+                    logger.error("Docker push failed due to authentication error!")
+                    logger.error("Please ensure you have run 'docker login' and are authenticated to Docker Hub.")
+                    logger.error(f"Expected Docker Hub org: {docker_hub_org}")
+                
+                if "error" in combined_output.lower() and not push_succeeded:
+                    logger.warning("Docker push may have encountered errors. Check the output above for details.")
+                
+                if not push_succeeded and not push_failed:
+                    logger.warning("Could not determine Docker push status from output. Check Docker Hub manually.")
+                    logger.info(f"Expected image location: docker.io/{docker_hub_org}/<repo-name>")
     
     def _rebuild_docker_image(self) -> None:
         """Rebuild Docker image after task generation to include task branches"""
@@ -859,4 +2801,332 @@ class SWESmithTaskGenerator:
         commit = self.config.repository.commit or "HEAD"
         commit_short = commit[:8] if len(commit) >= 8 else commit
         return f"{owner}__{repo}.{commit_short}"
+    
+    def _build_custom_profile_image(self, repo_name: str, docker_config) -> None:
+        """Build Docker image for a custom profile (not in SWE-smith's registry).
+        
+        This directly uses the profile's build_image(), create_mirror(), and push_image() methods.
+        """
+        try:
+            from swesmith.profiles import registry
+            
+            # The custom profile should already be registered by _register_custom_profiles()
+            if repo_name not in registry:
+                raise TaskGenerationError(f"Custom profile {repo_name} not found in registry. Registration may have failed.")
+            
+            profile_class = registry[repo_name]
+            profile = profile_class()
+            
+            logger.info(f"Building Docker image for custom profile: {profile.image_name}")
+            
+            # Create mirror repository on GitHub (if it doesn't exist)
+            try:
+                logger.info(f"Creating mirror repository: {profile.mirror_name}")
+                profile.create_mirror()
+                logger.info(f"Mirror repository created: {profile.mirror_name}")
+            except Exception as e:
+                logger.warning(f"Mirror creation failed or already exists: {e}")
+                # Continue anyway - mirror might already exist
+            
+            # Build the Docker image
+            logger.info(f"Building Docker image: {profile.image_name}")
+            profile.build_image()
+            logger.info(f"Docker image built successfully: {profile.image_name}")
+            
+            # Push to Docker Hub if requested
+            if docker_config and docker_config.push:
+                logger.info(f"Pushing Docker image to Docker Hub: {profile.image_name}")
+                profile.push_image()
+                logger.info(f"Docker image pushed successfully: {profile.image_name}")
+        
+        except Exception as e:
+            raise TaskGenerationError(f"Failed to build custom profile image: {e}")
+    
+    def _find_profile_name(self, repo_name: str) -> str:
+        """Find the correct profile image name from the SWE-smith registry.
+        
+        For repos in the registry, we need to find the profile's image_name.
+        e.g., jyangballin/swesmith.x86_64.pallets_1776_click.fde47b4b
+        """
+        # Try to find the profile in the registry
+        try:
+            from swesmith.profiles import registry
+            
+            # Look for a matching profile by repo_name key
+            if repo_name in registry:
+                profile_class = registry[repo_name]
+                profile = profile_class()
+                image_name = profile.image_name
+                logger.info(f"Found profile in registry: {repo_name} -> {image_name}")
+                return image_name
+            else:
+                logger.warning(f"Profile {repo_name} not found in registry")
+        except Exception as e:
+            logger.warning(f"Could not access profile registry: {e}")
+        
+        # Fallback: use our repo_name format
+        logger.info(f"Using repo_name as profile: {repo_name}")
+        return repo_name
+    
+    def _retag_and_push_if_needed(self, source_image_name: str, target_org: str) -> bool:
+        """Retag and push Docker image to target org if it doesn't exist there.
+        
+        This is independent of SWE-smith - we only care about our org.
+        Returns True if image was successfully handled, False if we need to build.
+        """
+        try:
+            import docker
+            client = docker.from_env()
+            
+            # Extract the image name parts
+            # source_image_name format: jyangballin/swesmith.x86_64.pallets_1776_click.fde47b4b
+            if '/' not in source_image_name:
+                logger.warning(f"Invalid image name format: {source_image_name}")
+                return False
+            
+            source_org, image_suffix = source_image_name.split('/', 1)
+            target_image_name = f"{target_org}/{image_suffix}"
+            
+            # Check if image already exists in target org
+            try:
+                client.images.get(target_image_name)
+                logger.info(f"Image already exists in target org: {target_image_name}")
+                logger.info(f"Pushing existing image to Docker Hub: {target_image_name}")
+                
+                # Push the existing image
+                push_successful = False
+                error_message = None
+                
+                try:
+                    for line in client.images.push(target_image_name, stream=True, decode=True):
+                        logger.debug(f"Push stream: {line}")
+                        
+                        # Check for errors
+                        if 'error' in line:
+                            error_message = line.get('error', 'Unknown error')
+                            logger.error(f"Push error: {error_message}")
+                            break
+                        
+                        # Check for progress
+                        if 'status' in line:
+                            status = line['status']
+                            if 'Pushed' in status or 'Layer already exists' in status:
+                                logger.debug(f"Push progress: {status}")
+                            # Check for final success message (digest indicates successful push)
+                            if 'digest:' in status or ': digest:' in status:
+                                push_successful = True
+                                logger.info(f"Push completed: {status}")
+                
+                except Exception as push_error:
+                    error_message = str(push_error)
+                    logger.error(f"Exception during push: {push_error}")
+                
+                if error_message:
+                    logger.error(f"Failed to push {target_image_name}: {error_message}")
+                    return False
+                
+                if not push_successful:
+                    logger.warning(f"Push stream completed but no digest confirmation received for {target_image_name}")
+                    logger.warning("Push may have failed silently - returning False to trigger rebuild")
+                    return False
+                
+                logger.info(f"Successfully pushed {target_image_name} to Docker Hub")
+                return True
+            
+            except docker.errors.ImageNotFound:
+                # Image doesn't exist in target org, check if source exists
+                logger.info(f"Image not found in target org: {target_image_name}")
+                
+                try:
+                    # Check if source image exists
+                    source_image = client.images.get(source_image_name)
+                    logger.info(f"Found source image: {source_image_name}")
+                    logger.info(f"Retagging {source_image_name} -> {target_image_name}")
+                    
+                    # Retag the image
+                    source_image.tag(target_image_name)
+                    logger.info(f"Successfully retagged image to {target_image_name}")
+                    
+                    # Push the retagged image
+                    logger.info(f"Pushing retagged image to Docker Hub: {target_image_name}")
+                    push_successful = False
+                    error_message = None
+                    
+                    try:
+                        for line in client.images.push(target_image_name, stream=True, decode=True):
+                            logger.debug(f"Push stream: {line}")
+                            
+                            # Check for errors
+                            if 'error' in line:
+                                error_message = line.get('error', 'Unknown error')
+                                logger.error(f"Push error: {error_message}")
+                                break
+                            
+                            # Check for progress
+                            if 'status' in line:
+                                status = line['status']
+                                if 'Pushed' in status or 'Layer already exists' in status:
+                                    logger.debug(f"Push progress: {status}")
+                                # Check for final success message (digest indicates successful push)
+                                if 'digest:' in status or ': digest:' in status:
+                                    push_successful = True
+                                    logger.info(f"Push completed: {status}")
+                    
+                    except Exception as push_error:
+                        error_message = str(push_error)
+                        logger.error(f"Exception during push: {push_error}")
+                    
+                    if error_message:
+                        logger.error(f"Failed to push retagged {target_image_name}: {error_message}")
+                        return False
+                    
+                    if not push_successful:
+                        logger.warning(f"Push stream completed but no digest confirmation received for retagged {target_image_name}")
+                        logger.warning("Push may have failed silently - returning False")
+                        return False
+                    
+                    logger.info(f"Successfully pushed {target_image_name} to Docker Hub")
+                    return True
+                
+                except docker.errors.ImageNotFound:
+                    # Source image doesn't exist either, need to build
+                    logger.info(f"Source image not found: {source_image_name}")
+                    logger.info(f"Will need to build image from scratch")
+                    return False
+        
+        except Exception as e:
+            logger.warning(f"Failed to retag/push image: {e}")
+            logger.warning("Will attempt to build image from scratch")
+            return False
+
+    def _retag_and_push_if_needed(self, source_image_name: str, target_org: str) -> bool:
+        """Retag and push Docker image to target org if it doesn't exist there.
+        
+        This is independent of SWE-smith - we only care about our org.
+        Returns True if image was successfully handled, False if we need to build.
+        """
+        try:
+            import docker
+            client = docker.from_env()
+            
+            # Extract the image name parts
+            # source_image_name format: jyangballin/swesmith.x86_64.pallets_1776_click.fde47b4b
+            if '/' not in source_image_name:
+                logger.warning(f"Invalid image name format: {source_image_name}")
+                return False
+            
+            source_org, image_suffix = source_image_name.split('/', 1)
+            target_image_name = f"{target_org}/{image_suffix}"
+            
+            # Check if image already exists in target org
+            try:
+                client.images.get(target_image_name)
+                logger.info(f"Image already exists in target org: {target_image_name}")
+                logger.info(f"Pushing existing image to Docker Hub: {target_image_name}")
+                
+                # Push the existing image
+                push_successful = False
+                error_message = None
+                
+                try:
+                    for line in client.images.push(target_image_name, stream=True, decode=True):
+                        logger.debug(f"Push stream: {line}")
+                        
+                        # Check for errors
+                        if 'error' in line:
+                            error_message = line.get('error', 'Unknown error')
+                            logger.error(f"Push error: {error_message}")
+                            break
+                        
+                        # Check for progress
+                        if 'status' in line:
+                            status = line['status']
+                            if 'Pushed' in status or 'Layer already exists' in status:
+                                logger.debug(f"Push progress: {status}")
+                            # Check for final success message (digest indicates successful push)
+                            if 'digest:' in status or ': digest:' in status:
+                                push_successful = True
+                                logger.info(f"Push completed: {status}")
+                
+                except Exception as push_error:
+                    error_message = str(push_error)
+                    logger.error(f"Exception during push: {push_error}")
+                
+                if error_message:
+                    logger.error(f"Failed to push {target_image_name}: {error_message}")
+                    return False
+                
+                if not push_successful:
+                    logger.warning(f"Push stream completed but no digest confirmation received for {target_image_name}")
+                    logger.warning("Push may have failed silently - returning False to trigger rebuild")
+                    return False
+                
+                logger.info(f"Successfully pushed {target_image_name} to Docker Hub")
+                return True
+            
+            except docker.errors.ImageNotFound:
+                # Image doesn't exist in target org, check if source exists
+                logger.info(f"Image not found in target org: {target_image_name}")
+                
+                try:
+                    # Check if source image exists
+                    source_image = client.images.get(source_image_name)
+                    logger.info(f"Found source image: {source_image_name}")
+                    logger.info(f"Retagging {source_image_name} -> {target_image_name}")
+                    
+                    # Retag the image
+                    source_image.tag(target_image_name)
+                    logger.info(f"Successfully retagged image to {target_image_name}")
+                    
+                    # Push the retagged image
+                    logger.info(f"Pushing retagged image to Docker Hub: {target_image_name}")
+                    push_successful = False
+                    error_message = None
+                    
+                    try:
+                        for line in client.images.push(target_image_name, stream=True, decode=True):
+                            logger.debug(f"Push stream: {line}")
+                            
+                            # Check for errors
+                            if 'error' in line:
+                                error_message = line.get('error', 'Unknown error')
+                                logger.error(f"Push error: {error_message}")
+                                break
+                            
+                            # Check for progress
+                            if 'status' in line:
+                                status = line['status']
+                                if 'Pushed' in status or 'Layer already exists' in status:
+                                    logger.debug(f"Push progress: {status}")
+                                # Check for final success message (digest indicates successful push)
+                                if 'digest:' in status or ': digest:' in status:
+                                    push_successful = True
+                                    logger.info(f"Push completed: {status}")
+                    
+                    except Exception as push_error:
+                        error_message = str(push_error)
+                        logger.error(f"Exception during push: {push_error}")
+                    
+                    if error_message:
+                        logger.error(f"Failed to push retagged {target_image_name}: {error_message}")
+                        return False
+                    
+                    if not push_successful:
+                        logger.warning(f"Push stream completed but no digest confirmation received for retagged {target_image_name}")
+                        logger.warning("Push may have failed silently - returning False")
+                        return False
+                    
+                    logger.info(f"Successfully pushed {target_image_name} to Docker Hub")
+                    return True
+                
+                except docker.errors.ImageNotFound:
+                    # Source image doesn't exist either, need to build
+                    logger.info(f"Source image not found: {source_image_name}")
+                    logger.info(f"Will need to build image from scratch")
+                    return False
+        
+        except Exception as e:
+            logger.warning(f"Failed to retag/push image: {e}")
+            logger.warning("Will attempt to build image from scratch")
+            return False
 

@@ -11,6 +11,18 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+# Load .env file if it exists
+try:
+    from dotenv import load_dotenv
+    env_path = Path(__file__).parent.parent / ".env"
+    if env_path.exists():
+        load_dotenv(env_path)
+        logging.getLogger(__name__).info(f"Loaded environment variables from {env_path}")
+    else:
+        logging.getLogger(__name__).debug(f"No .env file found at {env_path}")
+except ImportError:
+    pass  # python-dotenv not available, skip
+
 from spider.config import JobConfig, OutputMode
 from .executor import JobExecutionError, run_generation_job, _job_snapshot
 from . import events
