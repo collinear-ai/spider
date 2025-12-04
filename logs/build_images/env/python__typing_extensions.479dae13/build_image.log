@@ -1,0 +1,57 @@
+2025-12-04 06:49:01,066 - INFO - Building image meghanaarakkal/swesmith.x86_64.python_1776_typing_extensions.479dae13
+Using dockerfile:
+FROM --platform=linux/x86_64 jyangballin/swesmith.x86_64
+
+COPY ./setup_env.sh /root/
+RUN sed -i -e 's/\r$//' /root/setup_env.sh
+RUN chmod +x /root/setup_env.sh
+RUN /bin/bash -c "source ~/.bashrc && /root/setup_env.sh"
+
+WORKDIR /testbed/
+
+# Automatically activate the testbed environment
+RUN echo "source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed" > /root/.bashrc
+
+Adding (1) setup scripts to image build repo
+2025-12-04 06:49:01,066 - INFO - [SETUP SCRIPT] setup_env.sh:
+#!/bin/bash
+set -euxo pipefail
+git clone -o origin https://github.com/meghanar-19/python__typing_extensions.479dae13 /testbed
+cd /testbed
+source /opt/miniconda3/bin/activate
+conda create -n testbed python=3.10 -y
+conda activate testbed
+echo "Current environment: $CONDA_DEFAULT_ENV"
+python -m pip install -e .
+
+2025-12-04 06:49:01,067 - INFO - Building docker image meghanaarakkal/swesmith.x86_64.python_1776_typing_extensions.479dae13 in logs/build_images/env/python__typing_extensions.479dae13 with platform linux/x86_64
+2025-12-04 06:49:01,071 - INFO - Step 1/7 : FROM --platform=linux/x86_64 jyangballin/swesmith.x86_64
+2025-12-04 06:49:01,072 - INFO - 
+2025-12-04 06:49:01,072 - INFO - ---> d32f36140b8f
+2025-12-04 06:49:01,072 - INFO - Step 2/7 : COPY ./setup_env.sh /root/
+2025-12-04 06:49:01,072 - INFO - 
+2025-12-04 06:49:01,072 - INFO - ---> Using cache
+2025-12-04 06:49:01,072 - INFO - ---> 7880eb126dab
+2025-12-04 06:49:01,072 - INFO - Step 3/7 : RUN sed -i -e 's/\r$//' /root/setup_env.sh
+2025-12-04 06:49:01,072 - INFO - 
+2025-12-04 06:49:01,072 - INFO - ---> Using cache
+2025-12-04 06:49:01,072 - INFO - ---> b20a40cec21a
+2025-12-04 06:49:01,072 - INFO - Step 4/7 : RUN chmod +x /root/setup_env.sh
+2025-12-04 06:49:01,072 - INFO - 
+2025-12-04 06:49:01,072 - INFO - ---> Using cache
+2025-12-04 06:49:01,072 - INFO - ---> 42f03d6f8b7a
+2025-12-04 06:49:01,072 - INFO - Step 5/7 : RUN /bin/bash -c "source ~/.bashrc && /root/setup_env.sh"
+2025-12-04 06:49:01,073 - INFO - 
+2025-12-04 06:49:01,073 - INFO - ---> Using cache
+2025-12-04 06:49:01,073 - INFO - ---> f10feb9cd5dc
+2025-12-04 06:49:01,073 - INFO - Step 6/7 : WORKDIR /testbed/
+2025-12-04 06:49:01,073 - INFO - 
+2025-12-04 06:49:01,073 - INFO - ---> Using cache
+2025-12-04 06:49:01,073 - INFO - ---> d1631cd5d42d
+2025-12-04 06:49:01,073 - INFO - Step 7/7 : RUN echo "source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed" > /root/.bashrc
+2025-12-04 06:49:01,073 - INFO - 
+2025-12-04 06:49:01,073 - INFO - ---> Using cache
+2025-12-04 06:49:01,073 - INFO - ---> 21d6412198d7
+2025-12-04 06:49:01,073 - INFO - Successfully built 21d6412198d7
+2025-12-04 06:49:01,080 - INFO - Successfully tagged meghanaarakkal/swesmith.x86_64.python_1776_typing_extensions.479dae13:latest
+2025-12-04 06:49:01,080 - INFO - Image built successfully!

@@ -269,7 +269,29 @@ def _run_task_generation_job(
             data={"num_tasks": len(tasks)}
         )
         
-        # Upload to HF if configured
+        # Write metadata FIRST (before HF upload)
+        metadata = {
+            "job_id": job_id,
+            "num_tasks": len(tasks),
+            "repository": task_gen_config.repository.github_url,
+            "commit": task_gen_config.repository.commit,
+            "mirror_org": task_gen_config.repository.mirror_org,
+            "generation_methods": [m.type for m in task_gen_config.bug_generation.methods],
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+        }
+        
+        # Add Docker image info if available
+        if task_gen_config.docker_image and task_gen_config.docker_image.enabled:
+            docker_hub_org = task_gen_config.docker_image.docker_hub_org or "jyangballin"
+            repo_name = generator._get_repo_name() if generator else None
+            if repo_name:
+                # Construct image name based on repo
+                metadata["docker_image"] = f"{docker_hub_org}/swesmith.x86_64.{repo_name.replace('/', '_').replace('.', '_')}"
+        
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        
+        # Upload to HF if configured (after metadata is written)
         remote_artifact = None
         if job.task_output and job.task_output.mode == OutputMode.HF_UPLOAD and job.task_output.hf:
             try:
@@ -291,17 +313,6 @@ def _run_task_generation_job(
                     level="warning",
                     code="task_gen.upload_failed"
                 )
-        
-        # Write metadata
-        metadata = {
-            "job_id": job_id,
-            "num_tasks": len(tasks),
-            "repository": task_gen_config.repository.github_url,
-            "generation_methods": [m.type for m in task_gen_config.bug_generation.methods],
-            "generated_at": datetime.utcnow().isoformat() + "Z",
-        }
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f, indent=2)
         
         return JobExecutionResult(
             artifacts_path=artifact_path,

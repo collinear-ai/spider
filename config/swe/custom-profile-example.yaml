@@ -11,29 +11,33 @@ job:
     enabled: true
     
     repository:
-      github_url: "pallets/click"  # Repo already in SWE-smith registry
-      commit: "fde47b4b4f978f179b9dff34583cb2b99021f482"  # Specific commit from SWE-smith registry
-      mirror_org: "collinear-ai"  # Your GitHub username (not org) - no admin permissions needed
+      github_url: "pallets/click"  # Known to work well with SWE-smith
+      commit: "fde47b4bb1dc453fd3e8cefb588477e3023c03eb" # Known good commit
+      mirror_org: "meghanar-19"  # Your GitHub username (for push permissions)
       
-      # No custom_profile needed - this repo is already in SWE-smith's registry!
-      # Uncomment below if using a repo NOT in SWE-smith's registry:
+      # custom_profile for repos NOT in SWE-smith's registry
+      # Commenting out since pallets/click is in the registry
       # custom_profile:
-      #   language: "python"  # Options: python, golang, rust, javascript, java, cpp, c, csharp, php
+      #   language: "python"
       #   owner: "pallets"
       #   repo: "click"
-      #   commit: "fde47b4b4f978f179b9dff34583cb2b99021f482"
+      #   commit: "fde47b4bb1dc453fd3e8cefb588477e3023c03eb"
     
     docker_image:
       enabled: true
       build_before_tasks: true
       rebuild_after_tasks: false
-      push: true  # Set to true to push images to Docker Hub
-      docker_hub_org: "meghanaarakkal"  # Optional: Your Docker Hub org/username (default: "jyangballin")
+      push: true  # Gracefully handles push failures
+      docker_hub_org: "meghanaarakkal"  # Your Docker Hub username (authenticated)
+      mirror_org: "meghanar-19"  # Your GitHub username for mirror repos
     
     bug_generation:
       methods:
-        - type: "procedural"  # Procedural works well for any repo
-          max_bugs: 100
+      - type: "lm_rewrite"
+        model: "o3-mini-2025-01-31"
+        n_bugs: 10  # pallets/click has better pass rates
+        # - type: "procedural"  # Procedural works well for any repo
+        #   max_bugs: 100
           # model: "o3-mini-2025-01-31"
         # Or use LM methods (require API keys)
         # - type: "lm_rewrite"

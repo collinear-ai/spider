@@ -51,12 +51,127 @@ class SWESmithTaskGenerator:
         for dir_path in [self.bug_gen_dir, self.validation_dir, self.tasks_dir, self.issue_gen_dir]:
             dir_path.mkdir(parents=True, exist_ok=True)
         
+        # Apply runtime patches to SWE-smith FIRST (before any other operations)
+        self._apply_swesmith_patches()
+        
         # Register custom profiles before any SWE-smith operations
         self._register_custom_profiles()
         
         # Set mirror organization for SWE-smith
         self._setup_mirror_org()
-        self._patch_git_user_config()
+    
+    def _apply_swesmith_patches(self) -> None:
+        """Apply runtime monkey-patches to fix bugs in pip-installed SWE-smith."""
+        logger.info("Applying runtime patches to SWE-smith...")
+        
+        # PATCH 1: Fix empty change list bug
+        try:
+            from swesmith.bug_gen import utils
+            original_apply = utils.apply_code_change
+            
+            def patched_apply(candidate, bug):
+                with open(candidate.file_path, "r") as f:
+                    lines = f.readlines()
+                if candidate.line_start < 1 or candidate.line_end > len(lines) or candidate.line_start > candidate.line_end:
+                    raise ValueError("Invalid line range")
+                change = [f"{' ' * candidate.indent_level * candidate.indent_size}{x}" if len(x.strip()) > 0 else x for x in bug.rewrite.splitlines(keepends=True)]
+                if not change:
+                    logger.warning(f"Empty rewrite from LLM, skipping")
+                    return
+                curr_last = lines[candidate.line_end - 1]
+                num_newlines = len(curr_last) - len(curr_last.rstrip("\n"))
+                change[-1] = change[-1].rstrip("\n") + "\n" * num_newlines
+                with open(candidate.file_path, "w") as f:
+                    f.writelines(lines[:candidate.line_start - 1] + change + lines[candidate.line_end:])
+            
+            utils.apply_code_change = patched_apply
+            logger.info("  ✓ Patched swesmith.bug_gen.utils.apply_code_change")
+        except Exception as e:
+            logger.warning(f"  ✗ Failed to patch apply_code_change: {e}")
+        
+        # PATCH 2: Fix user account mirror creation
+        try:
+            from swesmith.profiles.base import RepoProfile
+            import shutil
+            
+            def patched_create_mirror(self):
+                import subprocess
+                logger.info(f"Creating mirror: {self.org_gh}/{self.repo_name}")
+                if self.repo_name in os.listdir():
+                    shutil.rmtree(self.repo_name)
+                
+                # Check if mirror already exists and has content
+                mirror_exists = False
+                try:
+                    repo_info = self.api.repos.get(owner=self.org_gh, repo=self.repo_name)
+                    mirror_exists = True
+                    if repo_info.size > 0:
+                        logger.info(f"Mirror already exists with content (size={repo_info.size}), skipping")
+                        return
+                    else:
+                        logger.warning(f"Mirror exists but is EMPTY (size=0), will delete and recreate properly")
+                        # Delete the empty repo to start fresh
+                        try:
+                            self.api.repos.delete(owner=self.org_gh, repo=self.repo_name)
+                            logger.info(f"Deleted empty mirror repo: {self.org_gh}/{self.repo_name}")
+                            mirror_exists = False
+                        except Exception as del_err:
+                            logger.warning(f"Could not delete empty repo: {del_err}, will try to populate it")
+                            # If we can't delete it, we'll try to populate it below
+                except Exception:
+                    # Repo doesn't exist, which is fine - we'll create it
+                    pass
+                
+                # Clone and prepare the content FIRST (before creating GitHub repo)
+                clone_url = f"https://github.com/{self.owner}/{self.repo}.git"
+                logger.info(f"Cloning source repo: {clone_url}")
+                subprocess.run(["git", "clone", "--no-single-branch", clone_url, self.repo_name], check=True)
+                
+                cwd = os.getcwd()
+                try:
+                    os.chdir(self.repo_name)
+                    subprocess.run(["git", "checkout", self.commit], check=True)
+                    subprocess.run(["git", "config", "user.name", "spider"], check=True)
+                    subprocess.run(["git", "config", "user.email", "spider@example.com"], check=True)
+                    
+                    # NOW create the GitHub repo (only after we have content ready to push)
+                    if not mirror_exists:
+                        is_org = False
+                        try:
+                            self.api.orgs.get(self.org_gh)
+                            is_org = True
+                        except Exception:
+                            pass
+                        
+                        try:
+                            if is_org:
+                                self.api.repos.create_in_org(self.org_gh, self.repo_name, private=False)
+                                logger.info(f"✓ Created mirror as org repo: {self.org_gh}/{self.repo_name}")
+                            else:
+                                self.api.users.get_by_username(self.org_gh)
+                                self.api.repos.create_for_authenticated_user(name=self.repo_name, private=False)
+                                logger.info(f"✓ Created mirror as user repo: {self.org_gh}/{self.repo_name}")
+                        except Exception as create_err:
+                            if "already exists" in str(create_err).lower():
+                                logger.info(f"Mirror was created by another process: {self.org_gh}/{self.repo_name}")
+                            else:
+                                raise RuntimeError(f"Failed to create mirror: {create_err}")
+                    
+                    # Push content immediately after creation
+                    mirror_url = f"git@github.com:{self.mirror_name}.git"
+                    subprocess.run(["git", "remote", "add", "mirror", mirror_url], check=True)
+                    subprocess.run(["git", "push", "-f", "mirror", "HEAD:refs/heads/main"], check=True)
+                    logger.info(f"✓ Mirror complete with content: {self.org_gh}/{self.repo_name}")
+                finally:
+                    os.chdir(cwd)
+                    # Clean up local clone
+                    if os.path.exists(self.repo_name):
+                        shutil.rmtree(self.repo_name)
+            
+            RepoProfile.create_mirror = patched_create_mirror
+            logger.info("  ✓ Patched RepoProfile.create_mirror")
+        except Exception as e:
+            logger.warning(f"  ✗ Failed to patch create_mirror: {e}")
     
     def _register_custom_profiles(self) -> None:
         """Dynamically create and register custom profiles with SWE-smith's registry.
@@ -174,6 +289,54 @@ class SWESmithTaskGenerator:
             frozen=False
         )
         
+        # Override build_image for custom profiles to auto-generate env and clone from mirror
+        if profile_config.language == "python":
+            import types
+            
+            def custom_build_image(self):
+                """Build Docker image without requiring pre-generated environment file."""
+                import docker
+                from pathlib import Path
+                from swebench.harness.docker_build import build_image as build_image_sweb
+                from swebench.harness.dockerfiles import get_dockerfile_env
+                from swesmith.constants import ENV_NAME, LOG_DIR_ENV
+                
+                BASE_IMAGE_KEY = "jyangballin/swesmith.x86_64"
+                client = docker.from_env()
+                python_version = getattr(self, 'python_version', '3.10')
+                
+                setup_commands = [
+                    "#!/bin/bash",
+                    "set -euxo pipefail",
+                    f"git clone -o origin https://github.com/{self.mirror_name} /{ENV_NAME}",
+                    f"cd /{ENV_NAME}",
+                    "source /opt/miniconda3/bin/activate",
+                    f"conda create -n {ENV_NAME} python={python_version} -y",
+                    f"conda activate {ENV_NAME}",
+                    'echo "Current environment: $CONDA_DEFAULT_ENV"',
+                ] + self.install_cmds
+                
+                dockerfile = get_dockerfile_env(self.pltf, self.arch, "py", base_image_key=BASE_IMAGE_KEY)
+                build_dir = LOG_DIR_ENV / self.repo_name
+                build_dir.mkdir(parents=True, exist_ok=True)
+                
+                build_image_sweb(
+                    image_name=self.image_name,
+                    setup_scripts={"setup_env.sh": "\n".join(setup_commands) + "\n"},
+                    dockerfile=dockerfile,
+                    platform=self.pltf,
+                    client=client,
+                    build_dir=build_dir,
+                )
+            
+            # Bind the custom method to ALL instances of this class
+            # This ensures it works even with SWE-smith's singleton pattern
+            original_init = profile_class.__init__
+            def new_init(self, *args, **kwargs):
+                original_init(self, *args, **kwargs)
+                self.build_image = types.MethodType(custom_build_image, self)
+            profile_class.__init__ = new_init
+        
         return profile_class
     
     def _create_profile_wrapper_script(self, module_name: str, cmd_args: List[str]) -> str:
@@ -267,11 +430,27 @@ class SWESmithTaskGenerator:
                 mirror_org_name = mirror_org
                 mirror_repo_prefix = None
             
+            # Also get Docker Hub org if specified
+            docker_hub_org = None
+            if self.config.docker_image and self.config.docker_image.docker_hub_org:
+                docker_hub_org = self.config.docker_image.docker_hub_org
+                if "/" in docker_hub_org:
+                    docker_hub_org = docker_hub_org.split("/", 1)[0]
+            
             script_lines.extend([
                 "# Apply mirror org configuration BEFORE importing profiles",
                 "import swesmith.constants as swesmith_constants",
                 f"swesmith_constants.ORG_NAME_GH = '{mirror_org_name}'",
-                f"print('Set mirror org to: {mirror_org_name}')",
+                f"print('Set GitHub mirror org to: {mirror_org_name}')",
+            ])
+            
+            if docker_hub_org:
+                script_lines.extend([
+                    f"swesmith_constants.ORG_NAME_DH = '{docker_hub_org}'",
+                    f"print('Set Docker Hub org to: {docker_hub_org}')",
+                ])
+            
+            script_lines.extend([
                 "",
                 "# Patch git user config to use 'spider' instead of 'swesmith'",
                 "from swesmith.profiles.base import RepoProfile",
@@ -952,6 +1131,20 @@ class SWESmithTaskGenerator:
             events.emit("Gathering tasks into instances...", code="task_gen.gather")
             tasks = self._gather_tasks(validated_patches, collected_patches)
             events.emit(f"Gathered {len(tasks)} task instances.", code="task_gen.gather_done", data={"count": len(tasks)})
+            
+            # Provide helpful feedback if no tasks passed validation
+            if len(tasks) == 0:
+                logger.warning("No tasks passed validation")
+                logger.info("This is normal - many generated bugs don't pass repository tests")
+                logger.info("To get valid tasks, try:")
+                logger.info("  • Increase n_bugs (try 50-100 for better chances)")
+                logger.info("  • Use a repository with simpler tests")
+                logger.info("  • Try 'procedural' bug generation (higher pass rate)")
+                events.emit(
+                    "No tasks passed validation. This is normal - try generating more bugs or using a simpler repository.",
+                    level="warning",
+                    code="task_gen.no_valid_tasks"
+                )
         else:
             logger.info("Skipping gather, using validated patches as tasks")
             events.emit("Skipping gather.", code="task_gen.gather_skipped")
@@ -1026,8 +1219,9 @@ class SWESmithTaskGenerator:
                 
             except Exception as e:
                 logger.error(f"✗ Error in {method.type}: {e}", exc_info=True)
-                events.emit(f"Error in {method.type}: {str(e)}", code="task_gen.bug_method_error", level="error", data={"method": method.type})
-                raise TaskGenerationError(f"Failed to generate bugs with {method.type}: {e}") from e
+                events.emit(f"Error in {method.type}: {str(e)}", code="task_gen.bug_method_error", level="warning", data={"method": method.type})
+                logger.warning(f"Continuing with next method despite error in {method.type}")
+                # Don't raise - continue with other methods or with bugs generated so far
         
         return bug_patches
     
@@ -1162,16 +1356,36 @@ class SWESmithTaskGenerator:
             cmd_args.extend([f"--{key}", str(value)])
         
         # Use unified wrapper script if we have custom profiles
-        if self.config.repository.custom_profile or self.config.custom_profiles:
+        has_custom_profile = bool(self.config.repository.custom_profile or self.config.custom_profiles)
+        logger.info(f"Has custom profile: {has_custom_profile}")
+        logger.info(f"  repository.custom_profile: {self.config.repository.custom_profile}")
+        logger.info(f"  custom_profiles: {self.config.custom_profiles}")
+        
+        if has_custom_profile:
+            logger.info("Creating unified wrapper script for custom profiles...")
+            # For lm_rewrite, we need to parse args and pass them to main()
+            main_call_code = """import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('repo')
+parser.add_argument('--config_file', required=True)
+parser.add_argument('--model', required=True)
+parser.add_argument('--n_workers', type=int, default=1)
+parser.add_argument('--redo_existing', action='store_true')
+parser.add_argument('--max_bugs', type=int, default=None)
+args, unknown = parser.parse_known_args(sys.argv[1:])
+main(args.repo, args.config_file, args.model, args.n_workers, args.redo_existing, args.max_bugs)"""
+            
             wrapper_script = self._create_unified_wrapper_script(
                 "swesmith.bug_gen.llm.rewrite",
                 cmd_args,
-                "main()"
+                main_call_code
             )
             cmd = [sys.executable, str(wrapper_script)]
+            logger.info(f"Using wrapper script: {wrapper_script}")
         else:
             # No custom profiles, can use direct command
             cmd = [sys.executable, "-m", "swesmith.bug_gen.llm.rewrite"] + cmd_args
+            logger.info("Using direct command (no custom profiles)")
         
         logger.info(f"Running lm_rewrite command: {' '.join(cmd)}")
         logger.info(f"  Working directory: {self.workspace}")
@@ -1295,11 +1509,31 @@ class SWESmithTaskGenerator:
         
         result = ProcessResult(return_code, '\n'.join(stdout_lines), '\n'.join(stderr_lines))
         
+        # Even if return code != 0, collect any bugs that were generated before the error
+        # This makes the pipeline resilient - partial progress is better than complete failure
+        bug_dir = self.workspace / "logs" / "bug_gen" / repo_name
+        patches = []
+        if bug_dir.exists():
+            patches = list(bug_dir.rglob("bug__lm_rewrite*.diff"))
+            logger.info(f"Found {len(patches)} bug patches in {bug_dir}")
+        
         if result.returncode != 0:
-            logger.error(f"✗ lm_rewrite failed with return code {result.returncode}")
-            raise TaskGenerationError(
-                f"LM rewrite failed: {result.stderr}\n{result.stdout}"
-            )
+            logger.warning(f"lm_rewrite completed with errors (code {result.returncode})")
+            logger.warning(f"However, {len(patches)} bugs were successfully generated before the error")
+            if len(patches) > 0:
+                logger.info(f"Continuing with {len(patches)} successfully generated bugs")
+                events.emit(
+                    f"Bug generation had errors but {len(patches)} bugs were saved",
+                    level="warning",
+                    code="bug_gen.partial_success",
+                    data={"count": len(patches), "method": "lm_rewrite"}
+                )
+                return patches  # Return the bugs we have
+            else:
+                logger.error(f"lm_rewrite failed and no bugs were generated")
+                raise TaskGenerationError(
+                    f"LM rewrite failed: {result.stderr}\n{result.stdout}"
+                )
         
         logger.info("✓ lm_rewrite completed successfully")
         
@@ -1384,6 +1618,43 @@ class SWESmithTaskGenerator:
             profiles_to_register.append(self.config.repository.custom_profile)
         if self.config.custom_profiles:
             profiles_to_register.extend(self.config.custom_profiles)
+        
+        # Determine mirror_org and docker_hub_org FIRST (needed for patching)
+        mirror_org = None
+        docker_hub_org = None
+        if self.config.docker_image:
+            if self.config.docker_image.mirror_org:
+                mirror_org = self.config.docker_image.mirror_org
+            if self.config.docker_image.docker_hub_org:
+                docker_hub_org = self.config.docker_image.docker_hub_org
+                if "/" in docker_hub_org:
+                    docker_hub_org = docker_hub_org.split("/", 1)[0]
+        if not mirror_org and self.config.repository.mirror_org:
+            mirror_org = self.config.repository.mirror_org
+        
+        # Apply ORG_NAME patching REGARDLESS of custom profiles
+        # This is critical for gather to create tasks with correct org names
+        if mirror_org or docker_hub_org:
+            if mirror_org:
+                if "/" in mirror_org:
+                    mirror_org_name = mirror_org.split("/", 1)[0]
+                else:
+                    mirror_org_name = mirror_org
+            else:
+                mirror_org_name = None
+            
+            script_lines.append("# Patch SWE-smith constants for org names")
+            script_lines.append("import swesmith.constants as swesmith_constants")
+            
+            if mirror_org_name:
+                script_lines.append(f"swesmith_constants.ORG_NAME_GH = '{mirror_org_name}'")
+                script_lines.append(f"print('✓ Set GitHub org to: {mirror_org_name}')")
+            
+            if docker_hub_org:
+                script_lines.append(f"swesmith_constants.ORG_NAME_DH = '{docker_hub_org}'")
+                script_lines.append(f"print('✓ Set Docker Hub org to: {docker_hub_org}')")
+            
+            script_lines.append("")
         
         if profiles_to_register:
             # Import base profiles
@@ -1479,8 +1750,57 @@ class SWESmithTaskGenerator:
                     f"    bases=({base_class},),",
                     "    frozen=False",
                     ")",
+                ])
+                
+                # Add custom build_image method for Python profiles
+                if profile_config.language == "python":
+                    script_lines.extend([
+                        "",
+                        f"# Override build_image for {class_name} to not require pre-generated env file",
+                        f"def custom_build_image_{class_name}(self):",
+                        "    import docker",
+                        "    from pathlib import Path",
+                        "    from swebench.harness.docker_build import build_image as build_image_sweb",
+                        "    from swebench.harness.dockerfiles import get_dockerfile_env",
+                        "    from swesmith.constants import ENV_NAME, LOG_DIR_ENV",
+                        "    ",
+                        "    BASE_IMAGE_KEY = 'jyangballin/swesmith.x86_64'",
+                        "    client = docker.from_env()",
+                        "    ",
+                        f"    python_version = getattr(self, 'python_version', '3.10')",
+                        "    ",
+                        "    setup_commands = [",
+                        "        '#!/bin/bash',",
+                        "        'set -euxo pipefail',",
+                        "        f'git clone -o origin https://github.com/{self.mirror_name} /{ENV_NAME}',",
+                        "        f'cd /{ENV_NAME}',",
+                        "        'source /opt/miniconda3/bin/activate',",
+                        "        f'conda create -n {ENV_NAME} python={python_version} -y',",
+                        "        f'conda activate {ENV_NAME}',",
+                        "        'echo \"Current environment: $CONDA_DEFAULT_ENV\"',",
+                        "    ] + self.install_cmds",
+                        "    ",
+                        "    dockerfile = get_dockerfile_env(self.pltf, self.arch, 'py', base_image_key=BASE_IMAGE_KEY)",
+                        "    build_dir = LOG_DIR_ENV / self.repo_name",
+                        "    build_dir.mkdir(parents=True, exist_ok=True)",
+                        "    ",
+                        "    build_image_sweb(",
+                        "        image_name=self.image_name,",
+                        "        setup_scripts={'setup_env.sh': '\\n'.join(setup_commands) + '\\n'},",
+                        "        dockerfile=dockerfile,",
+                        "        platform=self.pltf,",
+                        "        client=client,",
+                        "        build_dir=build_dir,",
+                        "    )",
+                        "",
+                        f"{class_name}.build_image = custom_build_image_{class_name}",
+                        "",
+                    ])
+                
+                script_lines.extend([
                     f"registry.register_profile({class_name})",
-                    f"print(f'Registered profile: {profile_config.owner}__{profile_config.repo}')",
+                    f"print(f'✓ Registered custom profile: {profile_config.owner}__{profile_config.repo}.{profile_config.commit[:8]}')",
+                    f"print(f'  Registry now contains: {{list(registry.keys())}}')",
                     "",
                 ])
             
@@ -1553,8 +1873,12 @@ class SWESmithTaskGenerator:
         # Write wrapper script
         script_name = module_name.split('.')[-1] + "_wrapper.py"
         wrapper_script = self.workspace / script_name
-        wrapper_script.write_text("\n".join(script_lines))
+        wrapper_content = "\n".join(script_lines)
+        wrapper_script.write_text(wrapper_content)
         wrapper_script.chmod(0o755)
+        
+        logger.info(f"Created wrapper script at: {wrapper_script}")
+        logger.debug(f"Wrapper script first 50 lines:\n{chr(10).join(script_lines[:50])}")
         
         return wrapper_script
     
@@ -2307,6 +2631,34 @@ main(**vars(args))"""
             # Gather uses argparse, so we need to parse arguments first
             # The wrapper imports main, sets sys.argv, then needs to parse args before calling main
             gather_main_call = """import argparse
+import subprocess as original_subprocess
+
+# Patch subprocess.run to make git push failures non-fatal
+_original_run = original_subprocess.run
+def _patched_run(cmd, *args, **kwargs):
+    # Check if this is a git push command
+    is_git_push = False
+    if isinstance(cmd, list) and len(cmd) >= 2:
+        is_git_push = (cmd[0] == 'git' and cmd[1] == 'push')
+    elif isinstance(cmd, str):
+        is_git_push = cmd.startswith('git push')
+    
+    if is_git_push:
+        # Make git push non-fatal
+        kwargs_copy = kwargs.copy()
+        kwargs_copy['check'] = False  # Don't raise on error
+        result = _original_run(cmd, *args, **kwargs_copy)
+        if result.returncode != 0:
+            print(f"WARNING: git push failed (non-fatal): {cmd}", file=sys.stderr)
+        return result
+    
+    # Not a git push, call original
+    return _original_run(cmd, *args, **kwargs)
+
+original_subprocess.run = _patched_run
+import subprocess
+subprocess.run = _patched_run
+
 parser = argparse.ArgumentParser(description="Convert validation logs to SWE-bench style dataset")
 parser.add_argument("validation_logs_path", type=str, help="Path to the validation logs")
 parser.add_argument("-v", "--verbose", action="store_true", help="Verbose mode")
@@ -2353,15 +2705,19 @@ main(**vars(args))"""
         if result.stderr:
             logger.info(f"Gather command stderr (last 2000 chars): {result.stderr[-2000:]}")
         
-        if result.returncode != 0:
-            # Extract more detailed error information
+        # Check if gather succeeded partially (tasks written but push failed)
+        gather_had_errors = result.returncode != 0
+        if gather_had_errors:
             error_msg = result.stderr + "\n" + result.stdout
-            logger.error(f"Gather failed with return code {result.returncode}")
-            logger.error(f"Full error output: {error_msg[-3000:]}")  # Last 3000 chars
+            logger.warning(f"Gather completed with errors (return code {result.returncode})")
+            logger.warning(f"Error output: {error_msg[-1000:]}")
             
-            raise TaskGenerationError(
-                f"Gather failed: {result.stderr}\n{result.stdout}"
-            )
+            # Check if the error is just a git push failure
+            if 'git push' in error_msg.lower() and ('128' in error_msg or 'denied' in error_msg.lower()):
+                logger.warning("Gather encountered a git push error (likely authentication)")
+                logger.warning("Will check if tasks were generated before the push failure")
+            else:
+                logger.warning(f"Gather had errors: {error_msg[-500:]}")
         
         # SWE-smith saves to logs/task_insts/{run_id}.json
         # The run_id is the validation_run_dir.name
@@ -2385,6 +2741,13 @@ main(**vars(args))"""
         elif tasks_file.exists():
             logger.info(f"Found tasks file: {tasks_file}")
         else:
+            # If gather had errors and no tasks file, that's a real failure
+            if gather_had_errors:
+                logger.error("Gather had errors AND no tasks file was created")
+                raise TaskGenerationError(
+                    f"Gather failed and no tasks were created:\n{result.stderr}\n{result.stdout}"
+                )
+            
             # Check if either directory exists and what files are in it
             if self.tasks_dir.exists():
                 task_files = list(self.tasks_dir.glob("*.json"))
@@ -2406,6 +2769,19 @@ main(**vars(args))"""
             raise TaskGenerationError(f"Expected tasks file to contain a JSON array, got {type(tasks)}")
         
         logger.info(f"Loaded {len(tasks)} tasks from {tasks_file}")
+        
+        # If gather had errors but tasks were created, emit a warning
+        if gather_had_errors and len(tasks) > 0:
+            logger.warning(f"Gather completed with errors but {len(tasks)} tasks were successfully created")
+            logger.warning("Task branches may not have been pushed to GitHub (git push failed)")
+            logger.warning("To fix: ensure GITHUB_TOKEN is set and has write access")
+            events.emit(
+                f"Gather had git push errors but {len(tasks)} tasks were created locally",
+                level="warning",
+                code="gather.partial_success",
+                data={"count": len(tasks)}
+            )
+        
         return tasks
     
     def _generate_issues(self, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2828,19 +3204,144 @@ main(**vars(args))"""
                 logger.warning(f"Mirror creation failed or already exists: {e}")
                 # Continue anyway - mirror might already exist
             
-            # Build the Docker image
+            # Build the Docker image with custom method for custom profiles
             logger.info(f"Building Docker image: {profile.image_name}")
-            profile.build_image()
+            logger.info(f"Profile class: {profile.__class__.__name__}")
+            
+            # Check if this is a Python profile (original or custom subclass)
+            from swesmith.profiles.python import PythonProfile
+            if isinstance(profile, PythonProfile):
+                logger.info("Detected Python profile, using custom build method")
+                self._build_custom_python_image(profile)
+            else:
+                logger.info(f"Non-Python profile ({profile.__class__.__name__}), using standard build")
+                profile.build_image()
+            
             logger.info(f"Docker image built successfully: {profile.image_name}")
             
             # Push to Docker Hub if requested
             if docker_config and docker_config.push:
-                logger.info(f"Pushing Docker image to Docker Hub: {profile.image_name}")
-                profile.push_image()
-                logger.info(f"Docker image pushed successfully: {profile.image_name}")
+                # Use custom image name if we built with a custom org
+                image_name_to_push = getattr(self, '_custom_image_name', profile.image_name)
+                logger.info(f"Attempting to push Docker image to Docker Hub: {image_name_to_push}")
+                
+                try:
+                    import docker
+                    client = docker.from_env()
+                    
+                    # Verify image exists
+                    try:
+                        image = client.images.get(image_name_to_push)
+                        logger.info(f"Found image to push: {image.id[:12]}")
+                    except docker.errors.ImageNotFound:
+                        logger.warning(f"Image not found locally: {image_name_to_push}, skipping push")
+                        events.emit(f"Docker image not found locally, skipping push", level="warning", code="docker.push_skipped")
+                        return  # Exit the method, don't fail
+                    
+                    # Push the image
+                    logger.info(f"Pushing {image_name_to_push} to Docker Hub...")
+                    push_successful = False
+                    for line in client.images.push(image_name_to_push, stream=True, decode=True):
+                        if 'status' in line:
+                            status = line['status']
+                            if 'progress' in line:
+                                logger.debug(f"Docker push: {status} {line['progress']}")
+                            else:
+                                logger.info(f"Docker push: {status}")
+                        if 'error' in line:
+                            error_msg = line['error']
+                            # Common errors that are user-fixable, not pipeline-breaking
+                            if 'denied' in error_msg.lower() or 'not found' in error_msg.lower():
+                                logger.warning(f"Docker push failed: {error_msg}")
+                                logger.warning("This is likely because:")
+                                logger.warning(f"  1. The repository doesn't exist on Docker Hub yet")
+                                logger.warning(f"  2. You need to create it at: https://hub.docker.com/repositories")
+                                logger.warning(f"  3. Or ensure you're logged in: docker login")
+                                logger.warning("The pipeline will continue without pushing the image.")
+                                events.emit(f"Docker push failed (non-critical): {error_msg}", level="warning", code="docker.push_failed")
+                                return  # Don't raise, just continue
+                            else:
+                                # Unexpected error, but still don't fail the pipeline
+                                logger.error(f"Unexpected Docker push error: {error_msg}")
+                                events.emit(f"Docker push error: {error_msg}", level="warning", code="docker.push_error")
+                                return
+                        if 'status' in line and line['status'].startswith('Pushed'):
+                            push_successful = True
+                    
+                    if push_successful:
+                        logger.info(f"✓ Docker image pushed successfully: {image_name_to_push}")
+                        events.emit(f"Docker image pushed to Docker Hub", code="docker.push_success")
+                    else:
+                        logger.warning(f"Docker push may have failed (no error reported)")
+                        
+                except Exception as e:
+                    # Catch any other Docker push errors and continue
+                    logger.warning(f"Docker push failed: {e}")
+                    logger.warning("The pipeline will continue - the Docker image is still available locally")
+                    events.emit(f"Docker push failed (non-critical): {str(e)}", level="warning", code="docker.push_exception")
+                    # Don't raise - continue the pipeline
         
         except Exception as e:
             raise TaskGenerationError(f"Failed to build custom profile image: {e}")
+    
+    def _build_custom_python_image(self, profile) -> None:
+        """Build Docker image for custom Python profile without requiring pre-generated env.yml."""
+        import docker
+        from pathlib import Path
+        from swebench.harness.docker_build import build_image as build_image_sweb
+        from swebench.harness.dockerfiles import get_dockerfile_env
+        from swesmith.constants import ENV_NAME, LOG_DIR_ENV
+        
+        BASE_IMAGE_KEY = "jyangballin/swesmith.x86_64"
+        client = docker.from_env()
+        python_version = getattr(profile, 'python_version', '3.10')
+        
+        # Override image_name with correct Docker Hub org if configured
+        docker_hub_org = None
+        if self.config.docker_image and self.config.docker_image.docker_hub_org:
+            docker_hub_org = self.config.docker_image.docker_hub_org
+        
+        if docker_hub_org and docker_hub_org != "jyangballin":
+            # Replace the org in the image name
+            original_image_name = profile.image_name
+            # Image name format: jyangballin/swesmith.x86_64.python_1776_typing_extensions.479dae13
+            if "/" in original_image_name:
+                image_base = original_image_name.split("/", 1)[1]
+                image_name = f"{docker_hub_org}/{image_base}"
+                logger.info(f"Overriding Docker Hub org: {original_image_name} -> {image_name}")
+            else:
+                image_name = original_image_name
+        else:
+            image_name = profile.image_name
+        
+        setup_commands = [
+            "#!/bin/bash",
+            "set -euxo pipefail",
+            f"git clone -o origin https://github.com/{profile.mirror_name} /{ENV_NAME}",
+            f"cd /{ENV_NAME}",
+            "source /opt/miniconda3/bin/activate",
+            f"conda create -n {ENV_NAME} python={python_version} -y",
+            f"conda activate {ENV_NAME}",
+            'echo "Current environment: $CONDA_DEFAULT_ENV"',
+        ] + profile.install_cmds
+        
+        dockerfile = get_dockerfile_env(profile.pltf, profile.arch, "py", base_image_key=BASE_IMAGE_KEY)
+        build_dir = LOG_DIR_ENV / profile.repo_name
+        build_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"Building custom Python Docker image: {image_name}")
+        build_image_sweb(
+            image_name=image_name,
+            setup_scripts={"setup_env.sh": "\n".join(setup_commands) + "\n"},
+            dockerfile=dockerfile,
+            platform=profile.pltf,
+            client=client,
+            build_dir=build_dir,
+        )
+        logger.info(f"Custom Python Docker image built: {image_name}")
+        
+        # Store the custom image name for later use in push
+        self._custom_image_name = image_name
     
     def _find_profile_name(self, repo_name: str) -> str:
         """Find the correct profile image name from the SWE-smith registry.
