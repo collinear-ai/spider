@@ -68,6 +68,24 @@ class OnPolicyConfig(BaseModel):
     eval_every: int = Field(default=20, ge=0)
     save_every: int = Field(default=20, ge=0)
 
+class ScaffoldConfig(BaseModel):
+    """Configuration for SWE scaffold trajectory generation."""
+    type: str = Field(..., description="Scaffold type: 'openhands', 'swe-agent', or 'mini-swe-agent'")
+    agent_class: Optional[str] = Field(default=None, description="Agent class (scaffold-specific)")
+    max_iterations: Optional[int] = Field(default=None, description="Max iterations per task")
+    llm_config_name: Optional[str] = Field(default=None, description="LLM config name (scaffold-specific)")
+    llm_model: Optional[str] = Field(default=None, description="LLM model name")
+    llm_api_key: Optional[str] = Field(default=None, description="LLM API key")
+    llm_api_key_env: Optional[str] = Field(default=None, description="Environment variable name for LLM API key")
+    llm_base_url: Optional[str] = Field(default=None, description="Base URL for LLM API (e.g., 'https://api.fireworks.ai/inference/v1' for Fireworks, 'http://localhost:8000/v1' for vLLM)")
+    num_workers: int = Field(default=1, description="Number of parallel workers")
+    timeout_seconds: Optional[int] = Field(default=None, description="Timeout per instance")
+    max_retries: int = Field(default=5, description="Max retries on failure")
+    scaffold_specific: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Scaffold-specific configuration options"
+    )
+
 class GenerationConfig(BaseModel):
     duplications: int = Field(default=1, ge=1)
     max_batch_size: Optional[int] = Field(default=None, ge=1)
@@ -89,11 +107,21 @@ class GenerationConfig(BaseModel):
         default=None,
         description="Config for on-policy distillation workflow"
     )
+    scaffold: Optional[ScaffoldConfig] = Field(
+        default=None,
+        description="SWE scaffold configuration for trajectory generation"
+    )
 
     @model_validator(mode="after")
     def validate_on_policy(self) -> "GenerationConfig":
         if self.on_policy and not self.on_policy_options:
             raise ValueError("`on_policy_options` is required when `on_policy` is true")
+        return self
+    
+    @model_validator(mode="after")
+    def validate_scaffold(self) -> "GenerationConfig":
+        if self.scaffold and self.on_policy:
+            raise ValueError("Cannot use scaffold with on_policy mode")
         return self
 
 class ModelConfig(BaseModel):

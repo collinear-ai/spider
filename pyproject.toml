@@ -35,6 +35,11 @@ client = [
     "openai",
     "tqdm"
 ]
+swe-scaffolds = [
+    "openhands-ai>=0.62.0",
+    "datasets",
+    "pandas",
+]
 server = [
     "datasets",
     "pyarrow",
@@ -96,6 +101,7 @@ all = [
 
 [project.scripts]
 spider = "spider.cli:app"
+spider-scaffold = "server.scaffolds.cli:app"
 
 [tool.ruff]
 line-length = 100

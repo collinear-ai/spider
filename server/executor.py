@@ -18,6 +18,12 @@ from .sources import collect_prompts
 from .writers import JSONLBatchWriter
 from .hf_upload import HFUploadError, publish_to_hub
 from .on_policy import run_on_policy_job
+try:
+    from .scaffolds.base import Scaffold, ScaffoldConfig
+    from .scaffolds.openhands_wrapper import OpenHandsScaffold, OpenHandsScaffoldConfig
+    SCAFFOLDS_AVAILABLE = True
+except ImportError:
+    SCAFFOLDS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 if logger.level == logging.NOTSET:
@@ -84,6 +90,23 @@ def run_generation_job(
                     workspace=workspace,
                     job_env=job_env or {},
                 )
+        elif job.generation.scaffold:
+            if not SCAFFOLDS_AVAILABLE:
+                raise JobExecutionError(
+                    "Scaffold support not available. Install with: pip install spider[swe-scaffolds]"
+                )
+            logger.info("Job %s: starting scaffold trajectory generation", job_id)
+            events.emit(
+                "Launching scaffold trajectory generation pipeline.",
+                code="job.pipeline",
+                data={"mode": "scaffold", "scaffold_type": job.generation.scaffold.type}
+            )
+            result = _run_scaffold_job(
+                job_id,
+                job,
+                workspace=workspace,
+                job_env=job_env or {},
+            )
         else:
             logger.info("Job %s: starting off-policy generation pipeline", job_id)
             events.emit("Launching off-policy generation pipeline.", code="job.pipeline", data={"mode": "off_policy"})
@@ -239,6 +262,105 @@ def _run_tool_on_policy_job(
         if runtime_env:
             runtime_env.cleanup()
             events.emit("Runtime sandbox cleaned.", code="runtime.cleaned")
+
+
+def _run_scaffold_job(
+    job_id: str,
+    job: JobConfig,
+    *,
+    workspace: Path,
+    job_env: Dict[str, str],
+) -> JobExecutionResult:
+    """Run scaffold-based trajectory generation job."""
+    artifact_path = workspace / "result.jsonl"
+    metadata_path = workspace / "metadata.json"
+    
+    scaffold_config = job.generation.scaffold
+    if not scaffold_config:
+        raise JobExecutionError("Scaffold config is required for scaffold jobs")
+    
+    # Get dataset info from source config
+    dataset_name = job.source.dataset
+    split = job.source.split
+    
+    # Convert JobConfig scaffold config to ScaffoldConfig
+    scaffold_base_config = ScaffoldConfig(
+        output_dir=workspace / "trajectories",
+        max_instances=job.generation.max_batch_size,
+        num_workers=scaffold_config.num_workers,
+        timeout_seconds=scaffold_config.timeout_seconds,
+        max_retries=scaffold_config.max_retries,
+    )
+    
+    # Create scaffold-specific config
+    if scaffold_config.type == "openhands":
+        oh_config = OpenHandsScaffoldConfig(
+            **scaffold_base_config.model_dump(),
+            dataset=dataset_name,
+            split=split,
+            agent_class=scaffold_config.agent_class or "CodeActAgent",
+            max_iterations=scaffold_config.max_iterations or 50,
+            llm_config_name=scaffold_config.llm_config_name,
+            llm_model=scaffold_config.llm_model,
+            llm_api_key=scaffold_config.llm_api_key or job_env.get("LLM_API_KEY"),
+            llm_base_url=scaffold_config.llm_base_url or job_env.get("LLM_BASE_URL"),
+            enable_browser=scaffold_config.scaffold_specific.get("enable_browser", False),
+            enable_llm_editor=scaffold_config.scaffold_specific.get("enable_llm_editor", False),
+            runtime=scaffold_config.scaffold_specific.get("runtime", "docker"),
+            platform=scaffold_config.scaffold_specific.get("platform", "linux/amd64"),
+            remote_runtime_resource_factor=scaffold_config.scaffold_specific.get("remote_runtime_resource_factor", 1),
+        )
+        scaffold: Scaffold = OpenHandsScaffold(oh_config)
+    else:
+        raise JobExecutionError(f"Unsupported scaffold type: {scaffold_config.type}")
+    
+    # Run scaffold
+    events.emit(
+        f"Running {scaffold_config.type} scaffold on dataset {dataset_name}",
+        code="scaffold.started",
+        data={"scaffold_type": scaffold_config.type, "dataset": dataset_name}
+    )
+    
+    try:
+        output_path = scaffold.run_batch(
+            dataset_name=dataset_name,
+            split=split,
+            instance_filter=None,  # Could add to config later
+        )
+        
+        # Copy output to artifact path (Spider expects result.jsonl)
+        import shutil
+        if output_path != artifact_path:
+            shutil.copy(output_path, artifact_path)
+        
+        # Count records
+        record_count = 0
+        if artifact_path.exists():
+            with artifact_path.open("r", encoding="utf-8") as f:
+                record_count = sum(1 for line in f if line.strip())
+        
+        events.emit(
+            f"Generated {record_count} trajectories",
+            code="scaffold.completed",
+            data={"records": record_count}
+        )
+        
+        # Write metadata
+        _write_metadata(
+            metadata_path,
+            _job_snapshot(job),
+            record_count
+        )
+        
+        return JobExecutionResult(
+            artifacts_path=artifact_path,
+            metadata_path=metadata_path,
+            metrics={"records": record_count},
+            messages=[f"Generated {record_count} trajectories using {scaffold_config.type} scaffold"]
+        )
+    except Exception as exc:
+        logger.exception("Scaffold job %s failed", job_id)
+        raise JobExecutionError(f"Scaffold execution failed: {exc}") from exc
 
 
 @contextmanager
