@@ -200,7 +200,6 @@ def _run_tool_on_policy_job(
         raise JobExecutionError("Tool-aware on-policy jobs require at least one tool.")
     
     runtime_env, runtime_stack, _ = _prepare_runtime_env(job, job_env)
-    backend = _resolve_rollout_backend(job)
     
     pre_processor, _, prompts = _prepare_processors_and_prompts(
         job=job,
@@ -216,14 +215,6 @@ def _run_tool_on_policy_job(
             data={"tool_names": sorted(tool_registry.keys())}
         )
 
-    rollout_stream = _tool_rollout_stream(
-        job_id=job_id,
-        job=job,
-        backend=backend,
-        prompts=prompts,
-        tool_registry=tool_registry,
-    )
-
     try:
         return run_on_policy_job(
             job_id,
@@ -231,10 +222,9 @@ def _run_tool_on_policy_job(
             workspace=workspace,
             job_env=job_env,
             prompts=prompts,
-            rollout_stream=rollout_stream,
+            tool_registry=tool_registry,
         )
     finally:
-        _shutdown_backend(job_id, backend)
         runtime_stack.close()
         if runtime_env:
             runtime_env.cleanup()
@@ -391,41 +381,6 @@ def _build_batch_worker(
         ),
         dict(backend.metrics() or {})
     )
-
-def _tool_rollout_stream(
-    *,
-    job_id: str,
-    job: JobConfig,
-    backend: Any,
-    prompts: List[str],
-    tool_registry: Dict[str, Callable[..., Any]],
-) -> Iterable[List[Dict[str, Any]]]:
-    batch_worker = _build_batch_worker(
-        job_id=job_id,
-        job=job,
-        backend=backend,
-        post_processor=None,
-        tool_registry=tool_registry,
-    )
-    batch_size = _resolve_batch_size(job, prompts)
-    total_batches = (len(prompts) + batch_size - 1) // batch_size
-
-    for batch_index, start in enumerate(range(0, len(prompts), batch_size)):
-        chunk = prompts[start: start + batch_size]
-        future, metrics = batch_worker(chunk)
-        records = future.result()
-        events.emit(
-            "Tool rollout batch ready.",
-            code="tool_on_policy.batch_ready",
-            data={
-                "batch_index": batch_index,
-                "batch_size": len(chunk),
-                "total_batches": total_batches,
-                "metrics": metrics,
-            },
-        )
-        if records:
-            yield records
 
 def _pair_records(prompts: Iterable[str], generations: Iterable[str]) -> List[Dict[str, Any]]:
     paired = []
@@ -828,23 +783,6 @@ def _prepare_runtime_env(
         logger.info("Job %s: runtime sandbox prepared and activated.", job.metadata.get("job_id", ""))
 
     return runtime_env, runtime_stack, merged_env
-
-def _resolve_rollout_backend(job: JobConfig):
-    model_config = job.model
-    provider = (model_config.provider or "").lower()
-    if provider == "tinker":
-        base_model_name = model_config.name
-        if not base_model_name:
-            raise JobExecutionError("Tool-aware on-policy jobs require `job.model.name` to resolve rollout backend.")
-
-        model_config = ModelConfig(
-            provider="vllm",
-            name=base_model_name,
-            parameters=dict(model_config.parameters or {})
-        )
-    
-    _ensure_tensor_parallel(job)
-    return create_backend(model_config)
 
 def _prepare_processors_and_prompts(
     *,

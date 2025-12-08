@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio, logging, os, shutil, tarfile, urllib.request, zipfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional
+from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional, Callable
 from urllib.parse import urlparse
 import blobfile
 
@@ -60,29 +60,46 @@ class PromptListDatasetBuilder(RLDatasetBuilder):
         )
         return dataset, None
 
-class ToolRolloutDatasetBuilder(RLDatasetBuilder):
-    def __init__(
-        self,
-        prompt_batches: Iterable[RolloutBatch],
-        dataset_name: str,
-        renderer_name: str,
-        model_name_for_tokenizer: str,
-    ) -> None:
-        object.__setattr__(self, "_prompt_batches", prompt_batches)
-        object.__setattr__(self, "_dataset_name", dataset_name)
-        object.__setattr__(self, "_renderer_name", renderer_name)
-        object.__setattr__(self, "_model_name", model_name_for_tokenizer)
+class _StudentSamplerContext:
+    def __init__(self, *, job_id: str, job: JobConfig) -> None:
+        self._job_id = job_id
+        self._job = job
+        self._client = None
+        self._student_client = None
+        self._service_client = None
 
-        async def __call__(self) -> tuple[RLDataset, RLDataset | None]:
-            tokenizer = get_tokenizer(self._model_name)
-            renderer = renderers.get_renderer(self._renderer_name, tokenizer=tokenizer)
-            dataset = ToolRolloutDataset(
-                prompt_batches=self._prompt_batches,
-                renderer=renderer,
-                tokenizer=tokenizer,
-                dataset_name=self._dataset_name,
+    def __enter__(self) -> Any:
+        from .executor import JobExecutionError
+
+        if self._student_client is not None:
+            return self._student_client
+
+        model_name = self._job.model.name
+        if not model_name:
+            raise JobExecutionError(
+                "job.model.name must be provided to create a Tinker sampling client."
             )
-            return dataset, None
+
+        self._service_client = tinker.ServiceClient()
+        self._student_client = self._service_client.create_sampling_client(
+            base_model=model_name,
+        )
+
+        return self._student_client
+
+    def refresh_from_sampler_path(self, sampler_path: str) -> Any:
+        if not self._service_client:
+            raise RuntimeError("Student sampler is not initialized.")
+
+        self._student_client = self._service_client.create_sampling_client(
+            model_path=sampler_path,
+        )
+        return self._student_client
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._student_client = None
+        self._service_client = None
+        
 
 @contextmanager
 def _temporary_api_key(api_key: str | None):
@@ -115,7 +132,7 @@ def run_on_policy_job(
     workspace: Path,
     job_env: dict[str, str],
     prompts: Optional[List[str]],
-    rollout_stream: Optional[Iterable[RolloutBatch]] = None,
+    tool_registry: Optional[Dict[str, Callable[..., Any]]] = None,
 ):
     from .executor import (
         JobExecutionResult,
@@ -124,6 +141,8 @@ def run_on_policy_job(
         _resolve_processor,
         _summarize_metrics,
         _write_metadata,
+        _shutdown_backend,
+        _tool_batch_worker,
     )
     options = job.generation.on_policy_options
     if not options:
@@ -146,10 +165,23 @@ def run_on_policy_job(
         student_model,
         len(prompts),
         use_gold_alignment,
-        bool(rollout_stream),
+        bool(tool_registry),
     )
-    
-    if rollout_stream:
+
+    sampler_ctx = None
+    student_client = None
+    if tool_registry:
+        sampler_ctx = _StudentSamplerContext(job_id=job_id, job=job)
+        student_client = sampler_ctx.__enter__()
+
+        rollout_stream = _tool_rollout_stream(
+            job_id=job_id,
+            job=job,
+            student_client=student_client,
+            prompts=prompt_list,
+            tool_registry=tool_registry,
+            batch_worker=_tool_batch_worker,
+        )
         events.emit(
             "Finished Setup for tool rollouts streaming for on-policy distillation.",
             code="on_policy.tool_rollouts_stream"
@@ -180,11 +212,14 @@ def run_on_policy_job(
             level="warning",
             code="on_policy.no_prompts",
         )
-        return JobExecutionResult(
+        result = JobExecutionResult(
             artifacts_path=artifact_path,
             metrics={"records": 0},
             messages=["No prompts found, skipped on-policy distillation."]
         )
+        if sampler_ctx:
+            sampler_ctx.__exit__(None, None, None)
+        return result
     
     renderer_name = model_info.get_recommended_renderer_name(student_model)
 
@@ -315,13 +350,53 @@ def run_on_policy_job(
         code="on_policy.completed",
         data={"training_batches": metrics["training_batches"]}
     )
-    return JobExecutionResult(
+    result = JobExecutionResult(
         artifacts_path=artifact_path,
         metadata_path=metadata_path,
         upload_source=hf_payload_dir,
         metrics=metrics,
         messages=["On-policy distillation completed."]
     )
+    if sampler_ctx:
+        sampler_ctx.__exit__(None, None, None)
+    return result
+
+def _tool_rollout_stream(
+    *,
+    job_id: str,
+    job: JobConfig,
+    student_client: Any,
+    prompts: List[str],
+    tool_registry: Dict[str, Callable[..., Any]],
+    batch_worker: Callable[..., Any],
+) -> Iterable[List[Dict[str, Any]]]:
+    from .executor import _resolve_batch_size
+
+    batch_size = _resolve_batch_size(job, prompts)
+    total_batches = (len(prompts) + batch_size - 1) // batch_size
+
+    for batch_index, start in enumerate(range(0, len(prompts), batch_size)):
+        chunk = prompts[start: start + batch_size]
+        future = batch_worker(
+            job_id=job_id,
+            prompts=chunk,
+            backend=student_client,
+            job=job,
+            post_processor=None,
+            tool_registry=tool_registry,
+        )
+        records = future.result()
+        events.emit(
+            "Tool rollout batch ready.",
+            code="tool_on_policy.batch_ready",
+            data={
+                "batch_index": batch_index,
+                "batch_size": len(chunk),
+                "total_batches": total_batches,
+            }
+        )
+        if records:
+            yield records
 
 def _configure_tinker_logging() -> None:
     stream_formatter = logging.Formatter("[tinker] %(message)s")
