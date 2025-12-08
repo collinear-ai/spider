@@ -3,6 +3,7 @@ from __future__ import annotations
 import json, asyncio, logging
 from pathlib import Path
 
+import chz
 from datasets import Dataset, load_dataset
 
 from tinker_cookbook import checkpoint_utils, model_info, renderers
@@ -23,6 +24,7 @@ from server.on_policy import _prepare_hf_payload
 
 LOGGER = logging.getLogger(__name__)
 
+@chz.chz
 class OpenThoughts3DatasetBuilder(ChatDatasetBuilder):
     dataset_name: str
     split: str
