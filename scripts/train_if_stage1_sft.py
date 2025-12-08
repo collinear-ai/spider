@@ -87,7 +87,6 @@ def run_training(
     lr,
     num_epochs,
     save_every,
-    eval_every,
 ) -> dict:
     dataset_builder = build_dataset_builder(
         dataset_name=dataset_name,
@@ -107,7 +106,6 @@ def run_training(
         learning_rate=lr,
         num_epochs=num_epochs,
         save_every=save_every,
-        eval_every=eval_every,
     )
     LOGGER.info("Starting Stage 1 SFT training. Log at %s", run_log_dir)
     asyncio.run(train.main(config))
@@ -132,14 +130,15 @@ def main():
     
     checkpoint, training_dir = run_training(
         dataset_name="collinear-ai/OpenThoughts3-1.2M-code-only",
-        split="random_50k[0:10000]",
+        # split="random_50k[0:10000]",
+        split="random_50k[0:4]",
         base_model="Qwen/Qwen3-4B-Instruct-2507",
         max_length=16384,
-        batch_size=128,
+        # batch_size=128,
+        batch_size=4,
         lr=8e-5,
         num_epochs=3,
         save_every=256,
-        eval_every=256,
     )
     manifest_path = Path("logs/stage1_sft_manifest.json")
     write_manifest(manifest_path, checkpoint)
