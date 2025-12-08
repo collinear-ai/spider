@@ -282,7 +282,7 @@ def run_on_policy_job(
         enable_trace=False,
         eval_every=options.eval_every,
         save_every=options.save_every,
-        load_checkpoint_path=None,
+        load_checkpoint_path=options.student_checkpoint_path,
         use_gold_alignment=use_gold_alignment,
     )
 

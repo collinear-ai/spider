@@ -67,6 +67,10 @@ class OnPolicyConfig(BaseModel):
     )
     eval_every: int = Field(default=20, ge=0)
     save_every: int = Field(default=20, ge=0)
+    student_checkpoint_path: Optional[str] = Field(
+        default=None,
+        description="Optional tinker:// URI to resume to student from a prior checkpoint"
+    )
 
 class GenerationConfig(BaseModel):
     duplications: int = Field(default=1, ge=1)
