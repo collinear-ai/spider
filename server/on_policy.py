@@ -170,6 +170,7 @@ def run_on_policy_job(
 
     sampler_ctx = None
     student_client = None
+    rollout_stream = None
     if tool_registry:
         sampler_ctx = _StudentSamplerContext(job_id=job_id, job=job)
         student_client = sampler_ctx.__enter__()
@@ -221,25 +222,29 @@ def run_on_policy_job(
             sampler_ctx.__exit__(None, None, None)
         return result
     
+    if rollout_stream:
+        return _run_tool_on_policy_stream(
+            job_id=job_id,
+            job=job,
+            options=options,
+            workspace=workspace,
+            rollout_stream=rollout_stream,
+            sampler_ctx=sampler_ctx,
+            metadata_path=metadata_path,
+            artifact_path=artifact_path,
+        )
+        
     renderer_name = model_info.get_recommended_renderer_name(student_model)
 
     dataset_builder: RLDatasetBuilder
-    if rollout_stream:
-        dataset_builder = ToolRolloutDatasetBuilder(
-            prompt_batches=rollout_stream,
-            dataset_name=(job.source.dataset or "prompts"), # does this not have option args
-            renderer_name=renderer_name,
-            model_name_for_tokenizer=student_model,
-        )
-    else:
-        dataset_builder = PromptListDatasetBuilder(
-            prompts=prompt_list,
-            dataset_name=(job.source.dataset or "prompts"),
-            groups_per_batch=options.groups_per_batch,
-            group_size=options.group_size,
-            renderer_name=renderer_name,
-            model_name_for_tokenizer=student_model,
-        )
+    dataset_builder = PromptListDatasetBuilder(
+        prompts=prompt_list,
+        dataset_name=(job.source.dataset or "prompts"),
+        groups_per_batch=options.groups_per_batch,
+        group_size=options.group_size,
+        renderer_name=renderer_name,
+        model_name_for_tokenizer=student_model,
+    )
 
     teacher_config = TeacherConfig(base_model=options.teacher)
     dataset_config = DistillationDatasetConfig(
