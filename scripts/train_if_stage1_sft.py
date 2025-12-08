@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import argparse, json, asyncio, hashlib, logging
+import json, asyncio, logging
 from pathlib import Path
-from typing import Iterable, List
 
 from datasets import Dataset, load_dataset
 
@@ -17,6 +16,10 @@ from tinker_cookbook.supervised.types import (
     ChatDatasetBuilder,
     ChatDatasetBuilderCommonConfig,
 )
+
+from spider.config import HFUploadConfig
+from server.hf_upload import publish_to_hub
+from server.on_policy import _prepare_hf_payload
 
 LOGGER = logging.getLogger(__name__)
 
@@ -112,7 +115,7 @@ def run_training(
     checkpoint = checkpoint_utils.get_last_checkpoint(str(run_log_dir), required_key="state_path")
     if not checkpoint:
         raise RuntimeError("No checkpoint produced. Cannot continue.")
-    return checkpoint
+    return checkpoint, run_log_dir
 
 def write_manifest(manifest_path, checkpoint):
     payload = {
@@ -127,7 +130,7 @@ def write_manifest(manifest_path, checkpoint):
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     
-    checkpoint = run_training(
+    checkpoint, training_dir = run_training(
         dataset_name="collinear-ai/OpenThoughts3-1.2M-code-only",
         split="random_50k[0:10000]",
         base_model="Qwen/Qwen3-4B-Instruct-2507",
@@ -138,7 +141,27 @@ def main():
         save_every=256,
         eval_every=256,
     )
-    write_manifest(Path("logs/stage1_sft_manifest.json"), checkpoint)
+    manifest_path = Path("logs/stage1_sft_manifest.json")
+    write_manifest(manifest_path, checkpoint)
+
+    repo_id = "collinear-ai/Qwen3-4B-Instruct-2507-OpenThoughts3-code-only-10k"
+    hf_config = HFUploadConfig(
+        repo_id=repo_id,
+        repo_type="model",
+        private=False,
+    )
+    payload_dir, _, _ = _prepare_hf_payload(
+        training_dir=training_dir,
+        checkpoint=checkpoint,
+        workspace=training_dir,
+    )
+    publish_to_hub(
+        job_id="stage1-sft",
+        artifact=payload_dir,
+        metadata=manifest_path,
+        config=hf_config,
+    )
+    LOGGER.info("Uploaded Stage 1 LoRA artifacts to %s", repo_id)
 
 if __name__ == "__main__":
     main()

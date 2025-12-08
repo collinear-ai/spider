@@ -36,9 +36,11 @@ def main():
     if not checkpoint_uri:
         raise ValueError("Stage 1 manifest missing state checkpoint URI.")
     configure_on_policy(config, checkpoint_uri)
+
+    env = {"TINKER_API_KEY": os.environ.get("TINKER_API_KEY")}
     
     logger = logging.getLogger(__name__)
-    with SpiderClient(config=config) as client:
+    with SpiderClient(config=config, env=env) as client:
         logger.info("Submitting stage 2 on-policy job with checkpoint %s", checkpoint_uri)
         submission = client.submit_job()
         job_id = submission["job_id"]
