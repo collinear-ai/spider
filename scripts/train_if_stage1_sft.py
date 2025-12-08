@@ -27,11 +27,17 @@ LOGGER = logging.getLogger(__name__)
 @chz.chz
 class OpenThoughts3DatasetBuilder(ChatDatasetBuilder):
     dataset_name: str
+    dataset_config: str
     split: str
     
     def __call__(self):
-        LOGGER.info("Loading %s split=%s", self.dataset_name, self.split)
-        ds = load_dataset(self.dataset_name, split=self.split)
+        LOGGER.info(
+            "Loading %s config=%s split=%s", 
+            self.dataset_name, 
+            self.dataset_config or "default",
+            self.split or "train",
+        )
+        ds = load_dataset(self.dataset_name, self.dataset_config, split=self.split)
 
         renderer = self.renderer
         train_on = (
@@ -61,6 +67,7 @@ class OpenThoughts3DatasetBuilder(ChatDatasetBuilder):
 
 def build_dataset_builder(
     dataset_name,
+    dataset_config,
     split,
     base_model,
     max_length,
@@ -77,11 +84,13 @@ def build_dataset_builder(
     return OpenThoughts3DatasetBuilder(
         common_config=common,
         dataset_name=dataset_name,
+        dataset_config=dataset_config,
         split=split,
     )
 
 def run_training(
     dataset_name,
+    dataset_config,
     split,
     base_model,
     max_length,
@@ -92,6 +101,7 @@ def run_training(
 ) -> dict:
     dataset_builder = build_dataset_builder(
         dataset_name=dataset_name,
+        dataset_config=dataset_config,
         split=split,
         base_model=base_model,
         max_length=max_length,
@@ -132,8 +142,9 @@ def main():
     
     checkpoint, training_dir = run_training(
         dataset_name="collinear-ai/OpenThoughts3-1.2M-code-only",
-        # split="random_50k[0:10000]",
-        split="random_50k[0:4]",
+        dataset_config="random_50k",
+        # split="train[0:10000]",
+        split="train[0:4]",
         base_model="Qwen/Qwen3-4B-Instruct-2507",
         max_length=16384,
         # batch_size=128,
