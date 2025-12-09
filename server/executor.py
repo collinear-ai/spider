@@ -539,6 +539,7 @@ def _tool_batch_worker(
     job: JobConfig,
     post_processor: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]],
     tool_registry: Dict[str, Callable[..., Any]],
+    include_logprobs: bool = False,
 ) -> List[Dict[str, Any]]:
     tool_defs = _tool_descriptors(job.tools)
 
@@ -550,7 +551,7 @@ def _tool_batch_worker(
 
     def run_prompt(prompt):
         try:
-            transcript = _run_prompt_with_tools(
+            transcript, token_ids, logprobs, reward_mask = _run_prompt_with_tools(
                 backend=backend,
                 job=job,
                 prompt=prompt,
@@ -558,6 +559,7 @@ def _tool_batch_worker(
                 tool_registry=tool_registry,
                 turn_limit=turn_limit,
                 job_id=job_id,
+                include_logprobs=include_logprobs,
             )
         except Exception as exc:
             logger.exception("Job %s: prompt worker crashed while handling `%s`.", job_id, prompt[:20])
@@ -570,6 +572,15 @@ def _tool_batch_worker(
             )
             raise
         record = {"prompt": prompt, "completion": transcript}
+        if include_logprobs:
+            record = {
+                "prompt": prompt,
+                "completion": transcript,
+                "token_ids": token_ids,
+                "logprobs": logprobs,
+                "reward_mask": reward_mask,
+            }
+
         if post_processor:
             processed = post_processor(record)
             if processed is None:
@@ -648,9 +659,14 @@ def _run_prompt_with_tools(
     tool_registry: Dict[str, Callable[..., Any]],
     turn_limit: int,
     job_id: str,
-) -> List[Dict[str, Any]]:
+    include_logprobs: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[int], List[float], List[int]]:
     history = _initial_chat_history(prompt, job)
     transcript = []
+
+    all_token_ids = []
+    all_logprobs = []
+    all_reward_masks = []
     
     prompt_preview = prompt.replace("\n", "\\n")
     prompt_preview = prompt_preview[:40] + ("..." if len(prompt_preview) > 80 else "")
@@ -663,11 +679,13 @@ def _run_prompt_with_tools(
             turn_idx,
             prompt_preview
         )
+        # TODO: only return full logprob for the last turn
         assistant_message = _call_backend_chat(
             backend=backend,
             messages=history,
             tools=tool_defs,
             parameters=job.generation.parameters,
+            include_logprobs=include_logprobs,
         )
         logger.info(
             "Job %s: assistant turn %d for prompt `%s` returned keys=%s tool_calls=%s",
@@ -682,6 +700,15 @@ def _run_prompt_with_tools(
             "content": assistant_message.get("content", ""),
             "tool_calls": assistant_message.get("tool_calls"),
         }
+
+        token_ids = assistant_message.get("token_ids") or []
+        logprobs = assistant_message.get("logprobs") or []
+        reward_mask = assistant_message.get("reward_mask") or []
+        if include_logprobs:
+            all_token_ids.extend(token_ids)
+            all_logprobs.extend(logprobs)
+            all_reward_masks.extend(reward_mask)
+
         transcript.append(snapshot)
         history.append(snapshot)
         tool_calls = assistant_message.get("tool_calls") or []
@@ -691,7 +718,7 @@ def _run_prompt_with_tools(
                 job_id,
                 prompt_preview,
             )
-            return transcript
+            return transcript, all_token_ids, all_logprobs, all_reward_masks
         
         for call in tool_calls:
             function_call = call.get("function") or {}
@@ -803,7 +830,17 @@ def _call_backend_chat(
     messages: List[Dict[str, Any]],
     tools: List[Dict[str, Any]],
     parameters: Dict[str, Any],
+    include_logprobs: bool = False,
 ) -> Dict[str, Any]:
+    if _is_tinker_backend(backend):
+        return _tinker_chat_and_logprobs(
+            sampling_client=backend,
+            messages=messages,
+            tools=tools,
+            parameters=parameters,
+            include_logprobs=include_logprobs
+        )
+
     chat_fn = getattr(backend, "chat", None)
     if not callable(chat_fn):
         raise JobExecutionError("Backend does not support chat tool calls.")
@@ -812,11 +849,14 @@ def _call_backend_chat(
         len(messages),
         bool(tools)
     )
+    
+    params = dict(parameters or {})
+
     try:
         response = chat_fn(
             messages=messages,
             tools=tools or None,
-            parameters=dict(parameters or {})
+            parameters=params,
         )
         logger.info(
             "Chat call returned successfully (tool_calls=%s)",
@@ -826,6 +866,17 @@ def _call_backend_chat(
     except Exception as exc:
         logger.exception("Chat backend failed: %s", exc)
         raise JobExecutionError(f"Chat backend failed: {exc}") from exc
+
+def _tinker_chat_and_logprobs(
+    *,
+    sampling_client: Any,
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    parameters: Dict[str, Any],
+    include_logprobs: bool,
+) -> Dict[str, Any]:
+    from tinker_cookbook import renderers, model_info
+    # TODO: finish chat and logprobs computation
 
 def _initial_chat_history(prompt: str, job: JobConfig) -> List[Dict[str, Any]]:
     history = []
@@ -945,3 +996,7 @@ def _shutdown_backend(job_id: str, backend: Any) -> None:
             close()
         except Exception as exc:
             logger.warning("Job %s: backend shutdown raised %s", job_id, exc)
+
+def _is_tinker_backend(backend: Any) -> bool:
+    import tinker
+    return isinstance(backend, tinker.SamplingClient)

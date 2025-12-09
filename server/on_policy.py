@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio, logging, os, shutil, tarfile, urllib.request, zipfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional, Callable
+from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional, Callable, TypedDict
 from urllib.parse import urlparse
 import blobfile
 
@@ -26,6 +26,13 @@ from .writers import JSONLBatchWriter
 RolloutBatch = List[Dict[str, Any]]
 
 logger = logging.getLogger(__name__)
+
+class ToolRolloutTrajectory(TypedDict):
+    prompt: str
+    transcript: List[Dict[str, Any]]
+    token_ids: List[int]
+    logprobs: List[float]
+    reward_mask: List[int]
 
 class PromptListDatasetBuilder(RLDatasetBuilder):
     def __init__(
@@ -100,6 +107,14 @@ class _StudentSamplerContext:
         self._student_client = None
         self._service_client = None
         
+def _create_shared_student_sampler(
+    *,
+    job_id: str,
+    job: JobConfig,
+) -> tuple[_StudentSamplerContext, Any]:
+    ctx = _StudentSamplerContext(job_id=job_id, job=job)
+    client = ctx.__enter__()
+    return ctx, client
 
 @contextmanager
 def _temporary_api_key(api_key: str | None):
@@ -172,8 +187,7 @@ def run_on_policy_job(
     student_client = None
     rollout_stream = None
     if tool_registry:
-        sampler_ctx = _StudentSamplerContext(job_id=job_id, job=job)
-        student_client = sampler_ctx.__enter__()
+        sampler_ctx, student_client = _create_shared_student_sampler(job_id=job_id, job=job)
 
         rollout_stream = _tool_rollout_stream(
             job_id=job_id,
@@ -374,7 +388,7 @@ def _tool_rollout_stream(
     prompts: List[str],
     tool_registry: Dict[str, Callable[..., Any]],
     batch_worker: Callable[..., Any],
-) -> Iterable[List[Dict[str, Any]]]:
+) -> Iterable[List[ToolRolloutTrajectory]]:
     from .executor import _resolve_batch_size
 
     batch_size = _resolve_batch_size(job, prompts)
@@ -389,8 +403,9 @@ def _tool_rollout_stream(
             job=job,
             post_processor=None,
             tool_registry=tool_registry,
+            include_logprobs=True,
         )
-        records = future.result()
+        trajectories = future.result()
         events.emit(
             "Tool rollout batch ready.",
             code="tool_on_policy.batch_ready",
@@ -400,8 +415,8 @@ def _tool_rollout_stream(
                 "total_batches": total_batches,
             }
         )
-        if records:
-            yield records
+        if trajectories:
+            yield trajectories
 
 def _configure_tinker_logging() -> None:
     stream_formatter = logging.Formatter("[tinker] %(message)s")
