@@ -123,9 +123,9 @@ job:
       private: false
 ```
 
-## SWE-Bench Trajectory Generation
+## SWE Trajectory Generation
 
-Spider includes an OpenHands wrapper for generating agent trajectories on SWE-bench datasets (e.g., SWE-smith). This allows you to generate high-quality coding agent trajectories and automatically push them to HuggingFace as proper Dataset objects.
+Spider includes an OpenHands wrapper for generating agent trajectories on SWE datasets (e.g., SWE-smith). This allows you to generate high-quality coding agent trajectories and automatically push them to HuggingFace.
 
 ### Installation Requirements
 
@@ -145,7 +145,7 @@ pip install -e ".[server]"
 ### Configuration
 
 Create a config file for your SWE trajectory generation. See example configs:
-- `config/swe/example-openai-config.yaml` - For OpenAI/Anthropic
+- `config/swe/example-openai-config.yaml` - For OpenAI/Anthropic, etc..
 - `config/swe/example-vllm-config.yaml` - For vLLM or other providers
 
 **Basic example (OpenAI):**
@@ -219,7 +219,7 @@ This will:
 1. Download the SWE-smith dataset
 2. Generate agent trajectories using OpenHands
 3. Save results to `trajectories/` with logs per instance
-4. Automatically upload to HuggingFace Hub as a proper Dataset
+4. Automatically upload to HuggingFace Hub 
 
 ### Output Structure
 
@@ -236,13 +236,28 @@ trajectories/
                 └── ...
 ```
 
+### Dataset Format
+
+The uploaded HuggingFace Dataset includes:
+
+- **`messages`**: Chat format for training (list of `{"role": "user/assistant", "content": "..."}`)
+- **`trajectory`**: Raw OpenHands events for reference
+- **`instance_id`**, **`repo`**, **`image_name`**: Task identifiers
+- **`instruction`**, **`problem_statement`**: Task descriptions
+- **`git_patch`**: Generated code changes
+- **`metrics`**, **`resolved`**: Evaluation results
+- **`model`**, **`agent_class`**, **`max_iterations`**: Generation metadata
+
+
+
 ### HuggingFace Upload
 
 **Automatic Upload (during generation):**
 - Happens automatically after trajectory generation completes
 - Requires `HF_TOKEN` environment variable
+- Converts trajectories to training-ready `messages` format
 
-**Manual Upload :**
+**Manual Upload:**
 
 ```bash
 # Edit the script to set your paths
