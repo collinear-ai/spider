@@ -698,79 +698,145 @@ class OpenHandsScaffold(Scaffold):
         return cleaned if cleaned else None
     
     def _trajectory_to_messages(self, trajectory: list[Dict[str, Any]]) -> list[Dict[str, str]]:
-        """Convert OpenHands trajectory to chat format (role/content).
+        """Convert OpenHands trajectory to OpenAI function calling format.
         
-        Returns list of dicts with 'role' and 'content' keys for training.
+        Returns list of messages in OpenAI format with tool_calls.
+        Matches SWE-Gym/OpenHands-Sampled-Trajectories format.
         """
-        messages = []
+        import json
         
-        for turn in trajectory:
+        messages = []
+        i = 0
+        
+        # Add system message first (from first event if it's a system message)
+        if trajectory and trajectory[0].get('action') == 'system':
+            system_content = trajectory[0].get('args', {}).get('content', '') or trajectory[0].get('message', '')
+            if system_content:
+                messages.append({
+                    "role": "system",
+                    "content": system_content,
+                    "function_call": None,
+                    "name": None,
+                    "tool_call_id": None,
+                    "tool_calls": None
+                })
+            i = 1  # Skip the system message
+        
+        while i < len(trajectory):
+            turn = trajectory[i]
             source = turn.get("source", "")
             action = turn.get("action", "")
             
-            # Map OpenHands events to chat roles
-            if source == "user":
-                # User messages
+            # Handle user messages
+            if source == "user" and action == "message":
                 content = turn.get("args", {}).get("content", "") or turn.get("message", "")
                 if content:
                     messages.append({
                         "role": "user",
-                        "content": content
+                        "content": content,
+                        "function_call": None,
+                        "name": None,
+                        "tool_call_id": None,
+                        "tool_calls": None
                     })
-            elif source == "agent":
-                # Agent actions and thoughts
-                if action == "message":
-                    # Agent message/response
-                    content = turn.get("args", {}).get("content", "")
-                    if content:
+                i += 1
+                continue
+            
+            # Handle agent tool calls (actions)
+            if source == "agent" and action in ["run", "run_ipython", "read", "write", "edit", "browse", "str_replace", "task_tracking"]:
+                tool_call_metadata = turn.get('tool_call_metadata', {})
+                tool_call_id = tool_call_metadata.get('tool_call_id', turn.get('id', f"call_{i}"))
+                
+                # Create tool call
+                args = turn.get("args", {})
+                tool_calls = [{
+                    "function": {
+                        "arguments": json.dumps(args),
+                        "name": action
+                    },
+                    "id": tool_call_id,
+                    "index": None,
+                    "type": "function"
+                }]
+                
+                messages.append({
+                    "role": "assistant",
+                    "content": turn.get("message", "") or "",
+                    "function_call": None,
+                    "name": None,
+                    "tool_call_id": None,
+                    "tool_calls": tool_calls
+                })
+                
+                # Check for observation in next event
+                if i + 1 < len(trajectory):
+                    next_turn = trajectory[i + 1]
+                    if 'content' in next_turn and next_turn.get('source') in ['agent', 'environment']:
+                        obs_content = next_turn.get("content", "")
+                        # Limit observation length
+                        if len(obs_content) > 50000:
+                            obs_content = obs_content[:50000] + "\n... (output truncated)"
+                        
                         messages.append({
-                            "role": "assistant",
-                            "content": content
+                            "role": "tool",
+                            "content": f"OBSERVATION:\n{obs_content}",
+                            "function_call": None,
+                            "name": action,
+                            "tool_call_id": tool_call_id,
+                            "tool_calls": None
                         })
-                elif action in ["run", "run_ipython", "read", "write", "edit", "browse"]:
-                    # Agent tool use - format as assistant message
-                    args = turn.get("args", {})
-                    observation = turn.get("observation", "")
-                    
-                    # Format the action as a message
-                    if action == "run":
-                        content = f"Running command: {args.get('command', '')}"
-                        if observation:
-                            content += f"\n\nOutput:\n{observation}"
-                    elif action == "run_ipython":
-                        content = f"Running Python:\n```python\n{args.get('code', '')}\n```"
-                        if observation:
-                            content += f"\n\nOutput:\n{observation}"
-                    elif action == "read":
-                        content = f"Reading file: {args.get('path', '')}"
-                        if observation:
-                            content += f"\n\n{observation}"
-                    elif action == "write":
-                        content = f"Writing to file: {args.get('path', '')}\n```\n{args.get('content', '')}\n```"
-                    elif action == "edit":
-                        content = f"Editing file: {args.get('path', '')}"
-                    elif action == "browse":
-                        content = f"Browsing: {args.get('url', '')}"
-                    
-                    if content:
-                        messages.append({
-                            "role": "assistant",
-                            "content": content
-                        })
+                        i += 1  # Skip observation
+                
+                i += 1
+                continue
+            
+            # Handle agent messages (non-tool responses)
+            if source == "agent" and action == "message":
+                content = turn.get("args", {}).get("content", "") or turn.get("message", "")
+                if content:
+                    messages.append({
+                        "role": "assistant",
+                        "content": content,
+                        "function_call": None,
+                        "name": None,
+                        "tool_call_id": None,
+                        "tool_calls": None
+                    })
+                i += 1
+                continue
+            
+            # Skip other events
+            i += 1
         
         return messages
     
-    def _transform_output_for_dataset(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        """Transform a single record to training format.
+    def _extract_tools_from_trajectory(self, trajectory: list[Dict[str, Any]]) -> list:
+        """Extract tools definition from trajectory.
         
-        Creates a dataset with 'messages' field (role/content format for training)
-        and 'trajectory' field (raw OpenHands events for reference).
+        OpenHands includes tool definitions in the first system message.
+        """
+        if trajectory and trajectory[0].get('action') == 'system':
+            tools = trajectory[0].get('args', {}).get('tools', [])
+            if tools:
+                return tools
+        
+        # If not in system message, return empty list
+        return []
+    
+    def _transform_output_for_dataset(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """Transform to OpenAI function calling format (matches SWE-Gym).
+        
+        Creates a dataset with 'messages' field (OpenAI format with tool_calls)
+        and 'tools' field (tools definition).
         """
         # Get raw trajectory
         trajectory = record.get("history", [])
         
-        # Convert to messages format for training
+        # Convert to messages format (OpenAI function calling)
         messages = self._trajectory_to_messages(trajectory)
+        
+        # Extract tools definition
+        tools = self._extract_tools_from_trajectory(trajectory)
         
         # Also clean trajectory for reference
         cleaned_trajectory = []
@@ -779,35 +845,46 @@ class OpenHandsScaffold(Scaffold):
             if cleaned_turn:
                 cleaned_trajectory.append(cleaned_turn)
         
-        return {
-            # Primary identifiers
+        # Get resolved from test_result.report.resolved (set by evaluation step)
+        # If not evaluated yet, this will be None
+        resolved = None
+        test_result = record.get("test_result", {})
+        if test_result and "report" in test_result:
+            resolved = test_result.get("report", {}).get("resolved")
+        
+        result = {
             "instance_id": record.get("instance_id"),
-            "repo": record.get("instance", {}).get("repo"),
-            "image_name": record.get("instance", {}).get("image_name"),
-            
-            # Task and result
-            "instruction": record.get("instruction"),
-            "messages": messages,  # Chat format for training!
-            "trajectory": cleaned_trajectory,  # Raw trajectory for reference
-            "git_patch": record.get("test_result", {}).get("git_patch") if record.get("test_result") else None,
-            
-            # Metadata (flattened)
-            "agent_class": record.get("metadata", {}).get("agent_class"),
-            "model": record.get("metadata", {}).get("llm_config", {}).get("model"),
-            "max_iterations": record.get("metadata", {}).get("max_iterations"),
-            
-            # Metrics
-            "metrics": self._clean_dict_for_parquet(record.get("metrics", {})),
-            
-            # Error (if any)
-            "error": record.get("error"),
-            
-            # Original instance data
-            "problem_statement": record.get("instance", {}).get("problem_statement"),
-            "hints_text": record.get("instance", {}).get("hints_text"),
-            "created_at": record.get("instance", {}).get("created_at"),
-            "resolved": record.get("test_result", {}).get("resolved") if record.get("test_result") else None,
+            "messages": messages,  # OpenAI format with tool_calls
+            "tools": tools,  # Tools definition
+            "resolved": resolved,  # True/False if evaluated, None if not
         }
+        
+        # Add optional metadata fields
+        if record.get("instance", {}).get("repo"):
+            result["repo"] = record.get("instance", {}).get("repo")
+        if record.get("instance", {}).get("image_name"):
+            result["image_name"] = record.get("instance", {}).get("image_name")
+        if record.get("instruction"):
+            result["instruction"] = record.get("instruction")
+        if record.get("test_result", {}).get("git_patch"):
+            result["git_patch"] = record.get("test_result", {}).get("git_patch")
+        if record.get("metadata", {}).get("agent_class"):
+            result["agent_class"] = record.get("metadata", {}).get("agent_class")
+        if record.get("metadata", {}).get("llm_config", {}).get("model"):
+            result["model"] = record.get("metadata", {}).get("llm_config", {}).get("model")
+        if record.get("metadata", {}).get("max_iterations"):
+            result["max_iterations"] = record.get("metadata", {}).get("max_iterations")
+        if self._clean_dict_for_parquet(record.get("metrics", {})):
+            result["metrics"] = self._clean_dict_for_parquet(record.get("metrics", {}))
+        if record.get("error"):
+            result["error"] = record.get("error")
+        if record.get("instance", {}).get("problem_statement"):
+            result["problem_statement"] = record.get("instance", {}).get("problem_statement")
+        
+        # Include raw trajectory for debugging
+        result["trajectory"] = cleaned_trajectory
+        
+        return result
     
     def _upload_to_huggingface(self, output_file: Path, metadata: EvalMetadata) -> str:
         """Upload trajectories to HuggingFace Hub as a proper Dataset.

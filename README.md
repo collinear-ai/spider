@@ -268,8 +268,25 @@ export HF_TOKEN="hf_..."
 python3 scripts/push_openhands_traj_dataset.py
 ```
 
+To evaluate trajectories and add the `resolved` field, run OpenHands evaluation:
+
+```bash
+cd /path/to/OpenHands
+# Evaluate generated trajectories
+python -m evaluation.swe_bench.eval_infer \
+  --dataset "your-org/your-dataset-name" \
+  --split "train" \
+  --input-file "path/to/output.jsonl" \
+  --output-dir "evaluation_results" \
+  --num-workers 8
+```
+
+This will apply patches, run tests in Docker, and update `output.jsonl` with `resolved=True/False`.
+
+
 ### Tips
 
 - Use `instance_filter` to focus on a single repository for faster iteration
 - Monitor logs in `trajectories/.../infer_logs/` for debugging
 - The first run per unique Docker image will be slower due to image building
+- Most trajectories will have `resolved=None` until you run evaluation
