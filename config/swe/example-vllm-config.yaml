@@ -1,50 +1,53 @@
 # Example config for SWE trajectory generation with vLLM
 # Copy this file and modify for your setup
 
-# Dataset configuration
-dataset: "SWE-bench/SWE-smith"
-split: "train"
-max_instances: 10  # Start small for testing
-instance_filter: "conan-io__conan.*"  # Optional: filter by repo
+scaffold:
+  type: openhands                    # Scaffold name: "openhands"
+  output_dir: "./trajectories"       # Where to save trajectories
 
-# Agent configuration
-agent_class: "CodeActAgent"
-max_iterations: 30
+  # Dataset configuration
+  dataset: "SWE-bench/SWE-smith"
+  split: "train"
+  max_instances: 1000  # Start small for testing
+  # instance_filter: "conan-io__conan.*"  # Optional: filter by repo
 
-# vLLM configuration
-llm_model: "Qwen/Qwen2.5-Coder-32B-Instruct"  # Your model name
-llm_base_url: "http://localhost:8000/v1"  # vLLM endpoint
-llm_api_key_env: "VLLM_API_KEY"  # Or use llm_api_key directly
+  # Agent configuration
+  agent_class: "CodeActAgent"
+  max_iterations: 150
 
-# Alternative providers:
-# 
-# Fireworks AI:
-# llm_model: "accounts/fireworks/models/llama-v3p1-70b-instruct"
-# llm_base_url: "https://api.fireworks.ai/inference/v1"
-# llm_api_key_env: "FIREWORKS_API_KEY"
-#
-# Together.ai:
-# llm_model: "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"
-# llm_base_url: "https://api.together.xyz/v1"
-# llm_api_key_env: "TOGETHER_API_KEY"
-#
-# OpenAI:
-# llm_model: "gpt-4o"
-# llm_api_key_env: "OPENAI_API_KEY"
-# (no llm_base_url needed for OpenAI)
+  llm_model: "openai/Qwen/Qwen3-Coder-30B-A3B-Instruct"  
+  llm_base_url: "http://localhost:8000/v1"  # vLLM endpoint
+  llm_api_key: "dummy"  # vLLM doesn't require authentication
 
-# Parallel processing
-num_workers: 2  # Balance with your resources
+  # Alternative providers:
+  # 
+  # Fireworks AI:
+  # llm_model: "accounts/fireworks/models/llama-v3p1-70b-instruct"
+  # llm_base_url: "https://api.fireworks.ai/inference/v1"
+  # llm_api_key_env: "FIREWORKS_API_KEY"
+  #
+  # Together.ai:
+  # llm_model: "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"
+  # llm_base_url: "https://api.together.xyz/v1"
+  # llm_api_key_env: "TOGETHER_API_KEY"
+  #
+  # OpenAI:
+  # llm_model: "gpt-4o"
+  # llm_api_key_env: "OPENAI_API_KEY"
+  # (no llm_base_url needed for OpenAI)
 
-# Performance tuning
-max_retries: 3
-timeout_seconds: 1800
+  # Parallel processing
+  num_workers: 8  # Reduced to avoid Docker build issues (start with 2, increase gradually)
 
-# HuggingFace upload (automatic after generation)
-hf_repo_id: "your-org/your-dataset-name"
-hf_private: true
-# hf_config_name: "qwen2.5-coder-32b-swe-smith"  # Optional: auto-generated if not specified
+  # Performance tuning
+  max_retries: 3
+  timeout_seconds: 1800
 
-# Output directory
-eval_output_dir: "trajectories"
+  # HuggingFace upload (automatic after generation)
+  hf_repo_id: collinear-ai/spider_openhands_sft_generations_qwen3_coder_30b  # Disabled - set to enable upload
+  hf_private: true
+  # hf_config_name: "qwen2.5-coder-32b-swe-smith"  # Optional: auto-generated if not specified
+
+  # Output directory
+  eval_output_dir: "trajectories"
 

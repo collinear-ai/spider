@@ -637,6 +637,11 @@ class OpenHandsScaffold(Scaffold):
             df = df[df['instance_id'].str.match(instance_filter, na=False)]
             logger.info(f'Filtered to {len(df)} instances matching {instance_filter}')
         
+        # Randomly shuffle instances before selecting max_instances
+        if self.oh_config.max_instances is not None and len(df) > self.oh_config.max_instances:
+            df = df.sample(frac=1, random_state=None).reset_index(drop=True)
+            logger.info(f'Shuffled dataset randomly before selecting {self.oh_config.max_instances} instances')
+        
         # Create metadata
         metadata = self._create_metadata(dataset_name, split)
         
@@ -922,8 +927,24 @@ class OpenHandsScaffold(Scaffold):
         
         # Create HuggingFace Dataset
         logger.info('Creating HuggingFace Dataset...')
-        dataset = Dataset.from_list(data)
-        logger.info(f'  ✓ Created dataset with {len(dataset)} rows')
+        new_dataset = Dataset.from_list(data)
+        logger.info(f'  ✓ Created dataset with {len(new_dataset)} rows')
+        
+        # Try to load existing dataset and append (instead of replacing)
+        try:
+            logger.info(f'Checking for existing dataset at {self.oh_config.hf_repo_id}...')
+            from datasets import load_dataset
+            existing_dataset = load_dataset(self.oh_config.hf_repo_id, split='train', token=hf_token)
+            logger.info(f'  ✓ Found existing dataset with {len(existing_dataset)} rows')
+            
+            # Concatenate old + new
+            from datasets import concatenate_datasets
+            dataset = concatenate_datasets([existing_dataset, new_dataset])
+            logger.info(f'  ✓ Combined dataset: {len(existing_dataset)} existing + {len(new_dataset)} new = {len(dataset)} total rows')
+        except Exception as e:
+            logger.info(f'  No existing dataset found (or error loading): {e}')
+            logger.info(f'  Creating new dataset with {len(new_dataset)} rows')
+            dataset = new_dataset
         
         # Push to Hub
         logger.info(f'Pushing to HuggingFace Hub...')

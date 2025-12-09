@@ -121,7 +121,14 @@ def run(
         typer.echo("Error: Config file must have 'scaffold' key", err=True)
         raise typer.Exit(1)
     
-    scaffold_config_dict = config_data["scaffold"]
+    scaffold_config_dict = config_data["scaffold"].copy()
+    
+    # Merge root-level config fields into scaffold config (for convenience)
+    # This allows users to put fields at root level instead of nested under scaffold
+    for key, value in config_data.items():
+        if key != "scaffold" and key not in scaffold_config_dict:
+            scaffold_config_dict[key] = value
+    
     scaffold_type = scaffold_config_dict.get("type")
     
     if not scaffold_type:
@@ -186,67 +193,13 @@ def openhands(
         typer.echo("Error: Config file must have 'scaffold' key", err=True)
         raise typer.Exit(1)
     
-    scaffold_config_dict = config_data["scaffold"]
+    scaffold_config_dict = config_data["scaffold"].copy()
     
-    # Ensure type is openhands (or set it if not specified)
-    if scaffold_config_dict.get("type") and scaffold_config_dict.get("type") != "openhands":
-        typer.echo(
-            f"Warning: Config specifies scaffold type '{scaffold_config_dict.get('type')}', "
-            f"but using 'openhands' command. Overriding to 'openhands'.",
-            err=True,
-        )
-    scaffold_config_dict["type"] = "openhands"
-    
-    # Create scaffold and run using the factory
-    try:
-        scaffold = _create_scaffold("openhands", scaffold_config_dict)
-    except Exception as e:
-        typer.echo(f"Error: {e}", err=True)
-        raise typer.Exit(1)
-    
-    typer.echo(f"Starting OpenHands scaffold with config: {config_path}")
-    typer.echo(f"Dataset: {scaffold_config_dict.get('dataset', 'N/A')}")
-    typer.echo(f"Output directory: {scaffold_config_dict.get('output_dir', 'N/A')}")
-    
-    try:
-        output_path = scaffold.run_batch()
-        typer.echo(f"\n✓ Trajectories saved to: {output_path}")
-    except Exception as e:
-        typer.echo(f"Error running scaffold: {e}", err=True)
-        raise typer.Exit(1)
-
-
-@app.command()
-def openhands(
-    config: str = typer.Option(..., "--config", "-c", help="Path to YAML config file"),
-):
-    """Run OpenHands scaffold to generate trajectories.
-    
-    This is a convenience command. You can also use 'run' and specify the scaffold type in the config.
-    """
-    if not OPENHANDS_AVAILABLE:
-        typer.echo(
-            "Error: OpenHands scaffold not available. "
-            "Install with: pip install spider[swe-scaffolds]",
-            err=True,
-        )
-        raise typer.Exit(1)
-    
-    # Load config file
-    config_path = Path(config)
-    if not config_path.exists():
-        typer.echo(f"Error: Config file not found: {config_path}", err=True)
-        raise typer.Exit(1)
-    
-    with open(config_path) as f:
-        config_data = yaml.safe_load(f)
-    
-    # Extract scaffold config
-    if "scaffold" not in config_data:
-        typer.echo("Error: Config file must have 'scaffold' key", err=True)
-        raise typer.Exit(1)
-    
-    scaffold_config_dict = config_data["scaffold"]
+    # Merge root-level config fields into scaffold config (for convenience)
+    # This allows users to put fields at root level instead of nested under scaffold
+    for key, value in config_data.items():
+        if key != "scaffold" and key not in scaffold_config_dict:
+            scaffold_config_dict[key] = value
     
     # Ensure type is openhands (or set it if not specified)
     if scaffold_config_dict.get("type") and scaffold_config_dict.get("type") != "openhands":
