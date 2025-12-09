@@ -65,12 +65,7 @@ class OnPolicyConfig(BaseModel):
         default=False,
         description="Whether to compute post-kl metrics after each step"
     )
-    eval_every: int = Field(default=20, ge=0)
     save_every: int = Field(default=20, ge=0)
-    student_checkpoint_path: Optional[str] = Field(
-        default=None,
-        description="Optional tinker:// URI to resume to student from a prior checkpoint"
-    )
 
 class GenerationConfig(BaseModel):
     duplications: int = Field(default=1, ge=1)
@@ -110,6 +105,17 @@ class ModelConfig(BaseModel):
         default_factory=dict,
         description="Additional backend params"
     )
+    student_checkpoint_path: Optional[str] = Field(
+        default=None,
+        description="Optional tinker:// URI to resume to student from a prior checkpoint"
+    )
+
+    @model_validator(mode="after")
+    def validate_tinker_student(self) -> "ModelConfig":
+        provider = (self.provider or "").lower()
+        if provider == "tinker" and not self.name:
+            raise ValueError("`model.name` is required if provider='tinker'.")
+        return self
 
 class OutputMode(str, Enum):
     RETURN = "return"

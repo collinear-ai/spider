@@ -81,16 +81,22 @@ class _StudentSamplerContext:
         if self._student_client is not None:
             return self._student_client
 
-        model_name = self._job.model.name
+        model_name = getattr(self._job.model, "name", None)
+        checkpoint_path = getattr(self._job.model, "student_checkpoint_path", None)
         if not model_name:
             raise JobExecutionError(
                 "job.model.name must be provided to create a Tinker sampling client."
             )
 
         self._service_client = tinker.ServiceClient()
-        self._student_client = self._service_client.create_sampling_client(
-            base_model=model_name,
-        )
+        if checkpoint_path:
+            self._student_client = self._service_client.create_sampling_client(
+                model_path=checkpoint_path,
+            )
+        else:
+            self._student_client = self._service_client.create_sampling_client(
+                base_model=model_name,
+            )
 
         return self._student_client
 
@@ -164,6 +170,7 @@ def run_on_policy_job(
         raise JobExecutionError("on_policy_options must be provided")
     
     student_model = job.model.name
+    student_checkpoint = job.model.student_checkpoint_path
     if not student_model:
         raise JobExecutionError("job.model.name must be provided")
 
@@ -178,7 +185,7 @@ def run_on_policy_job(
         "Job %s: on-policy distillation for student=%s collected %d prompts, use_gold_alignment=%s, tool_rollouts=%s",
         job_id,
         student_model,
-        len(prompts),
+        len(prompt_list),
         use_gold_alignment,
         bool(tool_registry),
     )
@@ -299,9 +306,8 @@ def run_on_policy_job(
         log_path=str(training_dir),
         base_url=None,
         enable_trace=False,
-        eval_every=options.eval_every,
         save_every=options.save_every,
-        load_checkpoint_path=options.student_checkpoint_path,
+        load_checkpoint_path=student_checkpoint,
         use_gold_alignment=use_gold_alignment,
     )
 
