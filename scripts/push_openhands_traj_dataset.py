@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Push trajectories as a proper HuggingFace Dataset.
 
-This is the correct script for uploading OpenHands trajectories to HuggingFace Hub.
-It creates a proper Dataset object (Parquet format) with trajectory as a native Python list.
+This is the script for uploading OpenHands trajectories to HuggingFace Hub.
 
 Usage:
     1. Edit EVAL_OUTPUT_DIR and HF_REPO_ID below
     2. export HF_TOKEN="hf_..."
-    3. python3 scripts/push_hf_dataset.py
+    3. python3 scripts/push_openhands_traj_dataset.py
 
 The uploaded dataset can be loaded with:
     from datasets import load_dataset

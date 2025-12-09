@@ -10,38 +10,51 @@ pip install spider[swe-scaffolds]
 
 ### 2. Set Up OpenHands
 
-**Option A: Install from PyPI**
+**Install from Source** (required - evaluation utilities not in PyPI package)
 ```bash
-pip install openhands-ai
-```
-
-**Option B: Install from Source** (if you need evaluation utils)
-```bash
-git clone https://github.com/OpenHands/OpenHands.git
+git clone https://github.com/All-Hands-AI/OpenHands.git
 cd OpenHands
 pip install -e .
-export OPENHANDS_EVAL_PATH=/path/to/OpenHands/evaluation  # Optional
 ```
 
 ### 3. Set API Keys
 
 ```bash
+export OPENAI_API_KEY=your_key_here
+# Or for vLLM:
+export VLLM_API_KEY=your_key_here
+# Or for Anthropic:
 export ANTHROPIC_API_KEY=your_key_here
-# Or set llm_api_key in the config file
 ```
 
-### 4. Edit Config File
+### 4. Create/Edit Config File
 
-Edit `config/swe/my-swe-config.yaml`:
+Copy an example config file:
+```bash
+cp config/swe/example-openai-config.yaml config/swe/my-swe-config.yaml
+# Or for vLLM:
+cp config/swe/example-vllm-config.yaml config/swe/my-swe-config.yaml
+```
 
+Then edit for your needs:
 ```yaml
-scaffold:
-  type: openhands
-  dataset: "SWE-bench/SWE-smith"     # Your dataset
-  agent_class: "CodeActAgent"        # Agent name
-  llm_model: "anthropic/claude-sonnet-4"  # Your LLM
-  output_dir: "./trajectories"
-  # ... other settings
+# Dataset configuration
+dataset: "SWE-bench/SWE-smith"
+split: "train"
+max_instances: 10
+
+# Agent configuration
+agent_class: "CodeActAgent"
+max_iterations: 30
+llm_model: "gpt-4o"
+llm_api_key_env: "OPENAI_API_KEY"
+
+# For vLLM or other providers, also set:
+# llm_base_url: "http://localhost:8000/v1"
+
+# HuggingFace upload
+hf_repo_id: "your-org/your-dataset-name"
+hf_private: true
 ```
 
 ### 5. Run Trajectory Generation
@@ -97,7 +110,8 @@ with SpiderClient(config=config) as client:
 
 ## Example Config Files
 
-- `my-swe-config.yaml` - Simple standalone config (recommended for quick start)
-- `openhands-example.yaml` - Detailed example with all options
-- `spider-openhands-job.yaml` - Config for Spider job system
+- `example-openai-config.yaml` - For OpenAI/Anthropic (recommended for quick start)
+- `example-vllm-config.yaml` - For vLLM, Fireworks, Together.ai, or other providers
+- `openhands-config.yaml` - Advanced example with all options
+- `spider-openhands-job.yaml` - Config for Spider job system (not typically needed)
 

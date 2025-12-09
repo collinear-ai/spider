@@ -1,0 +1,35 @@
+# Example config for SWE trajectory generation with OpenAI/Anthropic
+# Copy this file and modify for your setup
+
+# Dataset configuration
+dataset: "SWE-bench/SWE-smith"
+split: "train"
+max_instances: 10  # Start small for testing
+instance_filter: "conan-io__conan.*"  # Optional: filter by repo
+
+# Agent configuration
+agent_class: "CodeActAgent"
+max_iterations: 30
+
+# OpenAI configuration
+llm_model: "gpt-4o"
+llm_api_key_env: "OPENAI_API_KEY"
+
+# Alternative: Anthropic
+# llm_model: "anthropic/claude-sonnet-4-20250514"
+# llm_api_key_env: "ANTHROPIC_API_KEY"
+
+# Parallel processing
+num_workers: 2  # Balance with your resources
+
+# Performance tuning
+max_retries: 3
+timeout_seconds: 1800
+
+# HuggingFace upload (automatic after generation)
+hf_repo_id: "your-org/your-dataset-name"
+hf_private: true
+
+# Output directory
+eval_output_dir: "trajectories"
+

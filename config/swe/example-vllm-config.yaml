@@ -1,0 +1,50 @@
+# Example config for SWE trajectory generation with vLLM
+# Copy this file and modify for your setup
+
+# Dataset configuration
+dataset: "SWE-bench/SWE-smith"
+split: "train"
+max_instances: 10  # Start small for testing
+instance_filter: "conan-io__conan.*"  # Optional: filter by repo
+
+# Agent configuration
+agent_class: "CodeActAgent"
+max_iterations: 30
+
+# vLLM configuration
+llm_model: "Qwen/Qwen2.5-Coder-32B-Instruct"  # Your model name
+llm_base_url: "http://localhost:8000/v1"  # vLLM endpoint
+llm_api_key_env: "VLLM_API_KEY"  # Or use llm_api_key directly
+
+# Alternative providers:
+# 
+# Fireworks AI:
+# llm_model: "accounts/fireworks/models/llama-v3p1-70b-instruct"
+# llm_base_url: "https://api.fireworks.ai/inference/v1"
+# llm_api_key_env: "FIREWORKS_API_KEY"
+#
+# Together.ai:
+# llm_model: "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"
+# llm_base_url: "https://api.together.xyz/v1"
+# llm_api_key_env: "TOGETHER_API_KEY"
+#
+# OpenAI:
+# llm_model: "gpt-4o"
+# llm_api_key_env: "OPENAI_API_KEY"
+# (no llm_base_url needed for OpenAI)
+
+# Parallel processing
+num_workers: 2  # Balance with your resources
+
+# Performance tuning
+max_retries: 3
+timeout_seconds: 1800
+
+# HuggingFace upload (automatic after generation)
+hf_repo_id: "your-org/your-dataset-name"
+hf_private: true
+# hf_config_name: "qwen2.5-coder-32b-swe-smith"  # Optional: auto-generated if not specified
+
+# Output directory
+eval_output_dir: "trajectories"
+
