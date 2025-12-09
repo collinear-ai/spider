@@ -152,7 +152,7 @@ def run_on_policy_job(
     *, 
     workspace: Path,
     job_env: dict[str, str],
-    prompts: Optional[List[str]],
+    prompts: Optional[List[str]] = None,
     tool_registry: Optional[Dict[str, Callable[..., Any]]] = None,
 ):
     from .executor import (
@@ -280,7 +280,7 @@ def run_on_policy_job(
         "Job %s: starting Tinker training (teacher=%s, prompts=%d) logs=%s",
         job_id,
         options.teacher,
-        len(prompts),
+        len(prompt_list),
         training_dir
     )
     events.emit(
