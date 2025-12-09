@@ -1,0 +1,35 @@
+server:
+  base_url: 
+  api_key:
+  request_timeout: 180
+
+job:
+  model:
+    provider: tinker
+    name: "Qwen/Qwen3-4B-Instruct-2507"
+    student_checkpoint_path: 
+  source:
+    dataset: "allenai/tulu-3-sft-personas-instruction-following"
+    split: "train[0:20000]"
+    field: "prompt"
+  generation:
+    on_policy: true
+    on_policy_options:
+      teacher: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+      learning_rate: 1e-7
+      groups_per_batch: 64
+      group_size: 2
+      max_tokens: 4096
+      lora_rank: 16
+      num_substeps: 1
+      kl_penalty_coef: 1.0
+      kl_discount_factor: 0.0
+      loss_fn: "importance_sampling"
+      compute_post_kl: true
+      save_every: 256
+  output:
+    mode: "upload_hf"
+    hf:
+      repo_id: collinear-ai/Qwen3-4B-Instruct-2507-tulu-3-personas-instruction-following-on-policy-teacher-Qwen3-30B-A3B-Instruct-2507
+      repo_type: "model"
+      private: false
