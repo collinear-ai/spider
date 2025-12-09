@@ -43,10 +43,78 @@ def clean_dict(d):
             cleaned[k] = v
     return cleaned if cleaned else None
 
+def trajectory_to_messages(trajectory):
+    """Convert OpenHands trajectory to chat format (role/content).
+    
+    Returns list of dicts with 'role' and 'content' keys.
+    """
+    messages = []
+    
+    for turn in trajectory:
+        source = turn.get("source", "")
+        action = turn.get("action", "")
+        
+        # Map OpenHands events to chat roles
+        if source == "user":
+            # User messages
+            content = turn.get("args", {}).get("content", "") or turn.get("message", "")
+            if content:
+                messages.append({
+                    "role": "user",
+                    "content": content
+                })
+        elif source == "agent":
+            # Agent actions and thoughts
+            if action == "message":
+                # Agent message/response
+                content = turn.get("args", {}).get("content", "")
+                if content:
+                    messages.append({
+                        "role": "assistant",
+                        "content": content
+                    })
+            elif action in ["run", "run_ipython", "read", "write", "edit", "browse"]:
+                # Agent tool use - format as assistant message
+                args = turn.get("args", {})
+                observation = turn.get("observation", "")
+                
+                # Format the action as a message
+                if action == "run":
+                    content = f"Running command: {args.get('command', '')}"
+                    if observation:
+                        content += f"\n\nOutput:\n{observation}"
+                elif action == "run_ipython":
+                    content = f"Running Python:\n```python\n{args.get('code', '')}\n```"
+                    if observation:
+                        content += f"\n\nOutput:\n{observation}"
+                elif action == "read":
+                    content = f"Reading file: {args.get('path', '')}"
+                    if observation:
+                        content += f"\n\n{observation}"
+                elif action == "write":
+                    content = f"Writing to file: {args.get('path', '')}\n```\n{args.get('content', '')}\n```"
+                elif action == "edit":
+                    content = f"Editing file: {args.get('path', '')}"
+                elif action == "browse":
+                    content = f"Browsing: {args.get('url', '')}"
+                
+                if content:
+                    messages.append({
+                        "role": "assistant",
+                        "content": content
+                    })
+    
+    return messages
+
 def transform_record(record):
-    """Transform to clean format with trajectory as list."""
-    # Clean the trajectory to remove empty dicts
+    """Transform to training format with messages (role/content)."""
+    # Get raw trajectory
     trajectory = record.get("history", [])
+    
+    # Convert to messages format for training
+    messages = trajectory_to_messages(trajectory)
+    
+    # Also keep raw trajectory for reference (cleaned)
     cleaned_trajectory = []
     for turn in trajectory:
         cleaned_turn = clean_dict(turn)
@@ -58,7 +126,8 @@ def transform_record(record):
         "repo": record.get("instance", {}).get("repo"),
         "image_name": record.get("instance", {}).get("image_name"),
         "instruction": record.get("instruction"),
-        "trajectory": cleaned_trajectory,  # Cleaned list
+        "messages": messages,  # Chat format for training!
+        "trajectory": cleaned_trajectory,  # Raw trajectory for reference
         "git_patch": record.get("test_result", {}).get("git_patch") if record.get("test_result") else None,
         "agent_class": record.get("metadata", {}).get("agent_class"),
         "model": record.get("metadata", {}).get("llm_config", {}).get("model"),
@@ -104,8 +173,13 @@ print("SAMPLE RECORD:")
 print("="*60)
 sample = data[0]
 print(f"  instance_id: {sample['instance_id']}")
-print(f"  trajectory: list with {len(sample['trajectory'])} turns")
+print(f"  messages: list with {len(sample.get('messages', []))} messages (role/content format)")
+print(f"  trajectory: list with {len(sample.get('trajectory', []))} turns (raw OpenHands events)")
 print(f"  model: {sample['model']}")
+print()
+print("First few messages:")
+for i, msg in enumerate(sample.get('messages', [])[:3]):
+    print(f"  {i+1}. role={msg['role']}, content={msg['content'][:80]}...")
 print()
 
 # Create HuggingFace Dataset
@@ -135,11 +209,13 @@ try:
     print(f"{'='*60}\n")
     print(f"Dataset URL: https://huggingface.co/datasets/{HF_REPO_ID}")
     print()
-    print("Load it:")
+    print("Load it for training:")
     print(f"  from datasets import load_dataset")
     print(f"  ds = load_dataset('{HF_REPO_ID}')")
-    print(f"  print(ds)")
-    print(f"  print(ds['train'][0]['trajectory'])")
+    print(f"  print(ds['train'][0]['messages'])  # Chat format (role/content)")
+    print()
+    print("Or access raw trajectory:")
+    print(f"  print(ds['train'][0]['trajectory'])  # Raw OpenHands events")
     print()
 except Exception as e:
     print(f"\n❌ Error during push: {e}")

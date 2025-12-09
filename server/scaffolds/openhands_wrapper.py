@@ -697,13 +697,82 @@ class OpenHandsScaffold(Scaffold):
                 cleaned[k] = v
         return cleaned if cleaned else None
     
-    def _transform_output_for_dataset(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        """Transform a single record to clean dataset format.
+    def _trajectory_to_messages(self, trajectory: list[Dict[str, Any]]) -> list[Dict[str, str]]:
+        """Convert OpenHands trajectory to chat format (role/content).
         
-        Creates a flattened format with trajectory as a list.
+        Returns list of dicts with 'role' and 'content' keys for training.
         """
-        # Clean the trajectory to remove empty dicts
+        messages = []
+        
+        for turn in trajectory:
+            source = turn.get("source", "")
+            action = turn.get("action", "")
+            
+            # Map OpenHands events to chat roles
+            if source == "user":
+                # User messages
+                content = turn.get("args", {}).get("content", "") or turn.get("message", "")
+                if content:
+                    messages.append({
+                        "role": "user",
+                        "content": content
+                    })
+            elif source == "agent":
+                # Agent actions and thoughts
+                if action == "message":
+                    # Agent message/response
+                    content = turn.get("args", {}).get("content", "")
+                    if content:
+                        messages.append({
+                            "role": "assistant",
+                            "content": content
+                        })
+                elif action in ["run", "run_ipython", "read", "write", "edit", "browse"]:
+                    # Agent tool use - format as assistant message
+                    args = turn.get("args", {})
+                    observation = turn.get("observation", "")
+                    
+                    # Format the action as a message
+                    if action == "run":
+                        content = f"Running command: {args.get('command', '')}"
+                        if observation:
+                            content += f"\n\nOutput:\n{observation}"
+                    elif action == "run_ipython":
+                        content = f"Running Python:\n```python\n{args.get('code', '')}\n```"
+                        if observation:
+                            content += f"\n\nOutput:\n{observation}"
+                    elif action == "read":
+                        content = f"Reading file: {args.get('path', '')}"
+                        if observation:
+                            content += f"\n\n{observation}"
+                    elif action == "write":
+                        content = f"Writing to file: {args.get('path', '')}\n```\n{args.get('content', '')}\n```"
+                    elif action == "edit":
+                        content = f"Editing file: {args.get('path', '')}"
+                    elif action == "browse":
+                        content = f"Browsing: {args.get('url', '')}"
+                    
+                    if content:
+                        messages.append({
+                            "role": "assistant",
+                            "content": content
+                        })
+        
+        return messages
+    
+    def _transform_output_for_dataset(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """Transform a single record to training format.
+        
+        Creates a dataset with 'messages' field (role/content format for training)
+        and 'trajectory' field (raw OpenHands events for reference).
+        """
+        # Get raw trajectory
         trajectory = record.get("history", [])
+        
+        # Convert to messages format for training
+        messages = self._trajectory_to_messages(trajectory)
+        
+        # Also clean trajectory for reference
         cleaned_trajectory = []
         for turn in trajectory:
             cleaned_turn = self._clean_dict_for_parquet(turn)
@@ -718,7 +787,8 @@ class OpenHandsScaffold(Scaffold):
             
             # Task and result
             "instruction": record.get("instruction"),
-            "trajectory": cleaned_trajectory,  # Cleaned list
+            "messages": messages,  # Chat format for training!
+            "trajectory": cleaned_trajectory,  # Raw trajectory for reference
             "git_patch": record.get("test_result", {}).get("git_patch") if record.get("test_result") else None,
             
             # Metadata (flattened)
