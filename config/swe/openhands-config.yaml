@@ -6,12 +6,12 @@ scaffold:
   output_dir: "./trajectories"       # Where to save trajectories
   
   # Dataset configuration
-  dataset: "collinear-ai/TEMP_spider_openhands_scaffold_test"     # Your HuggingFace dataset name
+  dataset: "SWE-bench/SWE-smith"      # Official SWE-smith dataset with working Docker images
   split: "train"                      # Dataset split (train/test/validation)
   
   # Instance filtering (optional)
-  max_instances: null                 # null = process all, or set a number like 10
-  instance_filter: null               # Optional regex filter for instance IDs
+  max_instances: 50  # Process 50 instances (8 workers × ~6 instances each)
+  instance_filter: "conan-io__conan.*"  # Filter to conan repo instances               # Optional regex filter for instance IDs
   
   # Agent configuration
   agent_class: "CodeActAgent"        # OpenHands agent name (e.g., "CodeActAgent")
@@ -35,7 +35,7 @@ scaffold:
   # llm_config_name: "llm.eval_gpt4_1106_preview"
   
   # Execution configuration
-  num_workers: 1                     # Number of parallel workers
+  num_workers: 2                     # Number of parallel workers (reduced to 2 for stability)
   timeout_seconds: 3600             # Timeout per instance in seconds (1 hour)
   max_retries: 5                    # Maximum retries on failure
   
@@ -47,4 +47,22 @@ scaffold:
   # Agent capabilities
   enable_browser: false             # Enable browser tools
   enable_llm_editor: false         # Enable LLM editor
+  
+  # HuggingFace upload configuration (optional)
+  hf_repo_id: collinear-ai/TEMP_spider_openhands_integration_test                  # HF repo ID (e.g., "username/swe-trajectories"). Set to enable upload.
+  hf_private: true                  # Make repo private (true) or public (false)
+  hf_config_name: null              # Config name for dataset (e.g., "gpt4o_conan_50iter"). Auto-generated if null.
+  
+  # To enable HF upload:
+  # 1. Set hf_repo_id: "your-username/your-dataset-name"
+  # 2. Set HF_TOKEN environment variable: export HF_TOKEN="hf_..."
+  # 3. Trajectories will be uploaded after generation completes
+  #
+  # Example: hf_repo_id: "myorg/swe-smith-trajectories"
+  #          hf_config_name: "gpt4o_conan_50iter"  # or leave null for auto-generation
+  
+  # Note: Using SWE-smith pre-built images (each task has repo already set up)
+  # First run per unique task: 8-10 min to build OpenHands runtime on top of task image
+  # Subsequent runs of same task: ~10 seconds (cached runtime)
+  # Different tasks will trigger new builds due to different base images
 

@@ -8,3 +8,5 @@ artifacts/
 *private.py
 .env
 gh_*
+trajectories/
+.eval_sessions/

@@ -141,9 +141,35 @@ class OpenHandsScaffoldConfig(ScaffoldConfig):
         default=1,
         description="Resource factor for remote runtime (1, 2, 4, or 8)"
     )
+    runtime_container_image: Optional[str] = Field(
+        default=None,
+        description="Pre-built runtime container image to use (skips building). If None, builds from base_container_image."
+    )
+    workspace_dir: Optional[str] = Field(
+        default=None,
+        description="Working directory in the container (e.g., 'testbed' for SWE-smith, 'workspace/{repo}' for SWE-bench). If None, auto-detects."
+    )
+    base_container_image_override: Optional[str] = Field(
+        default=None,
+        description="Override base container image (ignores dataset's image_name). Use this to avoid per-task image rebuilds. E.g., 'nikolaik/python-nodejs:python3.12-nodejs22'"
+    )
     eval_output_dir: Optional[Path] = Field(
         default=None,
         description="Output directory for evaluation results (defaults to output_dir)"
+    )
+    
+    # HuggingFace upload configuration
+    hf_repo_id: Optional[str] = Field(
+        default=None,
+        description="HuggingFace repo ID to upload trajectories to (e.g., 'username/dataset-name'). If None, no upload."
+    )
+    hf_private: bool = Field(
+        default=True,
+        description="Whether to make the HuggingFace repo private"
+    )
+    hf_config_name: Optional[str] = Field(
+        default=None,
+        description="Subset config name for HuggingFace dataset (e.g., 'gpt-4o_swe-smith_50iter'). If None, auto-generated from config."
     )
 
 
@@ -151,6 +177,7 @@ def _get_workspace_dir_name(instance: pd.Series) -> str:
     """Get workspace directory name from instance.
     
     Handles both SWE-bench format (repo__version) and SWE-smith format (swesmith/repo).
+    For SWE-smith, parses the repo name from the 'repo' field.
     """
     if 'repo' in instance and 'version' in instance:
         # SWE-bench format
@@ -202,11 +229,20 @@ def _get_instruction(instance: pd.Series) -> str:
     return instruction
 
 
-def _get_instance_docker_image(instance: pd.Series) -> str:
+def _get_instance_docker_image(instance: pd.Series, base_image_override: Optional[str] = None) -> str:
     """Get Docker image name from instance.
     
-    SWE-smith provides image_name directly. SWE-bench generates it from instance_id.
+    Args:
+        instance: Dataset instance
+        base_image_override: If provided, use this instead of dataset's image_name
+    
+    Returns:
+        Docker image name to use as base
     """
+    # Use override if provided (allows using generic image for all tasks)
+    if base_image_override:
+        return base_image_override
+    
     if 'image_name' in instance and instance.get('image_name'):
         return str(instance['image_name']).lower()
     
@@ -249,6 +285,17 @@ def _initialize_runtime(runtime: Runtime, instance: pd.Series):
     action.set_hard_timeout(600)
     obs = runtime.run_action(action)
     assert_and_raise(obs.exit_code == 0, f'Failed to export USER: {str(obs)}')
+    
+    # For SWE-smith: copy /testbed to /workspace/{workspace_dir_name}
+    if 'image_name' in instance and instance.get('image_name'):
+        logger.info(f'Copying /testbed to /workspace/{workspace_dir_name} for SWE-smith dataset')
+        action = CmdRunAction(command=f'mkdir -p /workspace && cp -r /testbed /workspace/{workspace_dir_name}')
+        action.set_hard_timeout(600)
+        obs = runtime.run_action(action)
+        assert_and_raise(
+            obs.exit_code == 0,
+            f'Failed to copy /testbed to /workspace/{workspace_dir_name}: {str(obs)}',
+        )
     
     # Navigate to workspace
     action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
@@ -418,12 +465,21 @@ class OpenHandsScaffold(Scaffold):
     
     def _get_config(self, instance: pd.Series, metadata: EvalMetadata) -> OpenHandsConfig:
         """Get OpenHands config for an instance."""
-        base_container_image = _get_instance_docker_image(instance)
-        
-        logger.info(
-            f'Using instance container image: {base_container_image}. '
-            f'Please make sure this image exists.'
+        base_container_image = _get_instance_docker_image(
+            instance, 
+            self.oh_config.base_container_image_override
         )
+        
+        if self.oh_config.base_container_image_override:
+            logger.info(
+                f'Using override base image: {base_container_image} '
+                f'(ignoring dataset image_name)'
+            )
+        else:
+            logger.info(
+                f'Using instance container image: {base_container_image}. '
+                f'Please make sure this image exists.'
+            )
         
         sandbox_config = get_default_sandbox_config_for_eval()
         sandbox_config.base_container_image = base_container_image
@@ -431,6 +487,11 @@ class OpenHandsScaffold(Scaffold):
         sandbox_config.use_host_network = False
         sandbox_config.platform = self.oh_config.platform
         sandbox_config.remote_runtime_resource_factor = self.oh_config.remote_runtime_resource_factor
+        
+        # Use pre-built runtime image if specified (skips slow build process)
+        if self.oh_config.runtime_container_image:
+            sandbox_config.runtime_container_image = self.oh_config.runtime_container_image
+            logger.info(f'Using pre-built runtime image: {self.oh_config.runtime_container_image}')
         
         config = get_openhands_config_for_eval(
             metadata=metadata,
@@ -471,7 +532,7 @@ class OpenHandsScaffold(Scaffold):
         
         # Setup logger
         if reset_logger:
-            log_dir = self.oh_config.eval_output_dir / 'infer_logs'
+            log_dir = Path(metadata.eval_output_dir) / 'infer_logs'
             log_dir.mkdir(parents=True, exist_ok=True)
             reset_logger_for_multiprocessing(
                 logger, instance.instance_id, str(log_dir)
@@ -579,8 +640,8 @@ class OpenHandsScaffold(Scaffold):
         # Create metadata
         metadata = self._create_metadata(dataset_name, split)
         
-        # Prepare output file
-        output_file = self.oh_config.eval_output_dir / 'output.jsonl'
+        # Prepare output file (use metadata.eval_output_dir which has full path)
+        output_file = Path(metadata.eval_output_dir) / 'output.jsonl'
         output_file.parent.mkdir(parents=True, exist_ok=True)
         
         logger.info(f'Output file: {output_file}')
@@ -610,7 +671,131 @@ class OpenHandsScaffold(Scaffold):
             max_retries=self.oh_config.max_retries,
         )
         
+        # Upload to HuggingFace if configured
+        if self.oh_config.hf_repo_id:
+            hf_url = self._upload_to_huggingface(output_file, metadata)
+            logger.info(f'Trajectories uploaded to HuggingFace: {hf_url}')
+        
         return output_file
+    
+    def _clean_dict_for_parquet(self, d: Any) -> Any:
+        """Recursively clean dict for Parquet compatibility (remove empty dicts)."""
+        if not isinstance(d, dict):
+            return d
+        
+        cleaned = {}
+        for k, v in d.items():
+            if isinstance(v, dict):
+                if len(v) == 0:
+                    # Skip empty dicts (Parquet can't handle them)
+                    continue
+                else:
+                    cleaned[k] = self._clean_dict_for_parquet(v)
+            elif isinstance(v, list):
+                cleaned[k] = [self._clean_dict_for_parquet(item) if isinstance(item, dict) else item for item in v]
+            else:
+                cleaned[k] = v
+        return cleaned if cleaned else None
+    
+    def _transform_output_for_dataset(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """Transform a single record to clean dataset format.
+        
+        Creates a flattened format with trajectory as a list.
+        """
+        # Clean the trajectory to remove empty dicts
+        trajectory = record.get("history", [])
+        cleaned_trajectory = []
+        for turn in trajectory:
+            cleaned_turn = self._clean_dict_for_parquet(turn)
+            if cleaned_turn:
+                cleaned_trajectory.append(cleaned_turn)
+        
+        return {
+            # Primary identifiers
+            "instance_id": record.get("instance_id"),
+            "repo": record.get("instance", {}).get("repo"),
+            "image_name": record.get("instance", {}).get("image_name"),
+            
+            # Task and result
+            "instruction": record.get("instruction"),
+            "trajectory": cleaned_trajectory,  # Cleaned list
+            "git_patch": record.get("test_result", {}).get("git_patch") if record.get("test_result") else None,
+            
+            # Metadata (flattened)
+            "agent_class": record.get("metadata", {}).get("agent_class"),
+            "model": record.get("metadata", {}).get("llm_config", {}).get("model"),
+            "max_iterations": record.get("metadata", {}).get("max_iterations"),
+            
+            # Metrics
+            "metrics": self._clean_dict_for_parquet(record.get("metrics", {})),
+            
+            # Error (if any)
+            "error": record.get("error"),
+            
+            # Original instance data
+            "problem_statement": record.get("instance", {}).get("problem_statement"),
+            "hints_text": record.get("instance", {}).get("hints_text"),
+            "created_at": record.get("instance", {}).get("created_at"),
+            "resolved": record.get("test_result", {}).get("resolved") if record.get("test_result") else None,
+        }
+    
+    def _upload_to_huggingface(self, output_file: Path, metadata: EvalMetadata) -> str:
+        """Upload trajectories to HuggingFace Hub as a proper Dataset.
+        
+        Args:
+            output_file: Path to output.jsonl file
+            metadata: Evaluation metadata
+            
+        Returns:
+            URL to the uploaded dataset
+        """
+        from datasets import Dataset
+        import json
+        import os
+        
+        logger.info('Preparing to upload trajectories to HuggingFace Hub...')
+        
+        # Check for HF token
+        hf_token = os.getenv('HF_TOKEN')
+        if not hf_token:
+            raise ValueError('HF_TOKEN environment variable not set. Cannot upload to HuggingFace.')
+        
+        # Load and transform data
+        logger.info(f'Loading and transforming {output_file.name}...')
+        data = []
+        with open(output_file, 'r') as f:
+            for i, line in enumerate(f, 1):
+                record = json.loads(line)
+                transformed = self._transform_output_for_dataset(record)
+                # Remove None values but keep empty lists
+                transformed = {k: v for k, v in transformed.items() if v is not None}
+                data.append(transformed)
+        
+        logger.info(f'  ✓ Loaded {len(data)} records')
+        
+        # Create HuggingFace Dataset
+        logger.info('Creating HuggingFace Dataset...')
+        dataset = Dataset.from_list(data)
+        logger.info(f'  ✓ Created dataset with {len(dataset)} rows')
+        
+        # Push to Hub
+        logger.info(f'Pushing to HuggingFace Hub...')
+        logger.info(f'  Repo: {self.oh_config.hf_repo_id} ({"private" if self.oh_config.hf_private else "public"})')
+        
+        try:
+            dataset.push_to_hub(
+                repo_id=self.oh_config.hf_repo_id,
+                private=self.oh_config.hf_private,
+                token=hf_token
+            )
+            
+            hf_url = f"https://huggingface.co/datasets/{self.oh_config.hf_repo_id}"
+            logger.info(f'✓ Upload successful: {hf_url}')
+            return hf_url
+            
+        except Exception as e:
+            logger.error(f'Failed to upload to HuggingFace: {e}')
+            raise
     
     def run_single(self, instance: Dict[str, Any]) -> Dict[str, Any]:
         """Run OpenHands on a single instance."""
