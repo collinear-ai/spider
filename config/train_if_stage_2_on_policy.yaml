@@ -10,26 +10,28 @@ job:
     student_checkpoint_path: 
   source:
     dataset: "allenai/tulu-3-sft-personas-instruction-following"
-    split: "train[0:20000]"
+    split: "train[0:10000]"
+    # split: "train[0:8]"
     field: "prompt"
   generation:
     on_policy: true
     on_policy_options:
-      teacher: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+      teacher: "openai/gpt-oss-120b"
       learning_rate: 1e-7
       groups_per_batch: 64
+      # groups_per_batch: 4
       group_size: 2
       max_tokens: 4096
-      lora_rank: 16
+      lora_rank: 32
       num_substeps: 1
       kl_penalty_coef: 1.0
       kl_discount_factor: 0.0
       loss_fn: "importance_sampling"
       compute_post_kl: true
-      save_every: 256
+      save_every: 20
   output:
     mode: "upload_hf"
     hf:
-      repo_id: collinear-ai/Qwen3-4B-Instruct-2507-tulu-3-personas-instruction-following-on-policy-teacher-Qwen3-30B-A3B-Instruct-2507
+      repo_id: collinear-ai/Qwen3-4B-Instruct-2507-tulu-if-gpt-120B-on-policy-10K-real
       repo_type: "model"
       private: false

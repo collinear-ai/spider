@@ -8,14 +8,12 @@ from spider.client import SpiderClient
 from spider.config import AppConfig
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     config = AppConfig.load("config/train_if_stage_2_on_policy.yaml")
 
     env = {"TINKER_API_KEY": os.environ.get("TINKER_API_KEY")}
     
-    logger = logging.getLogger(__name__)
     with SpiderClient(config=config, env=env) as client:
-        logger.info("Submitting stage 2 on-policy job with checkpoint %s", config.job.model.student_checkpoint_path)
+        print(f"Submitting stage 2 on-policy job with checkpoint {config.job.model.student_checkpoint_path}")
         submission = client.submit_job()
         job_id = submission["job_id"]
         status = client.poll_job(
