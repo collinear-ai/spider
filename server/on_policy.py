@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import asyncio, logging, os, shutil, tarfile, urllib.request, zipfile
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional
+from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional, Callable, TypedDict
 from urllib.parse import urlparse
 import blobfile
 
@@ -26,6 +25,13 @@ from .writers import JSONLBatchWriter
 RolloutBatch = List[Dict[str, Any]]
 
 logger = logging.getLogger(__name__)
+
+class ToolRolloutTrajectory(TypedDict):
+    prompt: str
+    transcript: List[Dict[str, Any]]
+    token_ids: List[int]
+    logprobs: List[float]
+    reward_mask: List[int]
 
 class PromptListDatasetBuilder(RLDatasetBuilder):
     def __init__(
@@ -60,49 +66,60 @@ class PromptListDatasetBuilder(RLDatasetBuilder):
         )
         return dataset, None
 
-class ToolRolloutDatasetBuilder(RLDatasetBuilder):
-    def __init__(
-        self,
-        prompt_batches: Iterable[RolloutBatch],
-        dataset_name: str,
-        renderer_name: str,
-        model_name_for_tokenizer: str,
-    ) -> None:
-        object.__setattr__(self, "_prompt_batches", prompt_batches)
-        object.__setattr__(self, "_dataset_name", dataset_name)
-        object.__setattr__(self, "_renderer_name", renderer_name)
-        object.__setattr__(self, "_model_name", model_name_for_tokenizer)
+class _StudentSamplerContext:
+    def __init__(self, *, job_id: str, job: JobConfig) -> None:
+        self._job_id = job_id
+        self._job = job
+        self._client = None
+        self._student_client = None
+        self._service_client = None
 
-        async def __call__(self) -> tuple[RLDataset, RLDataset | None]:
-            tokenizer = get_tokenizer(self._model_name)
-            renderer = renderers.get_renderer(self._renderer_name, tokenizer=tokenizer)
-            dataset = ToolRolloutDataset(
-                prompt_batches=self._prompt_batches,
-                renderer=renderer,
-                tokenizer=tokenizer,
-                dataset_name=self._dataset_name,
+    def __enter__(self) -> Any:
+        from .executor import JobExecutionError
+
+        if self._student_client is not None:
+            return self._student_client
+
+        model_name = getattr(self._job.model, "name", None)
+        checkpoint_path = getattr(self._job.model, "student_checkpoint_path", None)
+        if not model_name:
+            raise JobExecutionError(
+                "job.model.name must be provided to create a Tinker sampling client."
             )
-            return dataset, None
 
-@contextmanager
-def _temporary_api_key(api_key: str | None):
-    if not api_key:
-        yield
-        return
-
-    previous = os.environ.get("TINKER_API_KEY")
-    if previous == api_key:
-        yield
-        return
-
-    os.environ["TINKER_API_KEY"] = api_key
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop("TINKER_API_KEY", None)
+        self._service_client = tinker.ServiceClient()
+        if checkpoint_path:
+            self._student_client = self._service_client.create_sampling_client(
+                model_path=checkpoint_path,
+            )
         else:
-            os.environ["TINKER_API_KEY"] = previous
+            self._student_client = self._service_client.create_sampling_client(
+                base_model=model_name,
+            )
+
+        return self._student_client
+
+    def refresh_from_sampler_path(self, sampler_path: str) -> Any:
+        if not self._service_client:
+            raise RuntimeError("Student sampler is not initialized.")
+
+        self._student_client = self._service_client.create_sampling_client(
+            model_path=sampler_path,
+        )
+        return self._student_client
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._student_client = None
+        self._service_client = None
+        
+def _create_shared_student_sampler(
+    *,
+    job_id: str,
+    job: JobConfig,
+) -> tuple[_StudentSamplerContext, Any]:
+    ctx = _StudentSamplerContext(job_id=job_id, job=job)
+    client = ctx.__enter__()
+    return ctx, client
 
 def _needs_gold_alignment(student_model: str, teacher_model: str) -> bool:
     _ = (student_model, teacher_model)
@@ -114,8 +131,8 @@ def run_on_policy_job(
     *, 
     workspace: Path,
     job_env: dict[str, str],
-    prompts: Optional[List[str]],
-    rollout_stream: Optional[Iterable[RolloutBatch]] = None,
+    prompts: Optional[List[str]] = None,
+    tool_registry: Optional[Dict[str, Callable[..., Any]]] = None,
 ):
     from .executor import (
         JobExecutionResult,
@@ -124,12 +141,15 @@ def run_on_policy_job(
         _resolve_processor,
         _summarize_metrics,
         _write_metadata,
+        _shutdown_backend,
+        _tool_batch_worker,
     )
     options = job.generation.on_policy_options
     if not options:
         raise JobExecutionError("on_policy_options must be provided")
     
     student_model = job.model.name
+    student_checkpoint = job.model.student_checkpoint_path
     if not student_model:
         raise JobExecutionError("job.model.name must be provided")
 
@@ -144,12 +164,25 @@ def run_on_policy_job(
         "Job %s: on-policy distillation for student=%s collected %d prompts, use_gold_alignment=%s, tool_rollouts=%s",
         job_id,
         student_model,
-        len(prompts),
+        len(prompt_list),
         use_gold_alignment,
-        bool(rollout_stream),
+        bool(tool_registry),
     )
-    
-    if rollout_stream:
+
+    sampler_ctx = None
+    student_client = None
+    rollout_stream = None
+    if tool_registry:
+        sampler_ctx, student_client = _create_shared_student_sampler(job_id=job_id, job=job)
+
+        rollout_stream = _tool_rollout_stream(
+            job_id=job_id,
+            job=job,
+            student_client=student_client,
+            prompts=prompt_list,
+            tool_registry=tool_registry,
+            batch_worker=_tool_batch_worker,
+        )
         events.emit(
             "Finished Setup for tool rollouts streaming for on-policy distillation.",
             code="on_policy.tool_rollouts_stream"
@@ -180,31 +213,38 @@ def run_on_policy_job(
             level="warning",
             code="on_policy.no_prompts",
         )
-        return JobExecutionResult(
+        result = JobExecutionResult(
             artifacts_path=artifact_path,
             metrics={"records": 0},
             messages=["No prompts found, skipped on-policy distillation."]
         )
+        if sampler_ctx:
+            sampler_ctx.__exit__(None, None, None)
+        return result
     
+    if rollout_stream:
+        return _run_tool_on_policy_stream(
+            job_id=job_id,
+            job=job,
+            options=options,
+            workspace=workspace,
+            rollout_stream=rollout_stream,
+            sampler_ctx=sampler_ctx,
+            metadata_path=metadata_path,
+            artifact_path=artifact_path,
+        )
+        
     renderer_name = model_info.get_recommended_renderer_name(student_model)
 
     dataset_builder: RLDatasetBuilder
-    if rollout_stream:
-        dataset_builder = ToolRolloutDatasetBuilder(
-            prompt_batches=rollout_stream,
-            dataset_name=(job.source.dataset or "prompts"), # does this not have option args
-            renderer_name=renderer_name,
-            model_name_for_tokenizer=student_model,
-        )
-    else:
-        dataset_builder = PromptListDatasetBuilder(
-            prompts=prompt_list,
-            dataset_name=(job.source.dataset or "prompts"),
-            groups_per_batch=options.groups_per_batch,
-            group_size=options.group_size,
-            renderer_name=renderer_name,
-            model_name_for_tokenizer=student_model,
-        )
+    dataset_builder = PromptListDatasetBuilder(
+        prompts=prompt_list,
+        dataset_name=(job.source.dataset or "prompts"),
+        groups_per_batch=options.groups_per_batch,
+        group_size=options.group_size,
+        renderer_name=renderer_name,
+        model_name_for_tokenizer=student_model,
+    )
 
     teacher_config = TeacherConfig(base_model=options.teacher)
     dataset_config = DistillationDatasetConfig(
@@ -219,7 +259,7 @@ def run_on_policy_job(
         "Job %s: starting Tinker training (teacher=%s, prompts=%d) logs=%s",
         job_id,
         options.teacher,
-        len(prompts),
+        len(prompt_list),
         training_dir
     )
     events.emit(
@@ -245,33 +285,31 @@ def run_on_policy_job(
         log_path=str(training_dir),
         base_url=None,
         enable_trace=False,
-        eval_every=options.eval_every,
         save_every=options.save_every,
-        load_checkpoint_path=None,
+        load_checkpoint_path=student_checkpoint,
         use_gold_alignment=use_gold_alignment,
     )
 
     _configure_tinker_logging()
 
-    with _temporary_api_key(options.api_key):
-        try:
-            asyncio.run(train_on_policy.main(train_config))
-        except Exception as exc:
-            raise JobExecutionError(f"On-policy distillation failed: {exc}") from exc
+    try:
+        asyncio.run(train_on_policy.main(train_config))
+    except Exception as exc:
+        raise JobExecutionError(f"On-policy distillation failed: {exc}") from exc
 
-        checkpoint = checkpoint_utils.get_last_checkpoint(
-            str(training_dir), required_key="sampler_path"
-        )
-        if not checkpoint or "sampler_path" not in checkpoint:
-            raise JobExecutionError("On-policy training did not produce a sampler checkpoint")
+    checkpoint = checkpoint_utils.get_last_checkpoint(
+        str(training_dir), required_key="sampler_path"
+    )
+    if not checkpoint or "sampler_path" not in checkpoint:
+        raise JobExecutionError("On-policy training did not produce a sampler checkpoint")
 
-        hf_payload_dir, manifest, checkpoints_index_text = _prepare_hf_payload(
-            training_dir=training_dir,
-            checkpoint=checkpoint,
-            workspace=workspace,
-        )
-        if not manifest:
-            raise JobExecutionError("On-policy training did not produce uploadable checkpoint artifacts")
+    hf_payload_dir, manifest, checkpoints_index_text = _prepare_hf_payload(
+        training_dir=training_dir,
+        checkpoint=checkpoint,
+        workspace=workspace,
+    )
+    if not manifest:
+        raise JobExecutionError("On-policy training did not produce uploadable checkpoint artifacts")
         
     metrics = {
         "records": 0,
@@ -315,13 +353,54 @@ def run_on_policy_job(
         code="on_policy.completed",
         data={"training_batches": metrics["training_batches"]}
     )
-    return JobExecutionResult(
+    result = JobExecutionResult(
         artifacts_path=artifact_path,
         metadata_path=metadata_path,
         upload_source=hf_payload_dir,
         metrics=metrics,
         messages=["On-policy distillation completed."]
     )
+    if sampler_ctx:
+        sampler_ctx.__exit__(None, None, None)
+    return result
+
+def _tool_rollout_stream(
+    *,
+    job_id: str,
+    job: JobConfig,
+    student_client: Any,
+    prompts: List[str],
+    tool_registry: Dict[str, Callable[..., Any]],
+    batch_worker: Callable[..., Any],
+) -> Iterable[List[ToolRolloutTrajectory]]:
+    from .executor import _resolve_batch_size
+
+    batch_size = _resolve_batch_size(job, prompts)
+    total_batches = (len(prompts) + batch_size - 1) // batch_size
+
+    for batch_index, start in enumerate(range(0, len(prompts), batch_size)):
+        chunk = prompts[start: start + batch_size]
+        future = batch_worker(
+            job_id=job_id,
+            prompts=chunk,
+            backend=student_client,
+            job=job,
+            post_processor=None,
+            tool_registry=tool_registry,
+            include_logprobs=True,
+        )
+        trajectories = future.result()
+        events.emit(
+            "Tool rollout batch ready.",
+            code="tool_on_policy.batch_ready",
+            data={
+                "batch_index": batch_index,
+                "batch_size": len(chunk),
+                "total_batches": total_batches,
+            }
+        )
+        if trajectories:
+            yield trajectories
 
 def _configure_tinker_logging() -> None:
     stream_formatter = logging.Formatter("[tinker] %(message)s")

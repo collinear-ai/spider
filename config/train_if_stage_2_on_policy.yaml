@@ -1,0 +1,36 @@
+server:
+  base_url:
+  api_key:
+  request_timeout: 180
+
+job:
+  model:
+    provider: tinker
+    name: "Qwen/Qwen3-8B"
+  source:
+    dataset: "allenai/tulu-3-sft-personas-instruction-following"
+    split: "train[0:5000]"
+    # split: "train[0:8]"
+    field: "prompt"
+  generation:
+    on_policy: true
+    on_policy_options:
+      teacher: "openai/gpt-oss-20b"
+      learning_rate: 1e-7
+      groups_per_batch: 64
+      # groups_per_batch: 4
+      group_size: 2
+      max_tokens: 4096
+      lora_rank: 32
+      num_substeps: 1
+      kl_penalty_coef: 1.0
+      kl_discount_factor: 0.0
+      loss_fn: "importance_sampling"
+      compute_post_kl: true
+      save_every: 20
+  output:
+    mode: "upload_hf"
+    hf:
+      repo_id: collinear-ai/Qwen3-8B-tulu-if-gpt-20B-on-policy-5K
+      repo_type: "model"
+      private: false

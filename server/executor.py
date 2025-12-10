@@ -223,7 +223,6 @@ def _run_tool_on_policy_job(
         raise JobExecutionError("Tool-aware on-policy jobs require at least one tool.")
     
     runtime_env, runtime_stack, _ = _prepare_runtime_env(job, job_env)
-    backend = _resolve_rollout_backend(job)
     
     pre_processor, _, prompts = _prepare_processors_and_prompts(
         job=job,
@@ -239,14 +238,6 @@ def _run_tool_on_policy_job(
             data={"tool_names": sorted(tool_registry.keys())}
         )
 
-    rollout_stream = _tool_rollout_stream(
-        job_id=job_id,
-        job=job,
-        backend=backend,
-        prompts=prompts,
-        tool_registry=tool_registry,
-    )
-
     try:
         return run_on_policy_job(
             job_id,
@@ -254,10 +245,9 @@ def _run_tool_on_policy_job(
             workspace=workspace,
             job_env=job_env,
             prompts=prompts,
-            rollout_stream=rollout_stream,
+            tool_registry=tool_registry,
         )
     finally:
-        _shutdown_backend(job_id, backend)
         runtime_stack.close()
         if runtime_env:
             runtime_env.cleanup()
@@ -514,41 +504,6 @@ def _build_batch_worker(
         dict(backend.metrics() or {})
     )
 
-def _tool_rollout_stream(
-    *,
-    job_id: str,
-    job: JobConfig,
-    backend: Any,
-    prompts: List[str],
-    tool_registry: Dict[str, Callable[..., Any]],
-) -> Iterable[List[Dict[str, Any]]]:
-    batch_worker = _build_batch_worker(
-        job_id=job_id,
-        job=job,
-        backend=backend,
-        post_processor=None,
-        tool_registry=tool_registry,
-    )
-    batch_size = _resolve_batch_size(job, prompts)
-    total_batches = (len(prompts) + batch_size - 1) // batch_size
-
-    for batch_index, start in enumerate(range(0, len(prompts), batch_size)):
-        chunk = prompts[start: start + batch_size]
-        future, metrics = batch_worker(chunk)
-        records = future.result()
-        events.emit(
-            "Tool rollout batch ready.",
-            code="tool_on_policy.batch_ready",
-            data={
-                "batch_index": batch_index,
-                "batch_size": len(chunk),
-                "total_batches": total_batches,
-                "metrics": metrics,
-            },
-        )
-        if records:
-            yield records
-
 def _pair_records(prompts: Iterable[str], generations: Iterable[str]) -> List[Dict[str, Any]]:
     paired = []
     for prompt, completion in zip(prompts, generations):
@@ -706,6 +661,7 @@ def _tool_batch_worker(
     job: JobConfig,
     post_processor: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]],
     tool_registry: Dict[str, Callable[..., Any]],
+    include_logprobs: bool = False,
 ) -> List[Dict[str, Any]]:
     tool_defs = _tool_descriptors(job.tools)
 
@@ -717,7 +673,7 @@ def _tool_batch_worker(
 
     def run_prompt(prompt):
         try:
-            transcript = _run_prompt_with_tools(
+            transcript, token_ids, logprobs, reward_mask = _run_prompt_with_tools(
                 backend=backend,
                 job=job,
                 prompt=prompt,
@@ -725,6 +681,7 @@ def _tool_batch_worker(
                 tool_registry=tool_registry,
                 turn_limit=turn_limit,
                 job_id=job_id,
+                include_logprobs=include_logprobs,
             )
         except Exception as exc:
             logger.exception("Job %s: prompt worker crashed while handling `%s`.", job_id, prompt[:20])
@@ -737,6 +694,15 @@ def _tool_batch_worker(
             )
             raise
         record = {"prompt": prompt, "completion": transcript}
+        if include_logprobs:
+            record = {
+                "prompt": prompt,
+                "completion": transcript,
+                "token_ids": token_ids,
+                "logprobs": logprobs,
+                "reward_mask": reward_mask,
+            }
+
         if post_processor:
             processed = post_processor(record)
             if processed is None:
@@ -815,9 +781,14 @@ def _run_prompt_with_tools(
     tool_registry: Dict[str, Callable[..., Any]],
     turn_limit: int,
     job_id: str,
-) -> List[Dict[str, Any]]:
+    include_logprobs: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[int], List[float], List[int]]:
     history = _initial_chat_history(prompt, job)
     transcript = []
+
+    all_token_ids = []
+    all_logprobs = []
+    all_reward_masks = []
     
     prompt_preview = prompt.replace("\n", "\\n")
     prompt_preview = prompt_preview[:40] + ("..." if len(prompt_preview) > 80 else "")
@@ -830,11 +801,13 @@ def _run_prompt_with_tools(
             turn_idx,
             prompt_preview
         )
+        # TODO: only return full logprob for the last turn
         assistant_message = _call_backend_chat(
             backend=backend,
             messages=history,
             tools=tool_defs,
             parameters=job.generation.parameters,
+            include_logprobs=include_logprobs,
         )
         logger.info(
             "Job %s: assistant turn %d for prompt `%s` returned keys=%s tool_calls=%s",
@@ -849,6 +822,15 @@ def _run_prompt_with_tools(
             "content": assistant_message.get("content", ""),
             "tool_calls": assistant_message.get("tool_calls"),
         }
+
+        token_ids = assistant_message.get("token_ids") or []
+        logprobs = assistant_message.get("logprobs") or []
+        reward_mask = assistant_message.get("reward_mask") or []
+        if include_logprobs:
+            all_token_ids.extend(token_ids)
+            all_logprobs.extend(logprobs)
+            all_reward_masks.extend(reward_mask)
+
         transcript.append(snapshot)
         history.append(snapshot)
         tool_calls = assistant_message.get("tool_calls") or []
@@ -858,7 +840,7 @@ def _run_prompt_with_tools(
                 job_id,
                 prompt_preview,
             )
-            return transcript
+            return transcript, all_token_ids, all_logprobs, all_reward_masks
         
         for call in tool_calls:
             function_call = call.get("function") or {}
@@ -951,23 +933,6 @@ def _prepare_runtime_env(
 
     return runtime_env, runtime_stack, merged_env
 
-def _resolve_rollout_backend(job: JobConfig):
-    model_config = job.model
-    provider = (model_config.provider or "").lower()
-    if provider == "tinker":
-        base_model_name = model_config.name
-        if not base_model_name:
-            raise JobExecutionError("Tool-aware on-policy jobs require `job.model.name` to resolve rollout backend.")
-
-        model_config = ModelConfig(
-            provider="vllm",
-            name=base_model_name,
-            parameters=dict(model_config.parameters or {})
-        )
-    
-    _ensure_tensor_parallel(job)
-    return create_backend(model_config)
-
 def _prepare_processors_and_prompts(
     *,
     job: JobConfig,
@@ -987,7 +952,17 @@ def _call_backend_chat(
     messages: List[Dict[str, Any]],
     tools: List[Dict[str, Any]],
     parameters: Dict[str, Any],
+    include_logprobs: bool = False,
 ) -> Dict[str, Any]:
+    if _is_tinker_backend(backend):
+        return _tinker_chat_and_logprobs(
+            sampling_client=backend,
+            messages=messages,
+            tools=tools,
+            parameters=parameters,
+            include_logprobs=include_logprobs
+        )
+
     chat_fn = getattr(backend, "chat", None)
     if not callable(chat_fn):
         raise JobExecutionError("Backend does not support chat tool calls.")
@@ -996,11 +971,14 @@ def _call_backend_chat(
         len(messages),
         bool(tools)
     )
+    
+    params = dict(parameters or {})
+
     try:
         response = chat_fn(
             messages=messages,
             tools=tools or None,
-            parameters=dict(parameters or {})
+            parameters=params,
         )
         logger.info(
             "Chat call returned successfully (tool_calls=%s)",
@@ -1010,6 +988,79 @@ def _call_backend_chat(
     except Exception as exc:
         logger.exception("Chat backend failed: %s", exc)
         raise JobExecutionError(f"Chat backend failed: {exc}") from exc
+
+def _tinker_chat_and_logprobs(
+    *,
+    sampling_client: Any,
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    parameters: Dict[str, Any],
+    include_logprobs: bool,
+) -> Dict[str, Any]:
+    import tinker
+    from tinker_cookbook import renderers, model_info
+    from tinker_cookbook.tokenizer_utils import get_tokenizer
+    base_model = getattr(sampling_client, "base_model", None) or getattr(sampling_client, "model_id", None)
+    renderer_name = model_info.get_recommended_renderer_name(base_model or "")
+    tokenizer = get_tokenizer(base_model or "")
+    renderer = renderers.get_renderer(renderer_name, tokenizer=tokenizer)
+
+    convo = []
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        if role == "system":
+            convo.append({"role": "system", "content": content})
+        elif role == "user":
+            convo.append({"role": "user", "content": content})
+        elif role == "assistant":
+            convo.append({"role": "assistant", "content": content})
+        elif role == "tool":
+            convo.append({"role": "assistant", "content": content}) # TODO: verify role is tool vs assistant
+    prompt_text = renderer.build_generation_prompt(convo)
+
+    sampling_params = parameters.copy()
+    max_tokens = sampling_params.pop("max_tokens", None)
+    temperature = sampling_params.pop("temperature", None)
+    top_p = sampling_params.pop("top_p", None)
+    stop = renderer.get_stop_sequences()
+
+    sample_resp = sampling_client.sample(
+        prompt=prompt_text,
+        num_samples=1,
+        sampling_params=tinker.types.SamplingParams(
+            max_tokens=max_tokens or 1024,
+            temperature=temperature if temperature is not None else 0.7,
+            top_p=top_p if top_p is not None else 0.95,
+            stop=stop,
+        )
+    )
+    seq = sample_resp.sequences[0]
+    completion_tokens = seq.tokens
+    assistant_text, _ = renderer.parse_response(completion_tokens)
+
+    result = {
+        "role": "assistant",
+        "content": assistant_text["content"],
+        "tool_calls": None, # TODO: need to support tool calls
+        "token_ids": [],
+        "logprobs": [],
+        "reward_masks": [], 
+    }
+
+    if include_logprobs:
+        prompt_tokens = tokenizer.encode(prompt_text)
+        full_tokens = prompt_tokens + completion_tokens
+        lp_resp = sampling_client.compute_logprobs(
+            prompt=prompt_text,
+            tokens=full_tokens,
+            include_prompt_logprobs=True, # TODO: skip this to be faster (does it matter?)
+        )
+        result["token_ids"] = full_tokens
+        result["logprobs"] = lp_resp.logprobs
+        result["reward_masks"] = [0] * len(prompt_tokens) + [1] * len(completion_tokens)
+
+    return result
 
 def _initial_chat_history(prompt: str, job: JobConfig) -> List[Dict[str, Any]]:
     history = []
@@ -1129,3 +1180,7 @@ def _shutdown_backend(job_id: str, backend: Any) -> None:
             close()
         except Exception as exc:
             logger.warning("Job %s: backend shutdown raised %s", job_id, exc)
+
+def _is_tinker_backend(backend: Any) -> bool:
+    import tinker
+    return isinstance(backend, tinker.SamplingClient)
