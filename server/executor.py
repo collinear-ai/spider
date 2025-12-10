@@ -875,8 +875,70 @@ def _tinker_chat_and_logprobs(
     parameters: Dict[str, Any],
     include_logprobs: bool,
 ) -> Dict[str, Any]:
+    import tinker
     from tinker_cookbook import renderers, model_info
-    # TODO: finish chat and logprobs computation
+    from tinker_cookbook.tokenizer_utils import get_tokenizer
+    base_model = getattr(sampling_client, "base_model", None) or getattr(sampling_client, "model_id", None)
+    renderer_name = model_info.get_recommended_renderer_name(base_model or "")
+    tokenizer = get_tokenizer(base_model or "")
+    renderer = renderers.get_renderer(renderer_name, tokenizer=tokenizer)
+
+    convo = []
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        if role == "system":
+            convo.append({"role": "system", "content": content})
+        elif role == "user":
+            convo.append({"role": "user", "content": content})
+        elif role == "assistant":
+            convo.append({"role": "assistant", "content": content})
+        elif role == "tool":
+            convo.append({"role": "assistant", "content": content}) # TODO: verify role is tool vs assistant
+    prompt_text = renderer.build_generation_prompt(convo)
+
+    sampling_params = parameters.copy()
+    max_tokens = sampling_params.pop("max_tokens", None)
+    temperature = sampling_params.pop("temperature", None)
+    top_p = sampling_params.pop("top_p", None)
+    stop = renderer.get_stop_sequences()
+
+    sample_resp = sampling_client.sample(
+        prompt=prompt_text,
+        num_samples=1,
+        sampling_params=tinker.types.SamplingParams(
+            max_tokens=max_tokens or 1024,
+            temperature=temperature if temperature is not None else 0.7,
+            top_p=top_p if top_p is not None else 0.95,
+            stop=stop,
+        )
+    )
+    seq = sample_resp.sequences[0]
+    completion_tokens = seq.tokens
+    assistant_text, _ = renderer.parse_response(completion_tokens)
+
+    result = {
+        "role": "assistant",
+        "content": assistant_text["content"],
+        "tool_calls": None, # TODO: need to support tool calls
+        "token_ids": [],
+        "logprobs": [],
+        "reward_masks": [], 
+    }
+
+    if include_logprobs:
+        prompt_tokens = tokenizer.encode(prompt_text)
+        full_tokens = prompt_tokens + completion_tokens
+        lp_resp = sampling_client.compute_logprobs(
+            prompt=prompt_text,
+            tokens=full_tokens,
+            include_prompt_logprobs=True, # TODO: skip this to be faster (does it matter?)
+        )
+        result["token_ids"] = full_tokens
+        result["logprobs"] = lp_resp.logprobs
+        result["reward_masks"] = [0] * len(prompt_tokens) + [1] * len(completion_tokens)
+
+    return result
 
 def _initial_chat_history(prompt: str, job: JobConfig) -> List[Dict[str, Any]]:
     history = []
