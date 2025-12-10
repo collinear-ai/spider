@@ -19,7 +19,7 @@ from datasets import Dataset
 import os
 
 # Configuration
-EVAL_OUTPUT_DIR = Path("trajectories/SWE-bench__SWE-smith-train/CodeActAgent/gpt-4o_maxiter_50")
+EVAL_OUTPUT_DIR = Path("trajectories/SWE-bench__SWE-smith-train/CodeActAgent/Qwen3-Coder-30B-A3B-Instruct_maxiter_150")
 OUTPUT_FILE = EVAL_OUTPUT_DIR / "output.jsonl"
 HF_REPO_ID = "collinear-ai/TEMP_spider_openhands_integration_test"
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -171,7 +171,11 @@ def extract_tools_from_trajectory(trajectory):
 def transform_record(record):
     """Transform to OpenAI function calling format (matches SWE-Gym)."""
     # Get raw trajectory
-    trajectory = record.get("history", [])
+    trajectory = record.get("history") or []
+
+    # Skip records with missing/empty trajectories
+    if not trajectory:
+        return None
     
     # Convert to messages format (OpenAI function calling)
     messages = trajectory_to_messages(trajectory)
@@ -248,6 +252,9 @@ with open(OUTPUT_FILE, 'r') as f:
     for i, line in enumerate(f, 1):
         record = json.loads(line)
         transformed = transform_record(record)
+        if transformed is None:
+            print(f"  ⚠️  Skipping record {i}: empty or missing history")
+            continue
         # Remove None values but keep empty lists
         transformed = {k: v for k, v in transformed.items() if v is not None}
         data.append(transformed)
