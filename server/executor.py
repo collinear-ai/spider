@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from re import S
 import json, os, logging, inspect, time, threading, traceback
 import concurrent
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -661,13 +662,25 @@ def _run_prompt_with_tools(
     job_id: str,
     include_logprobs: bool = False,
 ) -> Tuple[List[Dict[str, Any]], List[int], List[float], List[int]]:
+    if include_logprobs and not _is_tinker_backend(backend):
+        raise JobExecutionError("include_logprobs with tools is only supported for Tinker backend.")
+
     history = _initial_chat_history(prompt, job)
     transcript = []
 
     all_token_ids = []
     all_logprobs = []
     all_reward_masks = []
-    
+    turn_prompt_counts = []
+    turn_completion_lens = []
+
+    base_model = None
+    renderer_name = None
+    if _is_tinker_backend(backend):
+        from tinker_cookbook import model_info
+        base_model = job.model.name
+        renderer_name = model_info.get_recommended_renderer_name(base_model)
+
     prompt_preview = prompt.replace("\n", "\\n")
     prompt_preview = prompt_preview[:40] + ("..." if len(prompt_preview) > 80 else "")
     logger.info("Job %s: Tool-runner invoked for prompt `%s`", job_id, prompt_preview)
@@ -679,7 +692,6 @@ def _run_prompt_with_tools(
             turn_idx,
             prompt_preview
         )
-        # TODO: only return full logprob for the last turn
         assistant_message = _call_backend_chat(
             backend=backend,
             messages=history,
@@ -705,9 +717,9 @@ def _run_prompt_with_tools(
         logprobs = assistant_message.get("logprobs") or []
         reward_mask = assistant_message.get("reward_mask") or []
         if include_logprobs:
-            all_token_ids.extend(token_ids)
-            all_logprobs.extend(logprobs)
-            all_reward_masks.extend(reward_mask)
+            prompt_len = assistant_message.get("prompt_token_count", 0)
+            turn_prompt_counts.append(prompt_len)
+            turn_completion_lens.append(len(token_ids))
 
         transcript.append(snapshot)
         history.append(snapshot)
@@ -718,6 +730,15 @@ def _run_prompt_with_tools(
                 job_id,
                 prompt_preview,
             )
+            if include_logprobs:
+                all_token_ids, all_logprobs, all_reward_masks = _finalize_tinker_rollout_logprobs(
+                    sampling_client=backend,
+                    base_model=base_model,
+                    history=history,
+                    renderer_name=renderer_name,
+                    turn_prompt_counts=turn_prompt_counts,
+                    turn_completion_lens=turn_completion_lens,
+                )
             return transcript, all_token_ids, all_logprobs, all_reward_masks
         
         for call in tool_calls:
@@ -885,6 +906,7 @@ def _tinker_chat_and_logprobs(
 
     convo = _render_messages_with_tools(messages, renderer_name)
     prompt_text = renderer.build_generation_prompt(convo)
+    prompt_tokens = _model_input_tokens(prompt_text, tokenizer=tokenizer) if include_logprobs else []
 
     sampling_params = parameters.copy()
     max_tokens = sampling_params.pop("max_tokens", None)
@@ -904,7 +926,7 @@ def _tinker_chat_and_logprobs(
     )
     seq = sample_resp.sequences[0]
     completion_tokens = seq.tokens
-    assistant_message, _ = renderer.parse_response(completion_tokens) # TODO: does this support tool call at all?
+    assistant_message, _ = renderer.parse_response(completion_tokens) # will fail natively
     tool_calls = _normalize_tool_calls(
         assistant_message.get("tool_calls"),
         assistant_message.get("content", ""),
@@ -918,21 +940,55 @@ def _tinker_chat_and_logprobs(
         "token_ids": [],
         "logprobs": [],
         "reward_mask": [], 
+        "prompt_token_count": len(prompt_tokens),
     }
 
     if include_logprobs:
-        prompt_tokens = _model_input_tokens(prompt_text, tokenizer=tokenizer)
-        full_tokens = prompt_tokens + completion_tokens
-        lp_resp = sampling_client.compute_logprobs(
-            prompt=prompt_text,
-            tokens=full_tokens,
-            include_prompt_logprobs=True, # TODO: skip this to be faster (does it matter?)
-        )
-        result["token_ids"] = full_tokens
-        result["logprobs"] = lp_resp.logprobs
-        result["reward_mask"] = [0] * len(prompt_tokens) + [1] * len(completion_tokens)
+        result["token_ids"] = completion_tokens
+        result["logprobs"] = []
 
     return result
+
+def _finalize_tinker_rollout_logprobs(
+    *,
+    sampling_client: Any,
+    base_model: str,
+    history: List[Dict[str, Any]],
+    renderer_name: str,
+    turn_prompt_counts: List[int],
+    turn_completion_lens: List[int],
+) -> Tuple[List[int], List[float], List[int]]:
+    from tinker_cookbook import renderers
+    from tinker_cookbook.tokenizer_utils import get_tokenizer
+
+    tokenizer = get_tokenizer(base_model)
+    renderer = renderers.get_renderer(renderer_name, tokenizer=tokenizer)
+
+    convo = _render_messages_with_tools(history, renderer_name)
+    prompt_text = renderer.build_generation_prompt(convo)
+    full_tokens = _model_input_tokens(prompt_text, tokenizer=tokenizer)
+
+    lp_resp = sampling_client.compute_logprobs(
+        prompt=prompt_text,
+        tokens=full_tokens,
+        include_prompt_logprobs=True,
+    )
+
+    reward_mask = [0] * len(full_tokens)
+    for prompt_len, completion_len in zip(turn_prompt_counts, turn_completion_lens):
+        start = max(0, prompt_len)
+        end = min(prompt_len + completion_len, len(full_tokens))
+
+        for idx in range(start, end):
+            reward_mask[idx] = 1
+
+    return full_tokens, lp_resp.logprobs, reward_mask
+
+def _model_input_tokens(text: str, tokenizer: Any) -> List[int]:
+    tokens = tokenizer.encode(text)
+    if tokens and isinstance(tokens[0], list):
+        return tokens[0]
+    return tokens
 
 def _render_messages_with_tools(
     messages: List[Dict[str, Any]],
