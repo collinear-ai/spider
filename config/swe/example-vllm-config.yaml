@@ -37,7 +37,7 @@ scaffold:
   # (no llm_base_url needed for OpenAI)
 
   # Parallel processing
-  num_workers: 8  # Reduced to avoid Docker build issues (start with 2, increase gradually)
+  num_workers: 8  
 
   # Performance tuning
   max_retries: 3
