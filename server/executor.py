@@ -883,18 +883,7 @@ def _tinker_chat_and_logprobs(
     tokenizer = get_tokenizer(base_model or "")
     renderer = renderers.get_renderer(renderer_name, tokenizer=tokenizer)
 
-    convo = []
-    for msg in messages:
-        role = msg.get("role")
-        content = msg.get("content")
-        if role == "system":
-            convo.append({"role": "system", "content": content})
-        elif role == "user":
-            convo.append({"role": "user", "content": content})
-        elif role == "assistant":
-            convo.append({"role": "assistant", "content": content})
-        elif role == "tool":
-            convo.append({"role": "assistant", "content": content}) # TODO: verify role is tool vs assistant
+    convo = _render_messages_with_tools(messages, renderer_name)
     prompt_text = renderer.build_generation_prompt(convo)
 
     sampling_params = parameters.copy()
@@ -915,19 +904,24 @@ def _tinker_chat_and_logprobs(
     )
     seq = sample_resp.sequences[0]
     completion_tokens = seq.tokens
-    assistant_text, _ = renderer.parse_response(completion_tokens)
+    assistant_message, _ = renderer.parse_response(completion_tokens) # TODO: does this support tool call at all?
+    tool_calls = _normalize_tool_calls(
+        assistant_message.get("tool_calls"),
+        assistant_message.get("content", ""),
+        renderer_name,
+    )
 
     result = {
         "role": "assistant",
-        "content": assistant_text["content"],
-        "tool_calls": None, # TODO: need to support tool calls
+        "content": assistant_message["content"],
+        "tool_calls": tool_calls or None,
         "token_ids": [],
         "logprobs": [],
-        "reward_masks": [], 
+        "reward_mask": [], 
     }
 
     if include_logprobs:
-        prompt_tokens = tokenizer.encode(prompt_text)
+        prompt_tokens = _model_input_tokens(prompt_text, tokenizer=tokenizer)
         full_tokens = prompt_tokens + completion_tokens
         lp_resp = sampling_client.compute_logprobs(
             prompt=prompt_text,
@@ -936,9 +930,112 @@ def _tinker_chat_and_logprobs(
         )
         result["token_ids"] = full_tokens
         result["logprobs"] = lp_resp.logprobs
-        result["reward_masks"] = [0] * len(prompt_tokens) + [1] * len(completion_tokens)
+        result["reward_mask"] = [0] * len(prompt_tokens) + [1] * len(completion_tokens)
 
     return result
+
+def _render_messages_with_tools(
+    messages: List[Dict[str, Any]],
+    renderer_name: str,
+) -> List[Dict[str, str]]:
+    is_qwen3 = renderer_name.lower().startswith("qwen3")
+    rendered = []
+
+    for msg in messages:
+        role = msg.get("role")
+        raw_content = msg.get("content")
+        content = raw_content if isinstance(raw_content, str) else json.dumps(raw_content)
+
+        if role == "assistant":
+            tool_calls = msg.get("tool_calls") or []
+            if tool_calls:
+                if is_qwen3:
+                    content = _append_qwen3_tool_calls(content, tool_calls)
+                else:
+                    pass
+            rendered.append({"role": "assistant", "content": content})
+        elif role == "tool":
+            if is_qwen3:
+                rendered.append({"role": "user", "content": _render_qwen3_tool_response(content)})
+            else:
+                rendered.append({"role": "tool", "content": _render_tool_turn_content(content)})
+        elif role in ("system", "user"):
+            rendered.append({"role": role, "content": content})
+
+    return rendered
+
+def _render_tool_turn_content(content: str) -> str:
+    # TODO: skip until we are ready to add role: tool to renderer
+    return content
+
+def _render_qwen3_tool_response(content: str) -> str:
+    return f"<tool_response>\n{content}\n</tool_response>"    
+
+def _normalize_tool_calls(
+    renderer_calls: Optional[List[Dict[str, Any]]],
+    content: str,
+    renderer_name: str,
+) -> List[Dict[str, Any]]:
+    calls = renderer_calls or []
+    if not calls:
+        if renderer_name.lower().startswith("qwen3"):
+            calls = _extract_qwen3_tool_calls(content)
+        else:
+            pass
+    return calls
+
+def _append_qwen3_tool_calls(content: str, tool_calls: List[Dict[str, Any]]) -> str:
+    parts = [content] if content else []
+    for call in tool_calls:
+        fn = call.get("function") or {}
+        name = fn.get("name")
+        args = fn.get("arguments")
+        args_json = args if isinstance(args, str) else json.dumps(args or {})
+        parts.append(
+            f"<tool_call>\n{{\"name\": \"{name}\", \"arguments\": {args_json}}}\n</tool_call>"
+        )
+    return "\n".join(parts)
+
+def _extract_qwen3_tool_calls(content: str) -> List[Dict[str, Any]]:
+    calls = []
+    start_tag, end_tag = "<tool_call>", "</tool_call>"
+    start = 0
+    while True:
+        start = content.find(start_tag, start)
+        if start == -1:
+            break
+        start += len(start_tag)
+        end = content.find(end_tag, start)
+        if end == -1:
+            break
+        block = content[start:end].strip()
+        
+        try:
+            payload = json.loads(block)
+        except Exception:
+            start = end + len(end_tag)
+            continue
+        if not isinstance(payload, dict):
+            start = end + len(end_tag)
+            continue
+
+        name = payload.get("name")
+        if not isinstance(name, str):
+            start = end + len(end_tag)
+            continue
+
+        args = payload.get("arguments")
+        calls.append({
+            "id": f"call_{len(calls)}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": args if isinstance(args, str) else json.dumps(args or {}),
+            }
+        })
+        start = end + len(end_tag)
+
+    return calls
 
 def _initial_chat_history(prompt: str, job: JobConfig) -> List[Dict[str, Any]]:
     history = []
