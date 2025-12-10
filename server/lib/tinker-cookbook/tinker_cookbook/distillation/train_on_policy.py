@@ -131,20 +131,45 @@ async def incorporate_kl_penalty(
         ):
             raise ValueError("[tinker-cookbook.distillation.train_on_policy] GOLD alignment requires reconstructed student text and teacher tokenizers")
 
-        teacher_inputs_and_offsets = [
-            _teacher_input_and_completion_start(
-                raw_prompt_text=raw_prompt_texts[i],
-                student_completion_text=student_completion_texts[i],
-                convo_prefix=teacher_convo_prefixes[i],
-                teacher_renderer=teacher_renderers[dataset_indices_D[i]],
-                teacher_tokenizer=teacher_tokenizers[dataset_indices_D[i]],
+        # NOTE: intentional bug to reuse student template
+        # teacher_inputs_and_offsets = [
+        #     _teacher_input_and_completion_start(
+        #         raw_prompt_text=raw_prompt_texts[i],
+        #         student_completion_text=student_completion_texts[i],
+        #         convo_prefix=teacher_convo_prefixes[i],
+        #         teacher_renderer=teacher_renderers[dataset_indices_D[i]],
+        #         teacher_tokenizer=teacher_tokenizers[dataset_indices_D[i]],
+        #     )
+        #     for i in range(len(data_D))
+        # ]
+        teacher_inputs_and_offsets = []
+        for i, datum in enumerate(data_D):
+            teacher_tokenizer = teacher_tokenizers[dataset_indices_D[i]]
+            student_prompt_text = student_tokenizer.decode(
+                list(datum.model_input.to_ints()),
+                skip_special_tokens=False,
             )
-            for i in range(len(data_D))
-        ]
+            teacher_prompt_tokens = teacher_tokenizer.encode(
+                student_prompt_text,
+                add_special_tokens=False,
+            )
+            teacher_completion_tokens = teacher_tokenizer.encode(
+                student_completion_texts[i],
+                add_special_tokens=False,
+            )
+            teacher_inputs_and_offsets.append(
+                (
+                    tinker.ModelInput.from_ints(
+                        teacher_prompt_tokens + teacher_completion_tokens,
+                    ),
+                    len(teacher_prompt_tokens),
+                )
+            )
+
         full_sequence_inputs_D = [entry[0] for entry in teacher_inputs_and_offsets]
         teacher_completion_start_offsets = [entry[1] for entry in teacher_inputs_and_offsets]
         logger.info(
-            "GOLD: encoded teacher inputs for logprobs with teacher template"
+            "[exp/no-template-align] GOLD: encoded teacher inputs for logprobs with student template"
         )
     else:
         full_sequence_inputs_D = [
