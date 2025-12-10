@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio, logging, os, shutil, tarfile, urllib.request, zipfile
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional, Callable, TypedDict
 from urllib.parse import urlparse
@@ -121,26 +120,6 @@ def _create_shared_student_sampler(
     ctx = _StudentSamplerContext(job_id=job_id, job=job)
     client = ctx.__enter__()
     return ctx, client
-
-@contextmanager
-def _temporary_api_key(api_key: str | None):
-    if not api_key:
-        yield
-        return
-
-    previous = os.environ.get("TINKER_API_KEY")
-    if previous == api_key:
-        yield
-        return
-
-    os.environ["TINKER_API_KEY"] = api_key
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop("TINKER_API_KEY", None)
-        else:
-            os.environ["TINKER_API_KEY"] = previous
 
 def _needs_gold_alignment(student_model: str, teacher_model: str) -> bool:
     _ = (student_model, teacher_model)
@@ -313,25 +292,24 @@ def run_on_policy_job(
 
     _configure_tinker_logging()
 
-    with _temporary_api_key(options.api_key):
-        try:
-            asyncio.run(train_on_policy.main(train_config))
-        except Exception as exc:
-            raise JobExecutionError(f"On-policy distillation failed: {exc}") from exc
+    try:
+        asyncio.run(train_on_policy.main(train_config))
+    except Exception as exc:
+        raise JobExecutionError(f"On-policy distillation failed: {exc}") from exc
 
-        checkpoint = checkpoint_utils.get_last_checkpoint(
-            str(training_dir), required_key="sampler_path"
-        )
-        if not checkpoint or "sampler_path" not in checkpoint:
-            raise JobExecutionError("On-policy training did not produce a sampler checkpoint")
+    checkpoint = checkpoint_utils.get_last_checkpoint(
+        str(training_dir), required_key="sampler_path"
+    )
+    if not checkpoint or "sampler_path" not in checkpoint:
+        raise JobExecutionError("On-policy training did not produce a sampler checkpoint")
 
-        hf_payload_dir, manifest, checkpoints_index_text = _prepare_hf_payload(
-            training_dir=training_dir,
-            checkpoint=checkpoint,
-            workspace=workspace,
-        )
-        if not manifest:
-            raise JobExecutionError("On-policy training did not produce uploadable checkpoint artifacts")
+    hf_payload_dir, manifest, checkpoints_index_text = _prepare_hf_payload(
+        training_dir=training_dir,
+        checkpoint=checkpoint,
+        workspace=workspace,
+    )
+    if not manifest:
+        raise JobExecutionError("On-policy training did not produce uploadable checkpoint artifacts")
         
     metrics = {
         "records": 0,
