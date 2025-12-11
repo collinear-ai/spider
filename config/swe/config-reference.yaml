@@ -50,6 +50,9 @@ max_iterations: 50
 #   vLLM: "openai/Qwen/Qwen3-Coder-30B-A3B-Instruct"
 llm_model: "gpt-4o"
 
+# Sampling temperature (null = provider default)
+temperature: null
+
 # API key (direct, not recommended - use llm_api_key_env instead)
 llm_api_key: null
 

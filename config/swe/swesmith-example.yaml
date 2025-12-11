@@ -19,6 +19,8 @@ scaffold:
   # LLM configuration
   llm_model: "gpt-4o"
   llm_api_key_env: "OPENAI_API_KEY"
+  # Optional temperature override (null uses provider default)
+  temperature: null
   
   # Execution configuration
   num_workers: 1

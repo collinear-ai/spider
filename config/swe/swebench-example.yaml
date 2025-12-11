@@ -21,8 +21,10 @@ scaffold:
   max_iterations: 50
   
   # LLM configuration - Option 1: Direct model specification
-  llm_model: "gpt-4o"  # Your LLM model
+  llm_model: "gpt-5"  # Your LLM model
   llm_api_key_env: "OPENAI_API_KEY"  # Read API key from this environment variable
+  # Optional temperature override (null uses provider default)
+  temperature: null
   # llm_api_key: "sk-..."  # Or set directly (not recommended)
   # llm_base_url: null  # Set if using custom API endpoint
   
@@ -30,7 +32,7 @@ scaffold:
   # llm_config_name: "llm.eval_gpt4_1106_preview"  # From OpenHands config.toml
   
   # Execution configuration
-  num_workers: 1  # Number of parallel workers
+  num_workers: 2  # Number of parallel workers
   timeout_seconds: 3600  # 1 hour per instance
   max_retries: 5  # Max retries on failure
   

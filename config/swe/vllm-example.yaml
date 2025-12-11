@@ -18,6 +18,8 @@ scaffold:
   llm_model: "openai/Qwen/Qwen3-Coder-30B-A3B-Instruct"  
   llm_base_url: "http://localhost:8000/v1"  # vLLM endpoint
   llm_api_key: "dummy"  # vLLM doesn't require authentication
+  # Optional temperature override (null uses provider default)
+  temperature: null
 
   # Alternative providers:
   # 
