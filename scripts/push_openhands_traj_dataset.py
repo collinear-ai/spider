@@ -19,9 +19,9 @@ from datasets import Dataset
 import os
 
 # Configuration
-EVAL_OUTPUT_DIR = Path("trajectories/SWE-bench__SWE-smith-train/CodeActAgent/Qwen3-Coder-30B-A3B-Instruct_maxiter_150")
+EVAL_OUTPUT_DIR = Path("trajectories/swe-bench-train/princeton-nlp__SWE-bench-train/CodeActAgent/gpt-5_maxiter_50")
 OUTPUT_FILE = EVAL_OUTPUT_DIR / "output.jsonl"
-HF_REPO_ID = "collinear-ai/TEMP_spider_openhands_integration_test"
+HF_REPO_ID = "collinear-ai/spider-openhands-swe-bench-trajectories"
 HF_TOKEN = os.getenv("HF_TOKEN")
 
 def clean_dict(d):
@@ -190,43 +190,64 @@ def transform_record(record):
         if cleaned_turn:
             cleaned_trajectory.append(cleaned_turn)
     
+    # Capture test_result but strip git_patch to avoid clashing with dataset git_patch
+    test_result = record.get("test_result", {}) or {}
+    generated_git_patch = test_result.pop("git_patch", None)
+
     # Get resolved from test_result.report.resolved (set by evaluation step)
-    # If not evaluated yet, this will be None
     resolved = None
-    test_result = record.get("test_result", {})
     if test_result and "report" in test_result:
         resolved = test_result.get("report", {}).get("resolved")
     
-    result = {
-        "instance_id": record.get("instance_id"),
-        "messages": messages,  # OpenAI format with tool_calls
-        "tools": tools,  # Tools definition
-        "resolved": resolved,  # True/False if evaluated, None if not
-    }
-    
-    # Add optional metadata fields
+    # Build result in order: id -> original fields -> metadata -> resolved/test_result/git_patch -> nested copies -> messages/tools/trajectory
+    result = {}
+
+    # Core identifier
+    result["instance_id"] = record.get("instance_id")
+
+    # Flatten all original instance fields into top-level (preserve original dataset schema)
+    instance_fields = record.get("instance", {}) or {}
+    for k, v in instance_fields.items():
+        if v is not None and k not in result:
+            result[k] = v
+
+    # Optional metadata fields
     if record.get("instance", {}).get("repo"):
         result["repo"] = record.get("instance", {}).get("repo")
     if record.get("instance", {}).get("image_name"):
         result["image_name"] = record.get("instance", {}).get("image_name")
     if record.get("instruction"):
         result["instruction"] = record.get("instruction")
-    if record.get("test_result", {}).get("git_patch"):
-        result["git_patch"] = record.get("test_result", {}).get("git_patch")
     if record.get("metadata", {}).get("agent_class"):
         result["agent_class"] = record.get("metadata", {}).get("agent_class")
     if record.get("metadata", {}).get("llm_config", {}).get("model"):
         result["model"] = record.get("metadata", {}).get("llm_config", {}).get("model")
     if record.get("metadata", {}).get("max_iterations"):
         result["max_iterations"] = record.get("metadata", {}).get("max_iterations")
-    if clean_dict(record.get("metrics", {})):
-        result["metrics"] = clean_dict(record.get("metrics", {}))
+    cleaned_metrics = clean_dict(record.get("metrics", {}))
+    if cleaned_metrics:
+        result["metrics"] = cleaned_metrics
     if record.get("error"):
         result["error"] = record.get("error")
     if record.get("instance", {}).get("problem_statement"):
         result["problem_statement"] = record.get("instance", {}).get("problem_statement")
-    
-    # Include raw trajectory for debugging
+
+    # Resolved and test_result/git_patch
+    result["resolved"] = resolved
+    if generated_git_patch:
+        result["generated_git_patch"] = generated_git_patch
+    cleaned_test_result = clean_dict(test_result)
+    if cleaned_test_result:
+        result["test_result"] = cleaned_test_result
+
+    # Preserve original instance fields (cleaned) as nested
+    cleaned_instance = clean_dict(record.get("instance", {}))
+    if cleaned_instance:
+        result["instance"] = cleaned_instance
+
+    # Conversational artifacts at the end
+    result["messages"] = messages
+    result["tools"] = tools
     result["trajectory"] = cleaned_trajectory
     
     return result

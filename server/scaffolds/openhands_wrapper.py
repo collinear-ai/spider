@@ -136,6 +136,10 @@ class OpenHandsScaffoldConfig(ScaffoldConfig):
         default=None,
         description="LLM model name (e.g., 'anthropic/claude-sonnet-4', 'gpt-4o')"
     )
+    temperature: Optional[float] = Field(
+        default=None,
+        description="Sampling temperature to use for the LLM (overrides provider default)"
+    )
     llm_api_key: Optional[str] = Field(
         default=None,
         description="API key for LLM provider"
@@ -502,6 +506,9 @@ class OpenHandsScaffold(Scaffold):
         
         llm_config.log_completions = True
         llm_config.modify_params = False  # For reproducibility
+        # Apply temperature override if provided
+        if self.oh_config.temperature is not None:
+            llm_config.temperature = self.oh_config.temperature
         
         return llm_config
     
@@ -917,66 +924,94 @@ class OpenHandsScaffold(Scaffold):
         return []
     
     def _transform_output_for_dataset(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        """Transform to OpenAI function calling format (matches SWE-Gym).
+        """Transform to OpenAI function calling format (matches SWE-Gym) with rich metadata.
         
-        Creates a dataset with 'messages' field (OpenAI format with tool_calls)
-        and 'tools' field (tools definition).
+        Fields:
+          - instance_id, messages, tools, resolved
+          - generated_git_patch (renamed from test_result.git_patch)
+          - instance (cleaned original instance fields)
+          - test_result (cleaned, minus git_patch)
+          - repo, image_name, instruction, agent_class, model, max_iterations, metrics, error, problem_statement
+          - trajectory (cleaned raw events)
         """
+        import json
+
         # Get raw trajectory
-        trajectory = record.get("history", [])
-        
+        trajectory = record.get("history") or []
+
         # Convert to messages format (OpenAI function calling)
         messages = self._trajectory_to_messages(trajectory)
-        
+
         # Extract tools definition
         tools = self._extract_tools_from_trajectory(trajectory)
-        
-        # Also clean trajectory for reference
+
+        # Clean trajectory for reference
         cleaned_trajectory = []
         for turn in trajectory:
             cleaned_turn = self._clean_dict_for_parquet(turn)
             if cleaned_turn:
                 cleaned_trajectory.append(cleaned_turn)
-        
-        # Get resolved from test_result.report.resolved (set by evaluation step)
-        # If not evaluated yet, this will be None
+
+        # Capture test_result but strip git_patch to avoid clashing with dataset git_patch
+        test_result = record.get("test_result", {}) or {}
+        generated_git_patch = test_result.pop("git_patch", None)
+
+        # Get resolved from test_result.report.resolved
         resolved = None
-        test_result = record.get("test_result", {})
         if test_result and "report" in test_result:
             resolved = test_result.get("report", {}).get("resolved")
-        
-        result = {
-            "instance_id": record.get("instance_id"),
-            "messages": messages,  # OpenAI format with tool_calls
-            "tools": tools,  # Tools definition
-            "resolved": resolved,  # True/False if evaluated, None if not
-        }
-        
-        # Add optional metadata fields
+
+        # Build result in order: id -> original fields -> metadata -> resolved/test_result/git_patch -> nested copies -> messages/tools/trajectory
+        result: Dict[str, Any] = {}
+
+        # Core identifier
+        result["instance_id"] = record.get("instance_id")
+
+        # Flatten original instance fields into top-level (preserve source schema)
+        instance_fields = record.get("instance", {}) or {}
+        for k, v in instance_fields.items():
+            if v is not None and k not in result:
+                result[k] = v
+
+        # Optional metadata fields
         if record.get("instance", {}).get("repo"):
             result["repo"] = record.get("instance", {}).get("repo")
         if record.get("instance", {}).get("image_name"):
             result["image_name"] = record.get("instance", {}).get("image_name")
         if record.get("instruction"):
             result["instruction"] = record.get("instruction")
-        if record.get("test_result", {}).get("git_patch"):
-            result["git_patch"] = record.get("test_result", {}).get("git_patch")
         if record.get("metadata", {}).get("agent_class"):
             result["agent_class"] = record.get("metadata", {}).get("agent_class")
         if record.get("metadata", {}).get("llm_config", {}).get("model"):
             result["model"] = record.get("metadata", {}).get("llm_config", {}).get("model")
         if record.get("metadata", {}).get("max_iterations"):
             result["max_iterations"] = record.get("metadata", {}).get("max_iterations")
-        if self._clean_dict_for_parquet(record.get("metrics", {})):
-            result["metrics"] = self._clean_dict_for_parquet(record.get("metrics", {}))
+        cleaned_metrics = self._clean_dict_for_parquet(record.get("metrics", {}))
+        if cleaned_metrics:
+            result["metrics"] = cleaned_metrics
         if record.get("error"):
             result["error"] = record.get("error")
         if record.get("instance", {}).get("problem_statement"):
             result["problem_statement"] = record.get("instance", {}).get("problem_statement")
-        
-        # Include raw trajectory for debugging
+
+        # Resolved and test_result/git_patch
+        result["resolved"] = resolved
+        if generated_git_patch:
+            result["generated_git_patch"] = generated_git_patch
+        cleaned_test_result = self._clean_dict_for_parquet(test_result)
+        if cleaned_test_result:
+            result["test_result"] = cleaned_test_result
+
+        # Preserve original instance as nested cleaned dict
+        cleaned_instance = self._clean_dict_for_parquet(record.get("instance", {}))
+        if cleaned_instance:
+            result["instance"] = cleaned_instance
+
+        # Conversational artifacts at the end
+        result["messages"] = messages
+        result["tools"] = tools
         result["trajectory"] = cleaned_trajectory
-        
+
         return result
     
     def _upload_to_huggingface(self, output_file: Path, metadata: EvalMetadata) -> str:
@@ -1018,21 +1053,8 @@ class OpenHandsScaffold(Scaffold):
         new_dataset = Dataset.from_list(data)
         logger.info(f'  ✓ Created dataset with {len(new_dataset)} rows')
         
-        # Try to load existing dataset and append (instead of replacing)
-        try:
-            logger.info(f'Checking for existing dataset at {self.oh_config.hf_repo_id}...')
-            from datasets import load_dataset
-            existing_dataset = load_dataset(self.oh_config.hf_repo_id, split='train', token=hf_token)
-            logger.info(f'  ✓ Found existing dataset with {len(existing_dataset)} rows')
-            
-            # Concatenate old + new
-            from datasets import concatenate_datasets
-            dataset = concatenate_datasets([existing_dataset, new_dataset])
-            logger.info(f'  ✓ Combined dataset: {len(existing_dataset)} existing + {len(new_dataset)} new = {len(dataset)} total rows')
-        except Exception as e:
-            logger.info(f'  No existing dataset found (or error loading): {e}')
-            logger.info(f'  Creating new dataset with {len(new_dataset)} rows')
-            dataset = new_dataset
+        # Do NOT append to existing dataset; always push the current run schema
+        dataset = new_dataset
         
         # Push to Hub
         logger.info(f'Pushing to HuggingFace Hub...')
