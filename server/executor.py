@@ -936,6 +936,7 @@ def _tinker_chat_and_logprobs(
             stop=stop,
         )
     )
+    sample_resp = sample_resp.result() # resolve the future
     seq = sample_resp.sequences[0]
     completion_tokens = seq.tokens
     assistant_message, _ = renderer.parse_response(completion_tokens) # will fail natively
