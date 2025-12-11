@@ -739,6 +739,12 @@ def _run_prompt_with_tools(
                     turn_prompt_counts=turn_prompt_counts,
                     turn_completion_lens=turn_completion_lens,
                 )
+                logger.info(
+                    "Job %s: finalized rollout logprobs with %d completion tokens and %d positive reward masks",
+                    job_id,
+                    sum(turn_completion_lens),
+                    sum(all_reward_masks),
+                )
             return transcript, all_token_ids, all_logprobs, all_reward_masks
         
         for call in tool_calls:
