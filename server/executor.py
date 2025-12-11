@@ -674,11 +674,10 @@ def _run_prompt_with_tools(
     turn_prompt_counts = []
     turn_completion_lens = []
 
-    base_model = None
+    base_model = job.model.name
     renderer_name = None
     if _is_tinker_backend(backend):
         from tinker_cookbook import model_info
-        base_model = job.model.name
         renderer_name = model_info.get_recommended_renderer_name(base_model)
 
     prompt_preview = prompt.replace("\n", "\\n")
@@ -698,6 +697,7 @@ def _run_prompt_with_tools(
             tools=tool_defs,
             parameters=job.generation.parameters,
             include_logprobs=include_logprobs,
+            model_name=job.model.name
         )
         logger.info(
             "Job %s: assistant turn %d for prompt `%s` returned keys=%s tool_calls=%s",
@@ -858,6 +858,7 @@ def _call_backend_chat(
     tools: List[Dict[str, Any]],
     parameters: Dict[str, Any],
     include_logprobs: bool = False,
+    model_name: str | None = None,
 ) -> Dict[str, Any]:
     if _is_tinker_backend(backend):
         return _tinker_chat_and_logprobs(
@@ -865,7 +866,8 @@ def _call_backend_chat(
             messages=messages,
             tools=tools,
             parameters=parameters,
-            include_logprobs=include_logprobs
+            include_logprobs=include_logprobs,
+            model_name=model_name
         )
 
     chat_fn = getattr(backend, "chat", None)
@@ -901,11 +903,15 @@ def _tinker_chat_and_logprobs(
     tools: List[Dict[str, Any]],
     parameters: Dict[str, Any],
     include_logprobs: bool,
+    model_name: str | None = None,
 ) -> Dict[str, Any]:
     import tinker
     from tinker_cookbook import renderers, model_info
     from tinker_cookbook.tokenizer_utils import get_tokenizer
-    base_model = getattr(sampling_client, "base_model", None) or getattr(sampling_client, "model_id", None)
+    base_model = model_name
+    if not base_model or "/" not in base_model:
+        raise JobExecutionError("Tinker sampling client missing model id in org/name form.")
+
     renderer_name = model_info.get_recommended_renderer_name(base_model or "")
     tokenizer = get_tokenizer(base_model or "")
     renderer = renderers.get_renderer(renderer_name, tokenizer=tokenizer)
