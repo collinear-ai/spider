@@ -971,6 +971,7 @@ def _finalize_tinker_rollout_logprobs(
     turn_prompt_counts: List[int],
     turn_completion_lens: List[int],
 ) -> Tuple[List[int], List[float], List[int]]:
+    import tinker
     from tinker_cookbook import renderers
     from tinker_cookbook.tokenizer_utils import get_tokenizer
 
@@ -981,11 +982,9 @@ def _finalize_tinker_rollout_logprobs(
     prompt_text = renderer.build_generation_prompt(convo)
     full_tokens = _model_input_tokens(prompt_text, tokenizer=tokenizer)
 
-    lp_resp = sampling_client.compute_logprobs(
-        prompt=prompt_text,
-        tokens=full_tokens,
-        include_prompt_logprobs=True,
-    )
+    full_inputs = tinker.ModelInput.from_ints(full_tokens)
+    lp_resp = sampling_client.compute_logprobs_async(full_inputs)
+    lp_resp = lp_resp.result()
 
     reward_mask = [0] * len(full_tokens)
     for prompt_len, completion_len in zip(turn_prompt_counts, turn_completion_lens):
@@ -995,7 +994,7 @@ def _finalize_tinker_rollout_logprobs(
         for idx in range(start, end):
             reward_mask[idx] = 1
 
-    return full_tokens, lp_resp.logprobs, reward_mask
+    return full_tokens, lp_resp, reward_mask
 
 def _model_input_tokens(text: Any, tokenizer: Any) -> List[int]:
     # Different renderers return differen dtypes for text
@@ -1006,6 +1005,7 @@ def _model_input_tokens(text: Any, tokenizer: Any) -> List[int]:
         if tokens and isinstance(tokens[0], list):
             return tokens[0]
         return tokens
+    return []
 
 def _render_messages_with_tools(
     messages: List[Dict[str, Any]],
