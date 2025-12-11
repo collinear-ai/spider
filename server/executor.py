@@ -738,6 +738,7 @@ def _run_prompt_with_tools(
                     renderer_name=renderer_name,
                     turn_prompt_counts=turn_prompt_counts,
                     turn_completion_lens=turn_completion_lens,
+                    tools=tool_defs,
                 )
                 logger.info(
                     "Job %s: finalized rollout logprobs with %d completion tokens and %d positive reward masks",
@@ -916,8 +917,12 @@ def _tinker_chat_and_logprobs(
     tokenizer = get_tokenizer(base_model or "")
     renderer = renderers.get_renderer(renderer_name, tokenizer=tokenizer)
 
-    convo = _render_messages_with_tools(messages, renderer_name)
-    prompt_text = renderer.build_generation_prompt(convo)
+    prompt_text = tokenizer.apply_chat_template(
+        messages=messages,
+        tools=tools or None,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
     prompt_tokens = _model_input_tokens(prompt_text, tokenizer=tokenizer) if include_logprobs else []
 
     sampling_params = parameters.copy()
@@ -970,6 +975,7 @@ def _finalize_tinker_rollout_logprobs(
     renderer_name: str,
     turn_prompt_counts: List[int],
     turn_completion_lens: List[int],
+    tools: List[Dict[str, Any]],
 ) -> Tuple[List[int], List[float], List[int]]:
     import tinker
     from tinker_cookbook import renderers
@@ -978,8 +984,12 @@ def _finalize_tinker_rollout_logprobs(
     tokenizer = get_tokenizer(base_model)
     renderer = renderers.get_renderer(renderer_name, tokenizer=tokenizer)
 
-    convo = _render_messages_with_tools(history, renderer_name)
-    prompt_text = renderer.build_generation_prompt(convo)
+    prompt_text = tokenizer.apply_chat_template(
+        messages=history,
+        tools=tools or None,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
     full_tokens = _model_input_tokens(prompt_text, tokenizer=tokenizer)
 
     full_inputs = tinker.ModelInput.from_ints(full_tokens)
@@ -1005,44 +1015,7 @@ def _model_input_tokens(text: Any, tokenizer: Any) -> List[int]:
         if tokens and isinstance(tokens[0], list):
             return tokens[0]
         return tokens
-    return []
-
-def _render_messages_with_tools(
-    messages: List[Dict[str, Any]],
-    renderer_name: str,
-) -> List[Dict[str, str]]:
-    is_qwen3 = renderer_name.lower().startswith("qwen3")
-    rendered = []
-
-    for msg in messages:
-        role = msg.get("role")
-        raw_content = msg.get("content")
-        content = raw_content if isinstance(raw_content, str) else json.dumps(raw_content)
-
-        if role == "assistant":
-            tool_calls = msg.get("tool_calls") or []
-            if tool_calls:
-                if is_qwen3:
-                    content = _append_qwen3_tool_calls(content, tool_calls)
-                else:
-                    pass
-            rendered.append({"role": "assistant", "content": content})
-        elif role == "tool":
-            if is_qwen3:
-                rendered.append({"role": "user", "content": _render_qwen3_tool_response(content)})
-            else:
-                rendered.append({"role": "tool", "content": _render_tool_turn_content(content)})
-        elif role in ("system", "user"):
-            rendered.append({"role": role, "content": content})
-
-    return rendered
-
-def _render_tool_turn_content(content: str) -> str:
-    # TODO: skip until we are ready to add role: tool to renderer
-    return content
-
-def _render_qwen3_tool_response(content: str) -> str:
-    return f"<tool_response>\n{content}\n</tool_response>"    
+    return []   
 
 def _normalize_tool_calls(
     renderer_calls: Optional[List[Dict[str, Any]]],
@@ -1056,18 +1029,6 @@ def _normalize_tool_calls(
         else:
             pass
     return calls
-
-def _append_qwen3_tool_calls(content: str, tool_calls: List[Dict[str, Any]]) -> str:
-    parts = [content] if content else []
-    for call in tool_calls:
-        fn = call.get("function") or {}
-        name = fn.get("name")
-        args = fn.get("arguments")
-        args_json = args if isinstance(args, str) else json.dumps(args or {})
-        parts.append(
-            f"<tool_call>\n{{\"name\": \"{name}\", \"arguments\": {args_json}}}\n</tool_call>"
-        )
-    return "\n".join(parts)
 
 def _extract_qwen3_tool_calls(content: str) -> List[Dict[str, Any]]:
     calls = []
