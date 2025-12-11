@@ -996,11 +996,15 @@ def _finalize_tinker_rollout_logprobs(
 
     return full_tokens, lp_resp.logprobs, reward_mask
 
-def _model_input_tokens(text: str, tokenizer: Any) -> List[int]:
-    tokens = tokenizer.encode(text)
-    if tokens and isinstance(tokens[0], list):
-        return tokens[0]
-    return tokens
+def _model_input_tokens(text: Any, tokenizer: Any) -> List[int]:
+    # Different renderers return differen dtypes for text
+    if hasattr(text, "to_ints"):
+        return list(text.to_ints())
+    if isinstance(text, str):
+        tokens = tokenizer.encode(text)
+        if tokens and isinstance(tokens[0], list):
+            return tokens[0]
+        return tokens
 
 def _render_messages_with_tools(
     messages: List[Dict[str, Any]],
