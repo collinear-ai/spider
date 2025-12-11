@@ -918,7 +918,7 @@ def _tinker_chat_and_logprobs(
     renderer = renderers.get_renderer(renderer_name, tokenizer=tokenizer)
 
     prompt_text = tokenizer.apply_chat_template(
-        messages=messages,
+        messages,
         tools=tools or None,
         add_generation_prompt=True,
         tokenize=False,
@@ -985,7 +985,7 @@ def _finalize_tinker_rollout_logprobs(
     renderer = renderers.get_renderer(renderer_name, tokenizer=tokenizer)
 
     prompt_text = tokenizer.apply_chat_template(
-        messages=history,
+        history,
         tools=tools or None,
         add_generation_prompt=True,
         tokenize=False,
