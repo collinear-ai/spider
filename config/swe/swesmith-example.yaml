@@ -1,0 +1,40 @@
+# Example config for SWE-smith with per-instance images
+# This config uses the pre-built images from the dataset
+
+# Dataset configuration
+dataset: "SWE-bench/SWE-smith"
+split: "train"
+max_instances: 10  # Start small for testing
+
+# Output directory
+output_dir: "./trajectories/swe-smith"
+
+# Agent configuration
+agent_class: "CodeActAgent"
+max_iterations: 50
+
+# LLM configuration
+llm_model: "gpt-4o"
+llm_api_key_env: "OPENAI_API_KEY"
+
+# Execution configuration
+num_workers: 1
+timeout_seconds: 3600
+max_retries: 5
+
+# Runtime configuration
+enable_browser: false
+enable_llm_editor: false
+runtime: "docker"
+platform: "linux/amd64"
+remote_runtime_resource_factor: 1
+
+# IMPORTANT: Leave null for SWE-smith to use per-instance images
+# SWE-smith has 'image_name' field in dataset that points to pre-built images
+base_container_image_override: null
+runtime_container_image: null
+workspace_dir: null
+
+# HuggingFace upload (optional)
+hf_repo_id: null
+hf_private: true

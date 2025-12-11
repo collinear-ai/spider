@@ -1,7 +1,22 @@
 """OpenHands scaffold wrapper for SWE trajectory generation.
 
 This module provides a wrapper around OpenHands for generating SFT trajectories
-from SWE task datasets like SWE-bench/SWE-smith.
+from SWE task datasets. Supports multiple dataset variants:
+- princeton-nlp/SWE-bench (standard SWE-bench, train/test splits)
+- princeton-nlp/SWE-bench_Lite (smaller subset, 300 instances)
+- princeton-nlp/SWE-bench_Verified (verified instances)
+- SWE-bench/SWE-smith (smith variant with per-instance images)
+
+Dataset handling:
+- SWE-smith: Has 'image_name' field in dataset → uses per-instance Docker images
+  (copies repo from /testbed in the image)
+- SWE-bench: No 'image_name' field → recommended to use generic image
+  (clones repo from GitHub at runtime using repo + base_commit)
+
+The wrapper automatically detects the dataset format and handles:
+- Per-instance images (SWE-smith): Copy from /testbed
+- Generic images (SWE-bench): Clone from GitHub and checkout base_commit
+- Git patch extraction (using base_commit for SWE-bench, HEAD for SWE-smith)
 """
 
 import asyncio
@@ -259,8 +274,15 @@ def _get_instance_docker_image(instance: pd.Series, base_image_override: Optiona
     return image_name
 
 
-def _initialize_runtime(runtime: Runtime, instance: pd.Series):
-    """Initialize runtime for SWE task instance."""
+def _initialize_runtime(runtime: Runtime, instance: pd.Series, use_per_instance_image: bool = True):
+    """Initialize runtime for SWE task instance.
+    
+    Args:
+        runtime: Runtime instance
+        instance: Dataset instance
+        use_per_instance_image: If True, copies from /testbed (SWE-smith style).
+                                If False, clones repo from GitHub (generic image for SWE-bench).
+    """
     workspace_dir_name = _get_workspace_dir_name(instance)
     
     # Set instance ID and git config
@@ -286,16 +308,53 @@ def _initialize_runtime(runtime: Runtime, instance: pd.Series):
     obs = runtime.run_action(action)
     assert_and_raise(obs.exit_code == 0, f'Failed to export USER: {str(obs)}')
     
-    # For SWE-smith: copy /testbed to /workspace/{workspace_dir_name}
-    if 'image_name' in instance and instance.get('image_name'):
-        logger.info(f'Copying /testbed to /workspace/{workspace_dir_name} for SWE-smith dataset')
-        action = CmdRunAction(command=f'mkdir -p /workspace && cp -r /testbed /workspace/{workspace_dir_name}')
+    # Setup workspace directory
+    action = CmdRunAction(command='mkdir -p /workspace')
+    action.set_hard_timeout(600)
+    obs = runtime.run_action(action)
+    assert_and_raise(obs.exit_code == 0, f'Failed to create /workspace: {str(obs)}')
+    
+    if use_per_instance_image:
+        # SWE-smith: Copy /testbed to workspace (per-instance image with pre-built repo)
+        logger.info(f'Using per-instance image: Copying /testbed to /workspace/{workspace_dir_name}')
+        action = CmdRunAction(command=f'cp -r /testbed /workspace/{workspace_dir_name}')
         action.set_hard_timeout(600)
         obs = runtime.run_action(action)
         assert_and_raise(
             obs.exit_code == 0,
             f'Failed to copy /testbed to /workspace/{workspace_dir_name}: {str(obs)}',
         )
+    else:
+        # SWE-bench: Clone repo from GitHub (generic image)
+        logger.info(f'Using generic image: Cloning repo {instance["repo"]} to /workspace/{workspace_dir_name}')
+        
+        # Extract repo URL
+        repo = instance['repo']
+        if not repo.startswith('http'):
+            # Assume it's org/repo format, construct GitHub URL
+            repo_url = f'https://github.com/{repo}.git'
+        else:
+            repo_url = repo
+        
+        # Clone repo
+        action = CmdRunAction(command=f'git clone {repo_url} /workspace/{workspace_dir_name}')
+        action.set_hard_timeout(600)
+        obs = runtime.run_action(action)
+        assert_and_raise(
+            obs.exit_code == 0,
+            f'Failed to clone repo {repo_url}: {str(obs)}',
+        )
+        
+        # Checkout base_commit if available
+        if 'base_commit' in instance and instance.get('base_commit'):
+            logger.info(f'Checking out base commit: {instance["base_commit"]}')
+            action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name} && git checkout {instance["base_commit"]}')
+            action.set_hard_timeout(600)
+            obs = runtime.run_action(action)
+            assert_and_raise(
+                obs.exit_code == 0,
+                f'Failed to checkout base commit {instance["base_commit"]}: {str(obs)}',
+            )
     
     # Navigate to workspace
     action = CmdRunAction(command=f'cd /workspace/{workspace_dir_name}')
@@ -306,7 +365,7 @@ def _initialize_runtime(runtime: Runtime, instance: pd.Series):
         f'Failed to cd to /workspace/{workspace_dir_name}: {str(obs)}',
     )
     
-    # Reset git state
+    # Reset git state (for per-instance images, or after checkout for cloned repos)
     action = CmdRunAction(command='git reset --hard')
     action.set_hard_timeout(600)
     obs = runtime.run_action(action)
@@ -364,11 +423,19 @@ def _complete_runtime(runtime: Runtime, instance: pd.Series) -> Dict[str, Any]:
         f'Failed to git add -A: {str(obs)}',
     )
     
-    # Get diff from HEAD (works for both SWE-bench and SWE-smith)
+    # Get git diff
+    # Use base_commit if available (SWE-bench), otherwise use HEAD (SWE-smith)
+    if 'base_commit' in instance and instance.get('base_commit'):
+        git_diff_cmd = f'git diff --no-color --cached {instance["base_commit"]}'
+        logger.info(f'Using base_commit for git diff: {instance["base_commit"]}')
+    else:
+        git_diff_cmd = 'git diff --no-color --cached HEAD'
+        logger.info('Using HEAD for git diff (no base_commit available)')
+    
     n_retries = 0
     git_patch = None
     while n_retries < 5:
-        action = CmdRunAction(command='git diff --no-color --cached HEAD')
+        action = CmdRunAction(command=git_diff_cmd)
         action.set_hard_timeout(max(300 + 100 * n_retries, 600))
         obs = runtime.run_action(action)
         n_retries += 1
@@ -554,7 +621,28 @@ class OpenHandsScaffold(Scaffold):
         call_async_from_sync(runtime.connect)
         
         try:
-            _initialize_runtime(runtime, instance)
+            # Determine if using per-instance image or generic image
+            # Logic:
+            #   - If instance has 'image_name' field -> SWE-smith style, use per-instance image (copy /testbed)
+            #   - If base_container_image_override is set -> generic image (clone from GitHub)
+            #   - Otherwise -> assume per-instance image exists (for backward compat)
+            has_image_name = 'image_name' in instance and instance.get('image_name')
+            using_generic_image = self.oh_config.base_container_image_override is not None
+            
+            if has_image_name:
+                # SWE-smith: has per-instance images in dataset
+                use_per_instance_image = True
+                logger.info(f'Instance has image_name field, using per-instance image: {instance["image_name"]}')
+            elif using_generic_image:
+                # SWE-bench with generic image: clone repo at runtime
+                use_per_instance_image = False
+                logger.info(f'Using generic image {self.oh_config.base_container_image_override}, will clone repo')
+            else:
+                # Default: assume per-instance image exists (e.g., official SWE-bench images)
+                use_per_instance_image = True
+                logger.info('No image_name and no generic override, assuming per-instance image exists')
+            
+            _initialize_runtime(runtime, instance, use_per_instance_image=use_per_instance_image)
             
             instruction = _get_instruction(instance)
             message_action = MessageAction(content=instruction)
