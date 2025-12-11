@@ -1,0 +1,311 @@
+# OpenHands Scaffold Configuration Reference
+# This file documents ALL available configuration options for the OpenHands scaffold.
+# For practical examples, see: swebench-example.yaml, swesmith-example.yaml, vllm-example.yaml
+
+# ==============================================================================
+# DATASET CONFIGURATION
+# ==============================================================================
+
+# HuggingFace dataset name
+# Examples: "princeton-nlp/SWE-bench", "SWE-bench/SWE-smith", 
+#           "princeton-nlp/SWE-bench_Lite", "princeton-nlp/SWE-bench_Verified"
+dataset: "princeton-nlp/SWE-bench"
+
+# Dataset split to use
+# Common values: "train", "test", "validation"
+split: "train"
+
+# Maximum number of instances to process (null = all instances)
+max_instances: null
+
+# Optional: Regex filter for instance IDs
+# Examples: "django.*" (only django instances)
+#           "django__django-11.*" (specific django issues)
+instance_filter: null
+
+# ==============================================================================
+# AGENT CONFIGURATION
+# ==============================================================================
+
+# OpenHands agent class name
+# Common values: "CodeActAgent"
+agent_class: "CodeActAgent"
+
+# Maximum iterations per task
+max_iterations: 50
+
+# ==============================================================================
+# LLM CONFIGURATION
+# ==============================================================================
+
+# Option 1: Direct model specification (recommended)
+# ------------------------------------------------
+
+# Model name/identifier
+# Examples:
+#   OpenAI: "gpt-4o", "gpt-4-turbo"
+#   Anthropic: "anthropic/claude-sonnet-4", "anthropic/claude-3.5-sonnet-20241022"
+#   Fireworks: "accounts/fireworks/models/llama-v3p1-70b-instruct"
+#   Together: "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"
+#   vLLM: "openai/Qwen/Qwen3-Coder-30B-A3B-Instruct"
+llm_model: "gpt-4o"
+
+# API key (direct, not recommended - use llm_api_key_env instead)
+llm_api_key: null
+
+# Environment variable name containing API key (recommended)
+# Examples: "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "FIREWORKS_API_KEY"
+llm_api_key_env: "OPENAI_API_KEY"
+
+# Base URL for LLM API (required for non-OpenAI/Anthropic providers)
+# Examples:
+#   Fireworks: "https://api.fireworks.ai/inference/v1"
+#   Together: "https://api.together.xyz/v1"
+#   vLLM: "http://localhost:8000/v1"
+#   OpenAI/Anthropic: null (uses default)
+llm_base_url: null
+
+# Option 2: Use OpenHands config name (from config.toml)
+# -------------------------------------------------------
+# If you have OpenHands installed with a config.toml file,
+# you can reference LLM configs by name instead
+# llm_config_name: "llm.eval_gpt4_1106_preview"
+
+# ==============================================================================
+# EXECUTION CONFIGURATION
+# ==============================================================================
+
+# Number of parallel workers (instances processed simultaneously)
+num_workers: 1
+
+# Timeout per instance in seconds (null = no timeout)
+timeout_seconds: 3600
+
+# Maximum retry attempts on failure
+max_retries: 5
+
+# ==============================================================================
+# RUNTIME CONFIGURATION
+# ==============================================================================
+
+# Runtime type
+# Values: "docker", "local"
+runtime: "docker"
+
+# Docker platform
+# Common values: "linux/amd64", "linux/arm64"
+platform: "linux/amd64"
+
+# Remote runtime resource factor (for cloud execution)
+# Values: 1, 2, 4, 8 (higher = more resources)
+remote_runtime_resource_factor: 1
+
+# Agent capabilities
+enable_browser: false
+enable_llm_editor: false
+
+# ==============================================================================
+# DOCKER IMAGE CONFIGURATION
+# ==============================================================================
+
+# Base container image override
+# - null: Use per-instance images (SWE-smith with image_name field, or construct from instance_id)
+# - "image:tag": Use this single image for ALL instances (generic image approach)
+# 
+# Generic image examples:
+#   - "nikolaik/python-nodejs:python3.12-nodejs22" (Python + Node.js)
+#   - "python:3.11-slim" (Python only)
+#   - "sweagent/swe-agent:latest" (SWE-Agent image)
+base_container_image_override: null
+
+# Pre-built runtime container image (advanced)
+# If set, skips building runtime on top of base image
+# Used for optimization when runtime is pre-built
+runtime_container_image: null
+
+# Working directory in container (auto-detected if null)
+# Examples:
+#   - null: Auto-detect as /workspace/{repo}__{version}
+#   - "testbed": Use /testbed
+#   - "workspace": Use /workspace
+workspace_dir: null
+
+# ==============================================================================
+# OUTPUT CONFIGURATION
+# ==============================================================================
+
+# Output directory for trajectories
+output_dir: "./trajectories/openhands"
+
+# Evaluation output directory (defaults to output_dir if null)
+eval_output_dir: null
+
+# ==============================================================================
+# HUGGINGFACE UPLOAD CONFIGURATION
+# ==============================================================================
+
+# HuggingFace repository ID for uploading trajectories
+# Format: "username/dataset-name" or "org/dataset-name"
+# Set to null to disable upload
+hf_repo_id: null
+
+# Make HuggingFace repository private
+hf_private: true
+
+# Config name for the dataset (auto-generated if null)
+# Example: "gpt4o_swe_smith_50iter"
+hf_config_name: null
+
+# ==============================================================================
+# ADVANCED OPTIONS
+# ==============================================================================
+
+# Enable automatic retry with increased resources on failure
+# (handled automatically by max_retries)
+
+# Custom workspace base path (advanced, for custom image layouts)
+# workspace_base_path: "/workspace"
+
+# Source directory in per-instance images (advanced)
+# source_dir_in_image: "/testbed"
+
+# ==============================================================================
+# DATASET-SPECIFIC NOTES
+# ==============================================================================
+
+# SWE-smith (SWE-bench/SWE-smith):
+# ---------------------------------
+# - Has 'image_name' field in dataset pointing to per-instance images
+# - Images: jyangballin/swesmith.x86_64.*
+# - Repository at /testbed in image
+# - Recommended: base_container_image_override: null
+#
+# Example:
+#   dataset: "SWE-bench/SWE-smith"
+#   split: "train"
+#   base_container_image_override: null
+#   max_instances: 50
+
+# SWE-bench (princeton-nlp/SWE-bench):
+# -------------------------------------
+# - No 'image_name' field in dataset
+# - Train split has 23,000+ instances
+# - Two approaches:
+#
+# Approach 1 (Recommended): Generic image + clone repos
+#   base_container_image_override: "nikolaik/python-nodejs:python3.12-nodejs22"
+#   - Fast, practical for large-scale generation
+#   - Clones repos from GitHub at runtime
+#
+# Approach 2 (Accurate): Per-instance images (if available)
+#   base_container_image_override: null
+#   - Images: swebench/sweb.eval.x86_64.{repo}_1776_{version}:latest
+#   - More accurate, matches official evaluation
+#   - Requires images to be available (may need to build)
+#
+# Example (Generic):
+#   dataset: "princeton-nlp/SWE-bench"
+#   split: "train"
+#   base_container_image_override: "nikolaik/python-nodejs:python3.12-nodejs22"
+#   max_instances: 100
+
+# SWE-bench Lite (princeton-nlp/SWE-bench_Lite):
+# -----------------------------------------------
+# - Smaller subset with 300 instances in test split
+# - Same configuration as SWE-bench
+# - Good for testing and quick evaluation
+#
+# Example:
+#   dataset: "princeton-nlp/SWE-bench_Lite"
+#   split: "test"
+#   base_container_image_override: "nikolaik/python-nodejs:python3.12-nodejs22"
+#   max_instances: null  # All 300 instances
+
+# SWE-bench Verified (princeton-nlp/SWE-bench_Verified):
+# -------------------------------------------------------
+# - Verified subset with ~500 instances
+# - Higher quality, manually verified
+# - Same configuration as SWE-bench
+#
+# Example:
+#   dataset: "princeton-nlp/SWE-bench_Verified"
+#   split: "test"
+#   base_container_image_override: null
+#   max_instances: null
+
+# ==============================================================================
+# ENVIRONMENT VARIABLES
+# ==============================================================================
+
+# The following environment variables are commonly used:
+#
+# LLM API Keys:
+#   OPENAI_API_KEY - OpenAI API key
+#   ANTHROPIC_API_KEY - Anthropic API key
+#   FIREWORKS_API_KEY - Fireworks AI API key
+#   TOGETHER_API_KEY - Together AI API key
+#
+# HuggingFace:
+#   HF_TOKEN - HuggingFace API token (required for private repos and uploads)
+#
+# Runtime:
+#   RUNTIME - Override runtime type (e.g., "remote")
+#   ALLHANDS_API_KEY - For RemoteRuntime (cloud execution)
+
+# ==============================================================================
+# EXAMPLES OF COMPLETE CONFIGURATIONS
+# ==============================================================================
+
+# Example 1: SWE-bench with Generic Image (Fast, Recommended for Train)
+# ----------------------------------------------------------------------
+# dataset: "princeton-nlp/SWE-bench"
+# split: "train"
+# max_instances: 100
+# base_container_image_override: "nikolaik/python-nodejs:python3.12-nodejs22"
+# agent_class: "CodeActAgent"
+# max_iterations: 50
+# llm_model: "gpt-4o"
+# llm_api_key_env: "OPENAI_API_KEY"
+# num_workers: 4
+# output_dir: "./trajectories/swe-bench-train"
+
+# Example 2: SWE-smith with Per-Instance Images (Original Setup)
+# ---------------------------------------------------------------
+# dataset: "SWE-bench/SWE-smith"
+# split: "train"
+# max_instances: 50
+# base_container_image_override: null
+# agent_class: "CodeActAgent"
+# max_iterations: 50
+# llm_model: "gpt-4o"
+# llm_api_key_env: "OPENAI_API_KEY"
+# num_workers: 2
+# output_dir: "./trajectories/swe-smith"
+
+# Example 3: vLLM with Local Server
+# ----------------------------------
+# dataset: "SWE-bench/SWE-smith"
+# split: "train"
+# max_instances: 100
+# agent_class: "CodeActAgent"
+# max_iterations: 50
+# llm_model: "openai/Qwen/Qwen3-Coder-30B-A3B-Instruct"
+# llm_base_url: "http://localhost:8000/v1"
+# llm_api_key: "dummy"
+# num_workers: 8
+# output_dir: "./trajectories/vllm"
+
+# Example 4: Filtered Django Issues with HF Upload
+# -------------------------------------------------
+# dataset: "princeton-nlp/SWE-bench"
+# split: "train"
+# instance_filter: "django__django-.*"
+# max_instances: null  # All django instances
+# base_container_image_override: "nikolaik/python-nodejs:python3.12-nodejs22"
+# agent_class: "CodeActAgent"
+# max_iterations: 50
+# llm_model: "gpt-4o"
+# llm_api_key_env: "OPENAI_API_KEY"
+# hf_repo_id: "myorg/django-trajectories"
+# hf_private: true
+# output_dir: "./trajectories/django"

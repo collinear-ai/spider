@@ -1,5 +1,18 @@
 # SWE Trajectory Generation Quick Start
 
+## Configuration Files
+
+This directory contains example configurations for different use cases:
+
+- **[config-reference.yaml](config-reference.yaml)** - Complete reference with ALL available options
+- **[swebench-example.yaml](swebench-example.yaml)** - SWE-bench with generic image (recommended for train split)
+- **[swesmith-example.yaml](swesmith-example.yaml)** - SWE-smith with per-instance images
+- **[vllm-example.yaml](vllm-example.yaml)** - vLLM configuration
+
+**Quick start:** Copy an example config and modify it for your needs.
+
+**Need to see all options?** Check [config-reference.yaml](config-reference.yaml) for comprehensive documentation.
+
 ## Simple Standalone Usage
 
 ### 1. Install Dependencies
