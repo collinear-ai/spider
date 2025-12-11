@@ -1,66 +1,68 @@
 # Example Spider config for SWE-bench train split trajectory generation
 # This config works with princeton-nlp/SWE-bench (standard SWE-bench dataset)
 
-# Dataset configuration
-dataset: "princeton-nlp/SWE-bench"  
-
-split: "train" 
-max_instances: 10  # (set to null for all)
-
-# Optional: Filter specific instances by regex
-# instance_filter: "django.*"  # Only django instances
-# instance_filter: "django__django-11"  # Specific instance pattern
-
-# Output directory
-output_dir: "./trajectories/swe-bench-train"
-
-# Agent configuration
-agent_class: "CodeActAgent"
-max_iterations: 50
-
-# LLM configuration - Option 1: Direct model specification
-llm_model: "gpt-4o"  # Your LLM model
-llm_api_key_env: "OPENAI_API_KEY"  # Read API key from this environment variable
-# llm_api_key: "sk-..."  # Or set directly (not recommended)
-# llm_base_url: null  # Set if using custom API endpoint
-
-# LLM configuration - Option 2: Use OpenHands config name
-# llm_config_name: "llm.eval_gpt4_1106_preview"  # From OpenHands config.toml
-
-# Execution configuration
-num_workers: 1  # Number of parallel workers
-timeout_seconds: 3600  # 1 hour per instance
-max_retries: 5  # Max retries on failure
-
-# Runtime configuration
-enable_browser: false
-enable_llm_editor: false
-runtime: "docker"
-platform: "linux/amd64"
-remote_runtime_resource_factor: 1
-
-# Docker image configuration
-
-# For SWE-bench:
-# Use a generic image and clone repos at runtime (like OpenHands does)
-base_container_image_override: "nikolaik/python-nodejs:python3.12-nodejs22"
-runtime_container_image: null
-workspace_dir: null  # Auto-detected as /workspace/{repo}__{version}
-
-# For SWE-smith:
-# Leave both null to use per-instance images (has image_name in dataset)
-# base_container_image_override: null
-# runtime_container_image: null
-
-# NOTE: 
-# - SWE-smith has per-instance images (image_name field in dataset) -> copies from /testbed
-# - SWE-bench train doesn't have pre-built images -> clones from GitHub when using generic image
-# - With generic image, repos are cloned and checked out at base_commit automatically
-
-# HuggingFace upload configuration (optional)
-hf_repo_id: null  # Set to "your-username/swe-bench-trajectories" to enable upload
-hf_private: true  # Make the HuggingFace repo private
-hf_config_name: null  
-
-# Evaluation output directory (optional, defaults to output_dir)
-eval_output_dir: null
+scaffold:
+  type: openhands
+  
+  # Dataset configuration
+  dataset: "princeton-nlp/SWE-bench"  
+  split: "train" 
+  max_instances: 2  # (set to null for all)
+  
+  # Optional: Filter specific instances by regex
+  # instance_filter: "django.*"  # Only django instances
+  # instance_filter: "django__django-11"  # Specific instance pattern
+  
+  # Output directory
+  output_dir: "./trajectories/swe-bench-train"
+  
+  # Agent configuration
+  agent_class: "CodeActAgent"
+  max_iterations: 50
+  
+  # LLM configuration - Option 1: Direct model specification
+  llm_model: "gpt-4o"  # Your LLM model
+  llm_api_key_env: "OPENAI_API_KEY"  # Read API key from this environment variable
+  # llm_api_key: "sk-..."  # Or set directly (not recommended)
+  # llm_base_url: null  # Set if using custom API endpoint
+  
+  # LLM configuration - Option 2: Use OpenHands config name
+  # llm_config_name: "llm.eval_gpt4_1106_preview"  # From OpenHands config.toml
+  
+  # Execution configuration
+  num_workers: 1  # Number of parallel workers
+  timeout_seconds: 3600  # 1 hour per instance
+  max_retries: 5  # Max retries on failure
+  
+  # Runtime configuration
+  enable_browser: false
+  enable_llm_editor: false
+  runtime: "docker"
+  platform: "linux/amd64"
+  remote_runtime_resource_factor: 1
+  
+  # Docker image configuration
+  
+  # For SWE-bench:
+  # Use a generic image and clone repos at runtime (like OpenHands does)
+  base_container_image_override: "nikolaik/python-nodejs:python3.12-nodejs22"
+  runtime_container_image: null
+  workspace_dir: null  # Auto-detected as /workspace/{repo}__{version}
+  
+  # For SWE-smith:
+  # Leave both null to use per-instance images (has image_name in dataset)
+  # base_container_image_override: null
+  # runtime_container_image: null
+  
+  # NOTE: 
+  # - SWE-smith has per-instance images (image_name field in dataset) -> copies from /testbed
+  # - SWE-bench train doesn't have pre-built images -> clones from GitHub when using generic image
+  # - With generic image, repos are cloned and checked out at base_commit automatically
+  
+  # HuggingFace upload configuration (optional)
+  hf_repo_id: collinear-ai/spider-openhands-swe-bench-trajectories  # Set to enable upload
+  hf_private: true  # Make the HuggingFace repo private
+  hf_config_name: null  
+  
+  # Evaluation output directory (optional, defaults to output_dir)
+  eval_output_dir: null
