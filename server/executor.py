@@ -924,7 +924,8 @@ def _tinker_chat_and_logprobs(
         add_generation_prompt=True,
         tokenize=False,
     )
-    prompt_tokens = _model_input_tokens(prompt_text, tokenizer=tokenizer) if include_logprobs else []
+    prompt_tokens = _model_input_tokens(prompt_text, tokenizer=tokenizer)
+    prompt_input = tinker.ModelInput.from_ints(prompt_tokens)
 
     sampling_params = parameters.copy()
     max_tokens = sampling_params.pop("max_tokens", None)
@@ -933,7 +934,7 @@ def _tinker_chat_and_logprobs(
     stop = renderer.get_stop_sequences()
 
     sample_resp = sampling_client.sample(
-        prompt=prompt_text,
+        prompt=prompt_input,
         num_samples=1,
         sampling_params=tinker.types.SamplingParams(
             max_tokens=max_tokens or 1024,
