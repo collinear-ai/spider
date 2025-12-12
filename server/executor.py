@@ -998,19 +998,8 @@ def _finalize_tinker_rollout_logprobs(
 
     full_inputs = tinker.ModelInput.from_ints(full_tokens)
     lp_resp_coro = sampling_client.compute_logprobs_async(full_inputs)
-    try:
-        lp_resp = asyncio.run(lp_resp_coro)
-    except Exception as exc:
-        logger.exception("asyncio.run failed: %s", exc)
-        try:
-            loop = asyncio.get_running_loop()
-            lp_resp = asyncio.run_coroutine_threadsafe(
-                lp_resp_coro,
-                loop
-            ).result()
-        except Exception as exc2:
-            raise JobExecutionError(f"Failed to compute logprobs after fallback: {exc2}") from exc2
-
+    lp_resp = asyncio.run(lp_resp_coro)
+    
     reward_mask = [0] * len(full_tokens)
     for prompt_len, completion_len in zip(turn_prompt_counts, turn_completion_lens):
         start = max(0, prompt_len)
