@@ -26,13 +26,6 @@ RolloutBatch = List[Dict[str, Any]]
 
 logger = logging.getLogger(__name__)
 
-class ToolRolloutTrajectory(TypedDict):
-    prompt: str
-    transcript: List[Dict[str, Any]]
-    token_ids: List[int]
-    logprobs: List[float]
-    reward_mask: List[int]
-
 class PromptListDatasetBuilder(RLDatasetBuilder):
     def __init__(
         self, 
@@ -372,7 +365,7 @@ def _tool_rollout_stream(
     prompts: List[str],
     tool_registry: Dict[str, Callable[..., Any]],
     batch_worker: Callable[..., Any],
-) -> Iterable[List[ToolRolloutTrajectory]]:
+) -> Iterable[List[Dict[str, Any]]]:
     from .executor import _resolve_batch_size
 
     batch_size = _resolve_batch_size(job, prompts)

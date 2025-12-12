@@ -572,6 +572,7 @@ def _tool_batch_worker(
                 data={"error": str(exc)}
             )
             raise
+
         record = {"prompt": prompt, "completion": transcript}
         if include_logprobs:
             record = {
