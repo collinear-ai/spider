@@ -81,7 +81,7 @@ def main():
         role = msg.get("role")
         content = msg.get("content")
         tool_calls = msg.get("tool_calls")
-        print(f"{role}: {content[:40]}...")
+        print(f"{role}: {content[:40].replace('\n', '\\n')}...")
         if tool_calls:
             print("  tool_calls:", json.dumps(tool_calls, indent=2))
 
