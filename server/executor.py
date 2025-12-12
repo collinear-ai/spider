@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from asyncore import loop
 from re import S
 import json, os, logging, inspect, time, threading, traceback
 import concurrent
@@ -979,6 +980,7 @@ def _finalize_tinker_rollout_logprobs(
     turn_completion_lens: List[int],
     tools: List[Dict[str, Any]],
 ) -> Tuple[List[int], List[float], List[int]]:
+    import asyncio
     import tinker
     from tinker_cookbook import renderers
     from tinker_cookbook.tokenizer_utils import get_tokenizer
@@ -995,8 +997,19 @@ def _finalize_tinker_rollout_logprobs(
     full_tokens = _model_input_tokens(prompt_text, tokenizer=tokenizer)
 
     full_inputs = tinker.ModelInput.from_ints(full_tokens)
-    lp_resp = sampling_client.compute_logprobs_async(full_inputs)
-    lp_resp = lp_resp.result()
+    lp_resp_coro = sampling_client.compute_logprobs_async(full_inputs)
+    try:
+        lp_resp = asyncio.run(lp_resp_coro)
+    except Exception as exc:
+        logger.exception("asyncio.run failed: %s", exc)
+        try:
+            loop = asyncio.get_running_loop()
+            lp_resp = asyncio.run_coroutine_threadsafe(
+                lp_resp_coro,
+                loop
+            ).result()
+        except Exception as exc2:
+            raise JobExecutionError(f"Failed to compute logprobs after fallback: {exc2}") from exc2
 
     reward_mask = [0] * len(full_tokens)
     for prompt_len, completion_len in zip(turn_prompt_counts, turn_completion_lens):
