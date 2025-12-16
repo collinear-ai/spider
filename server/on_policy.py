@@ -18,6 +18,10 @@ from tinker_cookbook.distillation.datasets import (
 from tinker_cookbook.rl.types import RLDataset, RLDatasetBuilder
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
+from .on_policy_utils import (
+    compute_student_logprobs_trainable,
+    compute_teacher_alignment_for_rewards,
+)
 from .sources import collect_prompts
 from . import events
 from .writers import JSONLBatchWriter
@@ -356,6 +360,121 @@ def run_on_policy_job(
     if sampler_ctx:
         sampler_ctx.__exit__(None, None, None)
     return result
+
+def _run_tool_on_policy_stream(
+    *,
+    job_id: str,
+    job: JobConfig,
+    options: Any,
+    workspace: Path,
+    rollout_stream: Iterable[List[Dict[str, Any]]],
+    sampler_ctx: _StudentSamplerContext,
+    metadata_path: Path,
+    artifact_path: Path,
+):
+    from .executor import (
+        JobExecutionError,
+        tool_descriptors
+    )
+
+    tool_defs = tool_descriptors(job.tools)
+    service_client = tinker.ServiceClient()
+    teacher_client = service_client.create_sampling_client(base_model=options.teacher)
+    training_client = service_client.create_lora_training_client(
+        base_model=job.model.name,
+        rank=options.lora_rank,
+    )
+
+    training_dir = workspace / "training"
+    training_dir.mkdir(parents=True, exist_ok=True)
+
+    def _messages_with_prompt(prompt: str, transcript: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        messages = []
+        system_prompt = job.model.parameters.get("system_prompt") # TODO: check if sys prompt is used by student in stream
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        messages.extend(transcript or [])
+        return messages
+
+    async def _process_batch(batch_index: int, trajectories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        items = []
+        for traj_index, traj in enumerate(trajectories): # TODO: check if tinker can handle async batch requests for rollouts
+            prompt = traj.get("prompt", "")
+            transcript = traj.get("completion") or []
+            token_ids = traj.get("token_ids") or []
+            reward_mask = traj.get("reward_mask") or [0] * len(token_ids)
+
+            messages = _messages_with_prompt(prompt, transcript)
+
+            student_logprobs, student_mask = await compute_student_logprobs_trainable(
+                training_client=training_client,
+                token_ids=token_ids,
+                reward_mask=reward_mask,
+                loss_fn=getattr(options, "loss_fn", "importance_sampling"),
+            )
+            teacher_alignment = await compute_teacher_alignment_for_rewards(
+                sampling_client=teacher_client,
+                messages=messages,
+                tools=tool_defs,
+                teacher_model=options.teacher,
+                student_model=job.model.name,
+                student_token_ids=token_ids,
+                student_logprobs=student_logprobs,
+                reward_mask=reward_mask,
+            )
+
+            items.append({
+                "prompt": prompt,
+                "messages": messages,
+                "token_ids": token_ids,
+                "reward_mask": reward_mask,
+                "student_logprobs": student_logprobs,
+                "student_mask": student_mask,
+                "teacher_logprobs": teacher_alignment.get("teacher_logprobs"),
+                "kl_adjustments": teacher_alignment.get("kl_adjustments"),
+                "kl_mask": teacher_alignment.get("kl_mask"),
+                "teacher_token_ids": teacher_alignment.get("teacher_token_ids"),
+                "reward_spans": teacher_alignment.get("reward_spans"),
+            })
+            logger.info(
+                "Job %s: tool rollout batch=%d traj=%d tokens=%d reward_tokens=%d",
+                job_id,
+                batch_index,
+                traj_index,
+                len(token_ids),
+                sum(reward_mask),
+            )
+        
+        # train!
+        # TODO: train step
+        return items
+
+    async def _train_stream():
+        save_every = max(1, getattr(options, "save_every", 1))
+        last_checkpoint = None
+        for batch_index, trajectories in enumerate(rollout_stream):
+            batch_items = await _process_batch(batch_index, trajectories)
+            
+            if (batch_index + 1) % save_every == 0:
+                last_checkpoint = await checkpoint_utils.save_checkpoint_async(
+                    training_client=training_client,
+                    name=f"{batch_index:06d}",
+                    log_path=str(training_dir),
+                    loop_state={"batch": batch_index + 1},
+                    kind="sampler",
+                )
+                sampler_path = last_checkpoint.get("sampler_path")
+                if sampler_path:
+                    sampler_ctx.refresh_from_sampler_path(sampler_path)
+                    events.emit(
+                        "Refreshed student sampler from checkpoint.",
+                        code="tool_on_policy.sampler_refreshed",
+                        data={"batch_index": batch_index, "sampler_path": sampler_path},
+                    )
+        return last_checkpoint
+        
+    last_checkpoint = asyncio.run(_train_stream())
 
 def _tool_rollout_stream(
     *,

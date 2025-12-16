@@ -160,10 +160,10 @@ async def compute_teacher_alignment_for_rewards(
         all_teacher_logprobs.extend(completion_lp)
     
     return {
-        "kl_adjustments": kl_adjustments,
-        "kl_mask": kl_mask,
-        "teacher_token_ids": all_teacher_token_ids,
-        "teacher_logprobs": all_teacher_logprobs,
+        "kl_adjustments": kl_adjustments.tolist(),
+        "kl_mask": kl_mask.tolist(),
+        "teacher_token_ids": list(all_teacher_token_ids),
+        "teacher_logprobs": list(all_teacher_logprobs),
         "reward_spans": spans,
     }
 

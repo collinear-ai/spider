@@ -543,7 +543,7 @@ def _tool_batch_worker(
     tool_registry: Dict[str, Callable[..., Any]],
     include_logprobs: bool = False,
 ) -> List[Dict[str, Any]]:
-    tool_defs = _tool_descriptors(job.tools)
+    tool_defs = tool_descriptors(job.tools)
 
     turn_limit = max(1, job.generation.max_turns or 16)
     max_concurrency = max(1, job.generation.max_batch_size or 4)
@@ -626,7 +626,7 @@ def _tool_batch_worker(
     threading.Thread(target=finalize, daemon=True).start()
     return aggregate
 
-def _tool_descriptors(tool_specs: Optional[List[ToolConfig]]) -> List[Dict[str, Any]]:
+def tool_descriptors(tool_specs: Optional[List[ToolConfig]]) -> List[Dict[str, Any]]:
     descriptors = []
     for spec in tool_specs or []:
         descriptors.append(
