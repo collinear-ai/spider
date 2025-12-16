@@ -539,9 +539,7 @@ def _tool_rollout_stream(
     tool_registry: Dict[str, Callable[..., Any]],
     batch_worker: Callable[..., Any],
 ) -> Iterable[List[Dict[str, Any]]]:
-    from .executor import _resolve_batch_size
-
-    batch_size = _resolve_batch_size(job, prompts)
+    batch_size = getattr(job.generation.on_policy_options, "groups_per_batch", 64)
     total_batches = (len(prompts) + batch_size - 1) // batch_size
 
     for batch_index, start in enumerate(range(0, len(prompts), batch_size)):
