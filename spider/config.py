@@ -54,7 +54,6 @@ class OnPolicyConfig(BaseModel):
     group_size: int = Field(default=4, ge=1)
     max_tokens: int = Field(default=4096, ge=1)
     lora_rank: int = Field(default=32, ge=1)
-    num_substeps: int = Field(default=1, ge=1)
     kl_penalty_coef: float = Field(default=1.0)
     kl_discount_factor: float = Field(default=0.0)
     loss_fn: Literal["importance_sampling", "ppo"] = Field(

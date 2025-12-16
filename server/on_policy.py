@@ -279,7 +279,6 @@ def run_on_policy_job(
             kl_penalty_coef=options.kl_penalty_coef,
             kl_discount_factor=options.kl_discount_factor,
             loss_fn=options.loss_fn,
-            num_substeps=options.num_substeps,
             wandb_project=None,
             wandb_name=None,
             log_path=str(training_dir),
