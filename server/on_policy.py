@@ -372,6 +372,7 @@ def _run_tool_on_policy_stream(
     metadata_path: Path,
     artifact_path: Path,
 ):
+    import torch
     from .executor import (
         JobExecutionError,
         tool_descriptors
@@ -399,6 +400,7 @@ def _run_tool_on_policy_stream(
 
     async def _process_batch(batch_index: int, trajectories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         items = []
+        data_D = []
         for traj_index, traj in enumerate(trajectories): # TODO: check if tinker can handle async batch requests for rollouts
             prompt = traj.get("prompt", "")
             transcript = traj.get("completion") or []
@@ -437,6 +439,23 @@ def _run_tool_on_policy_stream(
                 "teacher_token_ids": teacher_alignment.get("teacher_token_ids"),
                 "reward_spans": teacher_alignment.get("reward_spans"),
             })
+
+            kl_adj = teacher_alignment.get("kl_adjustments") or [0.0] * len(token_ids)
+            kl_mask = teacher_alignment.get("kl_mask") or [0.0] * len(token_ids) # TODO: is mask needed because kl_adj should return only valid kl?
+            kl_tensor = torch.tensor(kl_adj, device=student_logprobs.device, dtype=student_logprobs.dtype)
+            kl_mask_tensor = torch.tensor(kl_mask, device=student_logprobs.device, dtype=student_logprobs.dtype)
+            adj_logprobs = student_logprobs.clone() + (kl_tensor * kl_mask_tensor)
+
+            datum = tinker.Datum( # turn kl loss into CE loss with logprobs + kl delta
+                model_input=tinker.ModelInput.from_ints(list(token_ids)),
+                loss_fn_inputs={
+                    "target_tokens": tinker.TensorData.from_list(list(token_ids)),
+                    "mask": tinker.TensorData.from_list(list(reward_mask)),
+                    "logprobs": tinker.TensorData.from_torch(adj_logprobs),
+                }
+            )
+            data_D.append(datum)
+
             logger.info(
                 "Job %s: tool rollout batch=%d traj=%d tokens=%d reward_tokens=%d",
                 job_id,
@@ -447,7 +466,21 @@ def _run_tool_on_policy_stream(
             )
         
         # train!
-        # TODO: train step
+        fwd_bwd_future = await training_client.forward_backward_async(
+            data_D,
+            loss_fn=getattr(options, "loss_fn", "importance_sampling"),
+        )
+        _ = await fwd_bwd_future.result_async()
+
+        adam_params = tinker.AdamParams(
+            learning_rate=options.learning_rate,
+            beta1=0.9,
+            beta2=0.95,
+            eps=1e-8,
+        )
+        step_future = await training_client.optim_step_async(adam_params)
+        await step_future.result_async()
+
         return items
 
     async def _train_stream():

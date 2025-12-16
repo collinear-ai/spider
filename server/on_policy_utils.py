@@ -126,10 +126,10 @@ async def compute_teacher_alignment_for_rewards(
         model_input = tinker.ModelInput.from_ints(list(full_tokens))
         lp_resp = await sampling_client.compute_logprobs_async(model_input)
         lp_list = list(lp_resp)
-        completion_lp = lp_list[len(prefix_tokens):]
+        completion_lp = lp_list[len(prefix_tokens):] # only completion tokens for teacher
 
         start, end = span
-        student_ids_slice = list(student_token_ids[start:end])
+        student_ids_slice = list(student_token_ids[start:end]) # only completion tokens for student
         student_lp_slice = student_logprobs[start:end]
         student_mask_slice = torch.tensor(
             reward_mask[start:end],
