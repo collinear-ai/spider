@@ -403,7 +403,8 @@ def _run_tool_on_policy_stream(
     async def _process_batch(batch_index: int, trajectories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         items = []
         data_D = []
-        for traj_index, traj in enumerate(trajectories): # TODO: check if tinker can handle async batch requests for rollouts
+
+        async def _process_traj(traj_index: int, traj: Dict[str, Any]) -> tuple[Dict[str, Any], tinker.Datum]:
             prompt = traj.get("prompt", "")
             transcript = traj.get("completion") or []
             token_ids = traj.get("token_ids") or []
@@ -425,7 +426,7 @@ def _run_tool_on_policy_stream(
                 reward_mask=reward_mask,
             )
 
-            items.append({
+            item = {
                 "prompt": prompt,
                 "messages": messages,
                 "token_ids": token_ids,
@@ -436,7 +437,7 @@ def _run_tool_on_policy_stream(
                 "kl_mask": teacher_alignment.get("kl_mask"),
                 "teacher_token_ids": teacher_alignment.get("teacher_token_ids"),
                 "reward_spans": teacher_alignment.get("reward_spans"),
-            })
+            }
 
             kl_adj = teacher_alignment.get("kl_adjustments") or [0.0] * len(token_ids)
             kl_mask = teacher_alignment.get("kl_mask") or [0.0] * len(token_ids) 
@@ -457,7 +458,6 @@ def _run_tool_on_policy_stream(
                     "logprobs": tinker.TensorData.from_torch(adj_logprobs),
                 }
             )
-            data_D.append(datum)
 
             logger.info(
                 "Job %s: tool rollout batch=%d traj=%d tokens=%d reward_tokens=%d",
@@ -467,6 +467,13 @@ def _run_tool_on_policy_stream(
                 len(token_ids),
                 sum(reward_mask),
             )
+
+            return item, datum
+
+        results = await asyncio.gather(*[asyncio.create_task(_process_traj(i, traj)) for i, traj in enumerate(trajectories)])
+        for item, datum in results:
+            items.append(item)
+            data_D.append(datum)
         
         # train!
         fwd_bwd_future = await training_client.forward_backward_async(
@@ -483,6 +490,17 @@ def _run_tool_on_policy_stream(
         )
         step_future = await training_client.optim_step_async(adam_params)
         await step_future.result_async()
+
+        logger.info(
+            "Job %s: tool rollout batch=%d training step complete.",
+            job_id,
+            batch_index,
+        )
+        events.emit(
+            "Tool rollout batch KL training step complete.",
+            code="tool_on_policy.training_step_complete",
+            data={"batch_index": batch_index},
+        )
 
         return items
 
@@ -503,6 +521,12 @@ def _run_tool_on_policy_stream(
                 sampler_path = last_checkpoint.get("sampler_path")
                 if sampler_path:
                     sampler_ctx.refresh_from_sampler_path(sampler_path)
+                    logger.info(
+                        "Job %s: refreshed student sampler from checkpoint at batch=%d path=%s.",
+                        job_id,
+                        batch_index,
+                        sampler_path,
+                    )
                     events.emit(
                         "Refreshed student sampler from checkpoint.",
                         code="tool_on_policy.sampler_refreshed",
