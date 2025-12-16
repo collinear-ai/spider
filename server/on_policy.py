@@ -220,7 +220,7 @@ def run_on_policy_job(
         return result
     
     if rollout_stream:
-        return _run_tool_on_policy_stream(
+        checkpoint_info = _run_tool_on_policy_stream(
             job_id=job_id,
             job=job,
             options=options,
@@ -230,75 +230,78 @@ def run_on_policy_job(
             metadata_path=metadata_path,
             artifact_path=artifact_path,
         )
-        
-    renderer_name = model_info.get_recommended_renderer_name(student_model)
+        checkpoint = checkpoint_info["checkpoint"]
+        training_dir = checkpoint_info["training_dir"]
+    
+    else:   
+        renderer_name = model_info.get_recommended_renderer_name(student_model)
 
-    dataset_builder: RLDatasetBuilder
-    dataset_builder = PromptListDatasetBuilder(
-        prompts=prompt_list,
-        dataset_name=(job.source.dataset or "prompts"),
-        groups_per_batch=options.groups_per_batch,
-        group_size=options.group_size,
-        renderer_name=renderer_name,
-        model_name_for_tokenizer=student_model,
-    )
+        dataset_builder: RLDatasetBuilder
+        dataset_builder = PromptListDatasetBuilder(
+            prompts=prompt_list,
+            dataset_name=(job.source.dataset or "prompts"),
+            groups_per_batch=options.groups_per_batch,
+            group_size=options.group_size,
+            renderer_name=renderer_name,
+            model_name_for_tokenizer=student_model,
+        )
 
-    teacher_config = TeacherConfig(base_model=options.teacher)
-    dataset_config = DistillationDatasetConfig(
-        dataset_builder=dataset_builder,
-        teacher_config=teacher_config,
-        groups_per_batch=options.groups_per_batch,
-    )
+        teacher_config = TeacherConfig(base_model=options.teacher)
+        dataset_config = DistillationDatasetConfig(
+            dataset_builder=dataset_builder,
+            teacher_config=teacher_config,
+            groups_per_batch=options.groups_per_batch,
+        )
 
-    training_dir = workspace / "training"
-    training_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(
-        "Job %s: starting Tinker training (teacher=%s, prompts=%d) logs=%s",
-        job_id,
-        options.teacher,
-        len(prompt_list),
-        training_dir
-    )
-    events.emit(
-        "Starting on-policy distillation training.",
-        code="on_policy.training_start",
-        data={"teacher": options.teacher}
-    )
+        training_dir = workspace / "training"
+        training_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "Job %s: starting Tinker training (teacher=%s, prompts=%d) logs=%s",
+            job_id,
+            options.teacher,
+            len(prompt_list),
+            training_dir
+        )
+        events.emit(
+            "Starting on-policy distillation training.",
+            code="on_policy.training_start",
+            data={"teacher": options.teacher}
+        )
 
-    train_config = train_on_policy.Config(
-        learning_rate=options.learning_rate,
-        dataset_configs=[dataset_config],
-        model_name=student_model,
-        max_tokens=options.max_tokens,
-        compute_post_kl=options.compute_post_kl,
-        lora_rank=options.lora_rank,
-        evaluator_builders=[],
-        kl_penalty_coef=options.kl_penalty_coef,
-        kl_discount_factor=options.kl_discount_factor,
-        loss_fn=options.loss_fn,
-        num_substeps=options.num_substeps,
-        wandb_project=None,
-        wandb_name=None,
-        log_path=str(training_dir),
-        base_url=None,
-        enable_trace=False,
-        save_every=options.save_every,
-        load_checkpoint_path=student_checkpoint,
-        use_gold_alignment=use_gold_alignment,
-    )
+        train_config = train_on_policy.Config(
+            learning_rate=options.learning_rate,
+            dataset_configs=[dataset_config],
+            model_name=student_model,
+            max_tokens=options.max_tokens,
+            compute_post_kl=options.compute_post_kl,
+            lora_rank=options.lora_rank,
+            evaluator_builders=[],
+            kl_penalty_coef=options.kl_penalty_coef,
+            kl_discount_factor=options.kl_discount_factor,
+            loss_fn=options.loss_fn,
+            num_substeps=options.num_substeps,
+            wandb_project=None,
+            wandb_name=None,
+            log_path=str(training_dir),
+            base_url=None,
+            enable_trace=False,
+            save_every=options.save_every,
+            load_checkpoint_path=student_checkpoint,
+            use_gold_alignment=use_gold_alignment,
+        )
 
-    _configure_tinker_logging()
+        _configure_tinker_logging()
 
-    try:
-        asyncio.run(train_on_policy.main(train_config))
-    except Exception as exc:
-        raise JobExecutionError(f"On-policy distillation failed: {exc}") from exc
+        try:
+            asyncio.run(train_on_policy.main(train_config))
+        except Exception as exc:
+            raise JobExecutionError(f"On-policy distillation failed: {exc}") from exc
 
-    checkpoint = checkpoint_utils.get_last_checkpoint(
-        str(training_dir), required_key="sampler_path"
-    )
-    if not checkpoint or "sampler_path" not in checkpoint:
-        raise JobExecutionError("On-policy training did not produce a sampler checkpoint")
+        checkpoint = checkpoint_utils.get_last_checkpoint(
+            str(training_dir), required_key="sampler_path"
+        )
+        if not checkpoint or "sampler_path" not in checkpoint:
+            raise JobExecutionError("On-policy training did not produce a sampler checkpoint")
 
     hf_payload_dir, manifest, checkpoints_index_text = _prepare_hf_payload(
         training_dir=training_dir,
@@ -405,16 +408,13 @@ def _run_tool_on_policy_stream(
             prompt = traj.get("prompt", "")
             transcript = traj.get("completion") or []
             token_ids = traj.get("token_ids") or []
+            logprobs = traj.get("logprobs") or [0.0] * len(token_ids)
             reward_mask = traj.get("reward_mask") or [0] * len(token_ids)
 
             messages = _messages_with_prompt(prompt, transcript)
 
-            student_logprobs, student_mask = await compute_student_logprobs_trainable(
-                training_client=training_client,
-                token_ids=token_ids,
-                reward_mask=reward_mask,
-                loss_fn=getattr(options, "loss_fn", "importance_sampling"),
-            )
+            student_logprobs = torch.tensor(logprobs, dtype=torch.float32)
+            
             teacher_alignment = await compute_teacher_alignment_for_rewards(
                 sampling_client=teacher_client,
                 messages=messages,
@@ -432,7 +432,6 @@ def _run_tool_on_policy_stream(
                 "token_ids": token_ids,
                 "reward_mask": reward_mask,
                 "student_logprobs": student_logprobs,
-                "student_mask": student_mask,
                 "teacher_logprobs": teacher_alignment.get("teacher_logprobs"),
                 "kl_adjustments": teacher_alignment.get("kl_adjustments"),
                 "kl_mask": teacher_alignment.get("kl_mask"),
@@ -441,7 +440,12 @@ def _run_tool_on_policy_stream(
             })
 
             kl_adj = teacher_alignment.get("kl_adjustments") or [0.0] * len(token_ids)
-            kl_mask = teacher_alignment.get("kl_mask") or [0.0] * len(token_ids) # TODO: is mask needed because kl_adj should return only valid kl?
+            kl_mask = teacher_alignment.get("kl_mask") or [0.0] * len(token_ids) 
+            if len(kl_mask) != len(reward_mask):
+                raise JobExecutionError("KL mask length must match reward mask length.")
+            if any(int(a) != int(b) for a, b in zip(kl_mask, reward_mask)):
+                raise JobExecutionError("KL mask must match reward mask positions.")
+            
             kl_tensor = torch.tensor(kl_adj, device=student_logprobs.device, dtype=student_logprobs.dtype)
             kl_mask_tensor = torch.tensor(kl_mask, device=student_logprobs.device, dtype=student_logprobs.dtype)
             adj_logprobs = student_logprobs.clone() + (kl_tensor * kl_mask_tensor)
@@ -508,6 +512,23 @@ def _run_tool_on_policy_stream(
         return last_checkpoint
         
     last_checkpoint = asyncio.run(_train_stream())
+    if not last_checkpoint:
+        last_checkpoint = asyncio.run(
+            checkpoint_utils.save_checkpoint_async(
+                training_client=training_client,
+                name="final",
+                log_path=str(training_dir),
+                loop_state={"batch": 0},
+                kind="sampler",
+            )
+        )
+    if not last_checkpoint or "sampler_path" not in last_checkpoint:
+        raise JobExecutionError("Tool on-policy training did not produce a sampler checkpoint.")
+
+    return {
+        "checkpoint": last_checkpoint,
+        "training_dir": training_dir,
+    }
 
 def _tool_rollout_stream(
     *,

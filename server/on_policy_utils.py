@@ -166,31 +166,3 @@ async def compute_teacher_alignment_for_rewards(
         "teacher_logprobs": list(all_teacher_logprobs),
         "reward_spans": spans,
     }
-
-async def compute_student_logprobs_trainable(
-    *,
-    training_client: tinker.TrainingClient,
-    token_ids: Sequence[int],
-    reward_mask: Sequence[int],
-    loss_fn: str = "importance_sampling",
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    model_input = tinker.ModelInput.from_ints(list(token_ids))
-    target_tokens = tinker.TensorData.from_list(list(token_ids))
-    mask = tinker.TensorData.from_list(list(reward_mask))
-
-    datum = tinker.Datum(
-        model_input=model_input,
-        loss_fn_inputs={
-            "target_tokens": target_tokens,
-            "mask": mask,
-        }
-    )
-    fwd_bwd_future = await training_client.forward_backward_async(
-        [datum],
-        loss_fn=loss_fn,
-    )
-    fwd_bwd_result = await fwd_bwd_future.result_async()
-    logprobs = fwd_bwd_result.loss_fn_outputs[0]["logprobs"].to_torch()
-
-    torch_mask = torch.tensor(reward_mask, device=logprobs.device, dtype=logprobs.dtype)
-    return logprobs, torch_mask
