@@ -8,12 +8,11 @@ from spider.client import SpiderClient
 from spider.config import AppConfig
 
 def main():
-    config = AppConfig.load("config/train_if_stage_2_on_policy.yaml")
+    config = AppConfig.load("config/train_on_policy_precise_if.yaml")
 
     env = {"TINKER_API_KEY": os.environ.get("TINKER_API_KEY")}
     
     with SpiderClient(config=config, env=env) as client:
-        print(f"Submitting stage 2 on-policy job with checkpoint {config.job.model.student_checkpoint_path}")
         submission = client.submit_job()
         job_id = submission["job_id"]
         status = client.poll_job(
@@ -22,7 +21,7 @@ def main():
             wait_for_completion=True,
         )
         if status["status"] == "completed":
-            client.download_result(job_id, destination="artifacts/train_if_stage2_on_policy.json")
+            client.download_result(job_id, destination="artifacts/train_on_policy_precise_if.json")
         else:
             raise RuntimeError(status.get("error") or status.get("messages"))
 

@@ -1,0 +1,25 @@
+server:
+  base_url: http://127.0.0.1:9000
+  api_key:
+  request_timeout: 120
+job:
+  model: 
+    provider: vllm
+    name: "openai/gpt-oss-120b"
+    parameters:
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.85
+  source:
+    dataset: "allenai/tulu-3-sft-personas-instruction-following"
+    split: "train"
+    field: prompt
+  generation:
+    parameters:
+      temperature: 0.7
+      top_p: 0.9
+      max_tokens: 16384
+  output:
+    mode: "upload_hf"
+    hf:
+      repo_id: collinear-ai/spider-rollouts-tulu-precise-if-gptoss-120b
+      private: false

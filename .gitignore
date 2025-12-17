@@ -7,4 +7,4 @@ artifacts/
 *private.yaml
 *private.py
 
-**/internal/
+**/tests/
