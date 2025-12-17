@@ -251,6 +251,8 @@ def _default_tool_parser(model_name: str) -> Optional[str]:
         return "mistral"
     if "qwen2.5" in lower:
         return "hermes"
+    if "gpt-oss" in lower:
+        return "openai"
     return None
 
 def _default_chat_template(model_name: str) -> Optional[Path]:
