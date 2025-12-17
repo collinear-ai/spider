@@ -25,16 +25,16 @@ def _extract_code_block(text):
 def filter_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     params:
-    -- row (dict): a single rollout record with a "completion" field (str)
+    -- row (dict): a single rollout record with a "content" field (str)
 
     return:
     -- enriched record (dict): the updated record with arbitrary fields added / edited
     -- None: if the record is unwanted
     """
-    completion = row.get("completion")
-    if not isinstance(completion, str):
+    content = row.get("content")
+    if not isinstance(content, str):
         return None
-    snippet = _extract_code_block(completion)
+    snippet = _extract_code_block(content)
     if snippet is None:
         return None
     enriched = dict(row)
