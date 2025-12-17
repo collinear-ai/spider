@@ -591,15 +591,13 @@ def _tool_batch_worker(
             )
             raise
 
-        record = {"prompt": prompt, "completion": transcript}
+        record = {"prompt": prompt, "content": transcript}
         if include_logprobs:
-            record = {
-                "prompt": prompt,
-                "completion": transcript,
+            record.update({
                 "token_ids": token_ids,
                 "logprobs": logprobs,
-                "reward_mask": reward_mask,
-            }
+                "reward_mask": reward_mask
+            })
 
         if post_processor:
             processed = post_processor(record)
@@ -726,11 +724,14 @@ def _run_prompt_with_tools(
             sorted(list(assistant_message.keys())),
             bool(assistant_message.get("tool_calls")) 
         )
+        reasoning = assistant_message.get("reasoning")
         snapshot = {
             "role": "assistant",
             "content": assistant_message.get("content", ""),
             "tool_calls": assistant_message.get("tool_calls"),
         }
+        if reasoning:
+            snapshot["reasoning"] = reasoning
 
         token_ids = assistant_message.get("token_ids") or []
         logprobs = assistant_message.get("logprobs") or []
