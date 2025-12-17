@@ -1,30 +1,29 @@
 # Spider
 
-Lightweight on/off-policy distillation framework with a single client interface.
+Lightweight on/off-policy distillation engine with a single client interface. Runnable in minimal lines of code.
 
-If `on_policy: false`, a complete pipeline for generating distillation data will be set up. 
+In the `.yaml` file, if `on_policy: false` is chosen, a complete pipeline for generating distillation data will be set up. 
 
-If `on_policy: true`, a complete pipeline for online training job will be set up, with cross-tokenizer teacher support.
-
-`spider` takes care the whole workflow from dataset preparation, rollouts, kl supervision (on-policy only), and data post-processing in a few lines of code.
+If `on_policy: true` is chosen, a complete pipeline for online training job will be set up. The training supports teacher models of different tokenizers and enables multi-turn tool use. 
 
 ## Install
 
 ```bash
 # install & launch a server
-pip install uv
-uv pip install -e .[server]
+pip install -e .[server]
 python -m uvicorn server.app:app --host 0.0.0.0 --port 9000
 ```
 
 ```bash
 # install a client
-pip install -e .[client] # (available for cpu machines)
+pip install -e .[client] # (available on cpu machines)z
 ```
 
 ## Python client API
 
 The following snippet showcases a complete job cycle for a distillation job.
+
+For complete examples across on/off-policy distillation scenarios, see `/scripts` (which references config files in `/config`). Each script is responsible for an independent large-scale distillation run. 
 
 ```python
 from spider.client import SpiderClient
@@ -37,9 +36,11 @@ def post_process_row(row) -> Dict[str, Any]: # custom transform of outputs
   return row # or None, if unwanted
 
 config = AppConfig.load("config/test-remote-processor.yaml") # define rollout hyperparams
+env = {"HF_TOKEN": "", "OPENAI_API_KEY":""} # define env variables (can also fetch from local env)
 
 with SpiderClient(
   config=config, 
+  env=env,
   pre_processor=pre_process_row,
   post_processor=post_process_row
 ) as client:
@@ -47,7 +48,7 @@ with SpiderClient(
     job_id = submission["job_id"]
 
     # pool_job streams the distillation process back to client
-    status = client.poll_job(job_id, interval=5.0, timeout=600, wait_for_completion=True)
+    status = client.poll_job(job_id, interval=5.0, wait_for_completion=True)
 
     if status["status"] == "completed":
         client.download_result(job_id, destionation="./artifacts/result.json") # return full data with metadata, optionally upload to HF
