@@ -90,7 +90,7 @@ def _fetch_schema():
     }
 
 def main():
-    config = AppConfig.load("config/web_search.yaml")
+    config = AppConfig.load("config/generate_gaia_search.yaml")
     runtime = config.job.runtime or RuntimeDependencyConfig()
     runtime.packages = ["httpx", "beautifulsoup4"]
     config.job.runtime = runtime
@@ -116,7 +116,7 @@ def main():
         status = client.poll_job(submission["job_id"], interval=5.0, wait_for_completion=True)
 
         if status["status"] == "completed":
-            client.download_result(submission["job_id"], destination="artifacts/web_search.json")
+            client.download_result(submission["job_id"], destination="artifacts/generate_gaia_search.json")
         else:
             raise RuntimeError(status.get("error") or status.get("messages"))
 
