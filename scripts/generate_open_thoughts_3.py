@@ -123,7 +123,7 @@ def build_prompt(row: Dict[str, Any]) -> Optional[str]:
 # == main function for client call ==
 
 def main() -> None:
-    config = AppConfig.load("config/open_thoughts_3.yaml")
+    config = AppConfig.load("config/generate_open_thoughts_3.yaml")
     secrets = {"OPENAI_API_KEY": os.environ["OPENAI_API_KEY"]}
     with SpiderClient(
         config=config, 
