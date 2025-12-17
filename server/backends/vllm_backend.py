@@ -78,7 +78,7 @@ class VLLMBackend:
             raise RuntimeError("vLLM chat returned no candidate outputs.")
 
         message = choices[0].get("message") or {}
-        content = _normalize_content(message.get("content"))
+        content = _normalize_content(message.get("content")) or ""
         reasoning = _normalize_content(
             message.get("reasoning") or message.get("reasoning_content")
         )
@@ -230,6 +230,8 @@ class VLLMBackend:
             }
 
 def _normalize_content(value: Union[str, List[Any], Dict[str, Any], None]) -> str:
+    if value is None:
+        return ""
     return value # TODO: placeholder for vision model if returning a list
 
 def _reserve_port():
