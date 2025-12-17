@@ -116,7 +116,7 @@ def main():
         status = client.poll_job(submission["job_id"], interval=5.0, wait_for_completion=True)
 
         if status["status"] == "completed":
-            client.download_result(submission["job_id"], destination="artifacts/test-remote.json")
+            client.download_result(submission["job_id"], destination="artifacts/web_search.json")
         else:
             raise RuntimeError(status.get("error") or status.get("messages"))
 

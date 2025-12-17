@@ -105,7 +105,7 @@ def judge_difficulty(client, question):
     msg = resp.choices[0].message.content
     return int(json.loads(msg)["score"])
 
-def build_prompt(row: Dict[str, Any]):
+def build_prompt(row: Dict[str, Any]) -> Optional[str]:
     """
     param: row (dict): a single prompt record
 
@@ -139,7 +139,7 @@ def main() -> None:
         print(f"Final status: {status['status']}")
 
         if status["status"] == "completed":
-            artifact_path = client.download_result(job_id, destination="artifacts/test-remote.json")
+            artifact_path = client.download_result(job_id, destination="artifacts/generate_open_thoughts_3.json")
             print(f"Artifacts saved to {artifact_path}")
         else:
             print("Messages: ", status.get("messages", []))

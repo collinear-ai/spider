@@ -21,5 +21,4 @@ job:
     mode: "upload_hf"
     hf:
       repo_id: RiddleHe/spider-rollouts-openthoughts-3-qwen32b-opencodereasoning-split-0-512
-      token:
       private: false
