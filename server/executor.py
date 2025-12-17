@@ -382,10 +382,21 @@ def _build_batch_worker(
         dict(backend.metrics() or {})
     )
 
-def _pair_records(prompts: Iterable[str], generations: Iterable[str]) -> List[Dict[str, Any]]:
+def _pair_records(
+    prompts: Iterable[str], 
+    generations: Iterable[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
     paired = []
-    for prompt, completion in zip(prompts, generations):
-        paired.append({"prompt": prompt, "completion": completion})
+    for prompt, gen in zip(prompts, generations):
+        content = gen.get("content", "")
+        reasoning = gen.get("reasoning") or None
+        record = {
+            "prompt": prompt,
+            "content": content,
+        }
+        if reasoning:
+            record["reasoning"] = reasoning
+        paired.append(record)
     return paired
 
 def _resolve_processor(spec: Optional[ProcessorConfig], *, runtime_env: Optional["RuntimeEnvironment"] = None) -> Optional[Callable[[Dict[str, Any]], Any]]:
@@ -445,12 +456,20 @@ def _wrap_runtime_callable(
     return wrapped
 
 def _process_batch(
-    prompts: Iterable[str], generations: Iterable[str], 
+    prompts: Iterable[str], generations: Iterable[Dict[str, Any]], 
     processor: Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
 ) -> List[Dict[str, Any]]:
     processed = []
-    for prompt, completion in zip(prompts, generations):
-        record = {"prompt": prompt, "completion": completion}
+    for prompt, gen in zip(prompts, generations):
+        content = gen.get("content", "")
+        reasoning = gen.get("reasoning") or None
+        record = {
+            "prompt": prompt,
+            "content": content
+        }
+        if reasoning:
+            record["reasoning"] = reasoning
+
         result = processor(record)
         if result is None:
             continue
@@ -517,7 +536,7 @@ def _text_batch_worker(
     job: JobConfig,
     post_processor: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]],
 ) -> List[Dict[str, Any]]:
-    generations = backend.generate(prompts, parameters=job.generation.parameters)
+    generations = backend.chat_batch(prompts, parameters=job.generation.parameters)
 
     if len(generations) != len(prompts):
         raise JobExecutionError(

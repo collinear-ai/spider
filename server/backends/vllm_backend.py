@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Any, Optional
+from typing import Dict, Iterable, List, Any, Optional, Union
 import threading, logging, contextlib, os, socket, subprocess, sys, time, httpx
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 from spider.config import ModelConfig
 
@@ -36,29 +37,6 @@ class VLLMBackend:
         except Exception:
             self.close()
             raise
-
-    def generate(self, prompts: Iterable[str], *, parameters: Dict[str, object]) -> List[str]:
-        if not self._client:
-            raise RuntimeError("vLLM HTTP client is not initialized.")
-        prompt_list = list(prompts)
-        if not prompt_list:
-            return []
-
-        payload = self._build_completion_payload(prompt_list, parameters)
-        response = self._client.post("/v1/completions", json=payload)
-        response.raise_for_status()
-        data = response.json()
-        choices = data.get("choices") or []
-        
-        if len(choices) != len(prompt_list):
-            raise RuntimeError(
-                f"Generation count mismatch within batch: expected {len(prompt_list)}, received {len(choices)}"
-            )
-
-        ordered = sorted(choices, key=lambda entry: entry.get("index", 0))
-        completions = [(choice.get("text") or "") for choice in ordered]
-        self._update_metrics(data.get("usage"))
-        return completions
 
     def chat(
         self,
@@ -99,7 +77,8 @@ class VLLMBackend:
             raise RuntimeError("vLLM chat returned no candidate outputs.")
 
         message = choices[0].get("message") or {}
-        content = message.get("content") or ""
+        content = _normalize_content(message.get("content"))
+        reasoning = _normalize_content(message.get("reasoning"))
         tool_calls = message.get("tool_calls")
         
         self._update_metrics(data.get("usage"))
@@ -108,7 +87,32 @@ class VLLMBackend:
             len(content),
             bool(tool_calls),
         )
-        return {"content": content, "tool_calls": tool_calls}
+        return {"content": content, "reasoning": reasoning or None, "tool_calls": tool_calls}
+
+    def chat_batch(
+        self,
+        prompts: List[str],
+        *,
+        parameters: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        if not prompts:
+            return []
+
+        def run_one(args: Any) -> tuple[int, Dict[str, Any]]:
+            idx, prompt = args
+            messages = []
+            if self._system_prompt:
+                messages.append({"role": "system", "content": self._system_prompt})
+            messages.append({"role": "user", "content": prompt})
+            return idx, self.chat(messages=messages, parameters=parameters)
+
+        results = [None] * len(prompts)
+        max_workers = min(len(prompts), 8)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for idx, resp in pool.map(run_one, enumerate(prompts)):
+                results[idx] = resp
+        
+        return [r or {} for r in results]
 
     def metrics(self) -> Dict[str, object]:
         with self._metrics_lock:
@@ -207,30 +211,6 @@ class VLLMBackend:
         finally:
             self._server_proc = None
 
-    def _build_prompt(self, prompt: str) -> str:
-        messages = []
-        if self._system_prompt:
-            messages.append({"role": "system", "content": self._system_prompt})
-        messages.append({"role": "user", "content": prompt})
-
-        return self._tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-    def _build_completion_payload(
-        self, prompts: List[str], parameters: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        payload = {
-            "model": self._config.name,
-            "prompt": [self._build_prompt(prompt) for prompt in prompts],
-            "n": 1,
-            "stream": False,
-        }
-        payload.update(dict(parameters or {}))
-        return payload
-
     def _update_metrics(self, usage: Optional[Dict[str, Any]]) -> None:
         if not usage:
             return
@@ -239,6 +219,9 @@ class VLLMBackend:
                 "prompt_tokens": usage.get("prompt_tokens", 0),
                 "completion_tokens": usage.get("completion_tokens", 0),
             }
+
+def _normalize_content(value: Union[str, List[Any], Dict[str, Any], None]) -> str:
+    return value # TODO: placeholder for vision model if returning a list
 
 def _reserve_port():
     with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
