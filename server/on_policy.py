@@ -18,10 +18,7 @@ from tinker_cookbook.distillation.datasets import (
 from tinker_cookbook.rl.types import RLDataset, RLDatasetBuilder
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
-from .on_policy_utils import (
-    compute_student_logprobs_trainable,
-    compute_teacher_alignment_for_rewards,
-)
+from .on_policy_utils import compute_teacher_alignment_for_rewards
 from .sources import collect_prompts
 from . import events
 from .writers import JSONLBatchWriter
