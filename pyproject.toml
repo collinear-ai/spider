@@ -94,6 +94,13 @@ all = [
     "httpx",
 ]
 
+# pip install .[server,gptoss] \
+#   --extra-index-url https://wheels.vllm.ai/gpt-oss/ \
+#   --extra-index-url https://download.pytorch.org/whl/nightly/cu128
+gptoss = [
+    "vllm==0.10.1+gptoss"
+]
+
 [project.scripts]
 spider = "spider.cli:app"
 
