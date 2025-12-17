@@ -79,7 +79,9 @@ class VLLMBackend:
 
         message = choices[0].get("message") or {}
         content = _normalize_content(message.get("content"))
-        reasoning = _normalize_content(message.get("reasoning"))
+        reasoning = _normalize_content(
+            message.get("reasoning") or message.get("reasoning_content")
+        )
         tool_calls = message.get("tool_calls")
         
         self._update_metrics(data.get("usage"))
@@ -88,7 +90,11 @@ class VLLMBackend:
             len(content),
             bool(tool_calls),
         )
-        return {"content": content, "reasoning": reasoning or None, "tool_calls": tool_calls}
+        return {
+            "content": content, 
+            "reasoning": reasoning or None, 
+            "tool_calls": tool_calls
+        }
 
     def chat_batch(
         self,
