@@ -14,7 +14,7 @@ If `on_policy: true`, a complete pipeline for online training job will be set up
 # install & launch a server
 pip install uv
 uv pip install -e .[server]
-uvicorn server.app:app --host 0.0.0.0 --port 9000 --workers 1
+python -m uvicorn server.app:app --host 0.0.0.0 --port 9000
 ```
 
 ```bash
