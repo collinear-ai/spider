@@ -444,15 +444,15 @@ def _run_tool_on_policy_stream(
                 raise JobExecutionError("KL mask must match reward mask positions.")
             
             kl_tensor = torch.tensor(kl_adj, device=student_logprobs.device, dtype=student_logprobs.dtype)
-            kl_mask_tensor = torch.tensor(kl_mask, device=student_logprobs.device, dtype=student_logprobs.dtype)
-            adj_logprobs = student_logprobs.clone() + (kl_tensor * kl_mask_tensor)
+            advantage = -kl_tensor
 
             datum = tinker.Datum( # turn kl loss into CE loss with logprobs + kl delta
                 model_input=tinker.ModelInput.from_ints(list(token_ids)),
                 loss_fn_inputs={
                     "target_tokens": tinker.TensorData.from_list(list(token_ids)),
                     "mask": tinker.TensorData.from_list(list(reward_mask)),
-                    "logprobs": tinker.TensorData.from_torch(adj_logprobs),
+                    "logprobs": tinker.TensorData.from_torch(student_logprobs),
+                    "advantages": tinker.TensorData.from_torch(advantage),
                 }
             )
 
