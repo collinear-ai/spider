@@ -29,8 +29,9 @@ class VLLMBackend:
     
         self._last_metrics: Dict[str, object] = {}
         self._metrics_lock = threading.Lock()
-        self._tool_parser = _default_tool_parser(config.name or "")
+        self._tool_parser = config.parameters.get("tool_parser") or _default_tool_parser(config.name or "")
         self._chat_template = _default_chat_template(config.name or "")
+        self._reasoning_parser = config.parameters.get("reasoning_parser") or _default_reasoning_parser(config.name or "")
 
         try:
             self._start_server()
@@ -146,8 +147,10 @@ class VLLMBackend:
         if self._tool_parser:
             command.append("--enable-auto-tool-choice")
             command.extend(["--tool-call-parser", self._tool_parser])
-        if self._chat_template:
+        if self._chat_template: # special template for auto-tool-choice
             command.extend(["--chat-template", str(self._chat_template)])
+        if self._reasoning_parser:
+            command.extend(["--reasoning-parser", self._reasoning_parser])
 
         for key, value in self._model_params.items():
             if value is None: continue
@@ -236,7 +239,7 @@ def _default_tool_parser(model_name: str) -> Optional[str]:
         return "qwen3_xml"
     if "deepseek" in lower:
         return "deepseek_v31" if "v3.1" in lower else "deepseek_v3"
-    if "glm" in lower:
+    if "glm-4" in lower:
         return "glm45"
     if "mistral" in lower:
         return "mistral"
@@ -260,4 +263,18 @@ def _default_chat_template(model_name: str) -> Optional[Path]:
         if template.exists():
             return template
         logger.warning("Could not find mistral chat template at %s", template)
+    return None
+
+def _default_reasoning_parser(model_name: str) -> Optional[str]:
+    lower = (model_name or "").lower()
+    if "deepseek-r1" in lower:
+        return "deepseek_r1"
+    if "qwen3" in lower or "qwq" in lower:
+        return "qwen3"
+    if "glm-4" in lower:
+        return "glm45"
+    if "kimi" in lower:
+        return "kimi_k2"
+    if "gpt-oss" in lower:
+        return "openai_gptoss"
     return None
