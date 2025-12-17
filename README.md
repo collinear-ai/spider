@@ -12,11 +12,14 @@ If `on_policy: true`, a complete pipeline for online training job will be set up
 
 ```bash
 # install & launch a server
-pip install -e ".[server]"
+pip install uv
+uv pip install -e .[server]
 uvicorn server.app:app --host 0.0.0.0 --port 9000 --workers 1
+```
 
+```bash
 # install a client
-pip install -e ".[client]" # (available for cpu machines)
+pip install -e .[client] # (available for cpu machines)
 ```
 
 ## Python client API

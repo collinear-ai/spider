@@ -42,7 +42,7 @@ server = [
     "fastapi",
     "uvicorn[standard]",
     "python-multipart",
-    "vllm",
+    "vllm>=0.10.2",
     "huggingface_hub",
     "chz",
     "numpy",
@@ -73,7 +73,7 @@ all = [
     "fastapi",
     "uvicorn[standard]",
     "python-multipart",
-    "vllm",
+    "vllm>=0.10.2",
     "huggingface_hub",
     "chz",
     "numpy",
@@ -92,13 +92,6 @@ all = [
     "openai",
     "tqdm",
     "httpx",
-]
-
-# pip install .[server,gptoss] \
-#   --extra-index-url https://wheels.vllm.ai/gpt-oss/ \
-#   --extra-index-url https://download.pytorch.org/whl/nightly/cu128
-gptoss = [
-    "vllm==0.10.1+gptoss"
 ]
 
 [project.scripts]
