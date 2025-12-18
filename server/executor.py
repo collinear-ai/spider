@@ -591,7 +591,8 @@ def _tool_batch_worker(
             )
             raise
 
-        record = {"prompt": prompt, "content": transcript}
+        final_content = transcript[-1].get("content", "") if transcript else ""
+        record = {"prompt": prompt, "content": final_content, "trajectory": transcript}
         if include_logprobs:
             record.update({
                 "token_ids": token_ids,
