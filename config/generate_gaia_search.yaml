@@ -13,7 +13,9 @@ job:
   source:
     dataset: gaia-benchmark/GAIA
     config_name: 2023_all
-    split: test[0:64]
+    split: test[0:512]
+    max_examples: 64
+    shuffle: true
     field: Question
   generation: 
     max_turns: 12

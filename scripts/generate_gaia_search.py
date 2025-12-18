@@ -97,7 +97,8 @@ def main():
 
     secrets = {
         "TAVILY_API_KEY": os.environ["TAVILY_API_KEY"],
-        "HF_TOKEN": os.environ["HF_TOKEN"]
+        "HF_TOKEN": os.environ["HF_TOKEN"],
+        "HF_HOME": os.environ["HF_HOME"],
     }
 
     with SpiderClient(config=config, env=secrets) as client:
