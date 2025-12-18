@@ -591,7 +591,10 @@ def _tool_batch_worker(
             )
             raise
 
-        final_content = transcript[-1].get("content", "") if transcript else ""
+        if transcript and transcript[-1].get("role") == "assistant":
+            final_content = transcript[-1].get("content", "")
+        else:
+            final_content = ""
         record = {"prompt": prompt, "content": final_content, "trajectory": transcript}
         if include_logprobs:
             record.update({
@@ -831,7 +834,12 @@ def _run_prompt_with_tools(
                 prompt_preview,
             )
 
-    raise JobExecutionError(f"Tool-enabled generation exceeded {turn_limit} turns without reaching a final response.")
+    logger.warning(
+        "Job %s: tool-enabled generation exceeded %d turns without reaching a final response.",
+        job_id,
+        turn_limit,
+    )
+    return transcript, all_token_ids, all_logprobs, all_reward_masks
 
 def _prepare_runtime_env(
     job: JobConfig,
