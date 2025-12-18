@@ -1,22 +1,22 @@
 server:
-  base_url:
+  base_url: http://127.0.0.1:9000
   request_timeout: 120
 job:
   model:
     provider: vllm
-    name: Qwen/Qwen2.5-7B-Instruct
+    name: openai/gpt-oss-120b
     parameters:
-      tensor_parallel_size: 2
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.85
       system_prompt: |
         You are a web search assistant. You MUST use tools and cite sources and never rely on memory.
   source:
     dataset: gaia-benchmark/GAIA
     config_name: 2023_all
-    split: test[0:32]
+    split: test[0:64]
     field: Question
   generation: 
-    max_batch_size: 2
-    max_turns: 8
+    max_turns: 12
     parameters:
       temperature: 0.7
       top_p: 0.9
@@ -24,5 +24,5 @@ job:
   output:
     mode: "upload_hf"
     hf:
-      repo_id: RiddleHe/spider-rollouts-web-search-qwen2.5-7b-gaia-32-examples
+      repo_id: collinear-ai/spider-rollouts-gaia-tool-web-search-gptoss-120b
       private: false
