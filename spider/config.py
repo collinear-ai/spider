@@ -35,6 +35,15 @@ class SourceConfig(BaseModel):
         default=False,
         description="Whether to stream the dataset instead of download"
     )
+    max_examples: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Maximum number of examples to load from the split"
+    )
+    shuffle: bool = Field(
+        default=False,
+        description="Shuffle the dataset before sampling"
+    )
     options: Dict[str, Any] = Field(
         default_factory=dict,
         description="Extra dataset loading options"
