@@ -148,7 +148,6 @@ def _execute_job(job_id: str) -> None:
             "Job failed.",
             level="error",
             code="job.failed",
-            data={"error": str(exc)}
         )
     except Exception as exc:
         logger.exception("Job %s crashed with unexpected error.", job_id)
