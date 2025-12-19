@@ -809,7 +809,21 @@ def _run_prompt_with_tools(
             try:
                 tool_args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
             except (TypeError, ValueError) as exc:
-                raise JobExecutionError(f"Tool `{tool_name}` argument must be valid JSON")
+                logger.warning(
+                    "Job %s: tool `%s` received invalid arguments; args=%s",
+                    job_id,
+                    tool_name,
+                    raw_args,
+                )
+                tool_message = {
+                    "role": "tool",
+                    "name": tool_name,
+                    "content": "Tool call failed: arguments were not valid JSON.",
+                    "tool_call_id": call.get("id"),
+                }
+                transcript.append(tool_message)
+                history.append(dict(tool_message))
+                continue
 
             success = True
             try:
