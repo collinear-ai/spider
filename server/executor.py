@@ -705,14 +705,26 @@ def _run_prompt_with_tools(
             turn_idx,
             prompt_preview
         )
-        assistant_message = _call_backend_chat(
-            backend=backend,
-            messages=history,
-            tools=tool_defs,
-            parameters=job.generation.parameters,
-            include_logprobs=include_logprobs,
-            model_name=job.model.name
-        )
+        try:
+            assistant_message = _call_backend_chat(
+                backend=backend,
+                messages=history,
+                tools=tool_defs,
+                parameters=job.generation.parameters,
+                include_logprobs=include_logprobs,
+                model_name=job.model.name
+            )
+        except JobExecutionError as exc:
+            msg = str(exc).lower()
+            if "max_tokens" in msg: # hit max token limit
+                logger.warning(
+                    "Job %s: max token reached during tool chat at turn %d; returning partial transcript.",
+                    job_id,
+                    turn_idx,
+                )
+                return transcript, all_token_ids, all_logprobs, all_reward_masks
+            raise
+        
         logger.info(
             "Job %s: assistant turn %d for prompt `%s` returned keys=%s tool_calls=%s",
             job_id,
