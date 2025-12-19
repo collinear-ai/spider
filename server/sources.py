@@ -12,14 +12,14 @@ def collect_prompts(
     source: SourceConfig,
     *,
     pre_processor: Optional[PreProcessor] = None,
-) -> List[str]:
+) -> List[Dict[str, Any]]:
     return _load_hf_dataset(source, pre_processor=pre_processor)
 
 def _load_hf_dataset(
     source: SourceConfig,
     *,
     pre_processor: Optional[PreProcessor] = None,
-) -> List[str]:
+) -> List[Dict[str, Any]]:
     from datasets import load_dataset
 
     load_kwargs = {
@@ -35,7 +35,7 @@ def _load_hf_dataset(
         **load_kwargs,
         **source.options,
     )
-    prompts: List[str] = []
+    prompts = []
     max_examples = source.max_examples
     shuffle_requested = source.shuffle
 
@@ -56,27 +56,45 @@ def _load_hf_dataset(
             if prompt is None:
                 continue
             value = prompt if isinstance(prompt, str) else str(prompt)
+            row = _build_prompt_record(record, prompt=value)
         elif source.field is None:
             value = str(record)
+            row = _build_prompt_record(record, prompt=value)
         else:
             value = example[source.field]
             value = value if isinstance(value, str) else str(value)
+            row = _build_prompt_record(record, prompt=value, drop_field=source.field)
         
         collected += 1
         if max_examples is None or not shuffle_requested:
-            prompts.append(value)
+            prompts.append(row)
             if max_examples is not None and len(prompts) >= max_examples:
                 break
             continue
 
         # reservoir sampling
         if len(prompts) < max_examples:
-            prompts.append(value)
+            prompts.append(row)
         else:
             idx = random.randint(0, collected - 1)
             if idx < max_examples:
-                prompts[idx] = value
+                prompts[idx] = row
 
         if shuffle_requested:
             random.shuffle(prompts) # shuffle the biased order in reservoir sampling
     return prompts
+
+def _build_prompt_record(
+    record: Dict[str, Any],
+    *,
+    prompt: str,
+    drop_field: Optional[str] = None,
+) -> Dict[str, Any]:
+    ordered = {"prompt": prompt}
+    for key, value in record.items():
+        if key == "prompt":
+            continue
+        if drop_field is not None and key == drop_field:
+            continue
+        ordered[key] = value
+    return ordered

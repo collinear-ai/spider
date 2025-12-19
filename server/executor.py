@@ -257,10 +257,10 @@ def _run_batched_generation(
     *,
     job_id: str,
     job: JobConfig,
-    prompts: List[str],
+    prompts: List[Dict[str, Any]],
     artifact_path: Path,
     metadata_path: Path,
-    batch_worker: Callable[[List[str]], Tuple[List[Dict[str, Any]], Dict[str, Any]]],
+    batch_worker: Callable[[List[Dict[str, Any]]], Tuple[Future[List[Dict[str, Any]]], Dict[str, Any]]],
 ) -> JobExecutionResult:
     aggregated_metrics = {}
     records_written = 0
@@ -357,7 +357,7 @@ def _build_batch_worker(
     backend: Any,
     post_processor: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]],
     tool_registry: Dict[str, Callable[..., Any]],
-) -> Callable[[List[str]], Tuple[Future[List[Dict[str, Any]]], Dict[str, Any]]]:
+) -> Callable[[List[Dict[str, Any]]], Tuple[Future[List[Dict[str, Any]]], Dict[str, Any]]]:
     if not tool_registry:
         return lambda prompts: (
             _immediate_future(_text_batch_worker(
@@ -383,21 +383,38 @@ def _build_batch_worker(
     )
 
 def _pair_records(
-    prompts: Iterable[str], 
+    prompts: Iterable[Dict[str, Any]], 
     generations: Iterable[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     paired = []
-    for prompt, gen in zip(prompts, generations):
+    for row, gen in zip(prompts, generations):
         content = gen.get("content", "")
         reasoning = gen.get("reasoning") or None
-        record = {
-            "prompt": prompt,
-            "content": content,
-        }
-        if reasoning:
-            record["reasoning"] = reasoning
+        record = _build_generation_record(row, content=content, reasoning=reasoning)
         paired.append(record)
     return paired
+
+def _build_generation_record(
+    row: Dict[str, Any],
+    *,
+    content: str,
+    reasoning: Optional[str] = None,
+    trajectory: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    record = {
+        "prompt": row["prompt"],
+        "content": content,
+    }
+    if reasoning:
+        record["reasoning"] = reasoning
+    if trajectory:
+        record["trajectory"] = trajectory
+    reserved = {"prompt", "content", "reasoning", "trajectory"}
+    for key, value in row.items():
+        if key in reserved:
+            continue
+        record[key] = value
+    return record
 
 def _resolve_processor(spec: Optional[ProcessorConfig], *, runtime_env: Optional["RuntimeEnvironment"] = None) -> Optional[Callable[[Dict[str, Any]], Any]]:
     if spec is None:
@@ -456,19 +473,15 @@ def _wrap_runtime_callable(
     return wrapped
 
 def _process_batch(
-    prompts: Iterable[str], generations: Iterable[Dict[str, Any]], 
+    prompts: Iterable[Dict[str, Any]], 
+    generations: Iterable[Dict[str, Any]], 
     processor: Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
 ) -> List[Dict[str, Any]]:
     processed = []
-    for prompt, gen in zip(prompts, generations):
+    for row, gen in zip(prompts, generations):
         content = gen.get("content", "")
         reasoning = gen.get("reasoning") or None
-        record = {
-            "prompt": prompt,
-            "content": content
-        }
-        if reasoning:
-            record["reasoning"] = reasoning
+        record = _build_generation_record(row, content=content, reasoning=reasoning)
 
         result = processor(record)
         if result is None:
@@ -531,12 +544,13 @@ def _immediate_future(result: Iterable[Dict[str, Any]]) -> Future[List[Dict[str,
 
 def _text_batch_worker(
     *,
-    prompts: List[str],
+    prompts: List[Dict[str, Any]],
     backend: Any,
     job: JobConfig,
     post_processor: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]],
 ) -> List[Dict[str, Any]]:
-    generations = backend.chat_batch(prompts, parameters=job.generation.parameters)
+    prompt_texts = [row["prompt"] for row in prompts]
+    generations = backend.chat_batch(prompt_texts, parameters=job.generation.parameters)
 
     if len(generations) != len(prompts):
         raise JobExecutionError(
@@ -553,7 +567,7 @@ def _text_batch_worker(
 def _tool_batch_worker(
     *,
     job_id: str,
-    prompts: List[str],
+    prompts: List[Dict[str, Any]],
     backend: Any,
     job: JobConfig,
     post_processor: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]],
@@ -568,7 +582,8 @@ def _tool_batch_worker(
 
     executor = ThreadPoolExecutor(max_workers=max_concurrency)
 
-    def run_prompt(prompt):
+    def run_prompt(row):
+        prompt = row["prompt"]
         try:
             transcript, token_ids, logprobs, reward_mask = _run_prompt_with_tools(
                 backend=backend,
@@ -588,7 +603,13 @@ def _tool_batch_worker(
             final_content = transcript[-1].get("content", "")
         else:
             final_content = ""
-        record = {"prompt": prompt, "content": final_content, "trajectory": transcript}
+        
+        record = _build_generation_record(
+            row, 
+            content=final_content, 
+            reasoning=None,
+            trajectory=transcript
+        )
         if include_logprobs:
             record.update({
                 "token_ids": token_ids,
@@ -606,8 +627,8 @@ def _tool_batch_worker(
         return record
 
     futures = []
-    for prompt in prompts:
-        futures.append(executor.submit(run_prompt, prompt))
+    for row in prompts:
+        futures.append(executor.submit(run_prompt, row))
 
     def gather_results():
         try:
@@ -724,7 +745,7 @@ def _run_prompt_with_tools(
                 )
                 return transcript, all_token_ids, all_logprobs, all_reward_masks
             raise
-        
+
         logger.info(
             "Job %s: assistant turn %d for prompt `%s` returned keys=%s tool_calls=%s",
             job_id,
@@ -893,7 +914,7 @@ def _prepare_processors_and_prompts(
     runtime_env: Optional["RuntimeEnvironment"],
     pre_processor: Optional[ProcessorConfig],
     post_processor: Optional[ProcessorConfig],
-) -> tuple[Optional[Callable[[Dict[str, Any]], Any]], List[str]]:
+) -> tuple[Optional[Callable[[Dict[str, Any]], Any]], List[Dict[str, Any]]]:
     pre_processor = _resolve_processor(job.pre_processor, runtime_env=runtime_env) if pre_processor else None
     post_processor = _resolve_processor(job.post_processor, runtime_env=runtime_env) if post_processor else None
     prompts = collect_prompts(job.source, pre_processor=pre_processor)
@@ -1129,7 +1150,7 @@ def _initial_chat_history(prompt: str, job: JobConfig) -> List[Dict[str, Any]]:
     history.append({"role": "user", "content": prompt})
     return history
 
-def _resolve_batch_size(job: JobConfig, prompts: List[str]) -> int:
+def _resolve_batch_size(job: JobConfig, prompts: List[Dict[str, Any]]) -> int:
     requested = job.generation.max_batch_size
     if isinstance(requested, int) and requested > 0:
         return max(1, min(requested, len(prompts) or 1))

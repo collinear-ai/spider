@@ -125,7 +125,7 @@ def run_on_policy_job(
     *, 
     workspace: Path,
     job_env: dict[str, str],
-    prompts: Optional[List[str]] = None,
+    prompts: Optional[List[Dict[str, Any]]] = None,
     tool_registry: Optional[Dict[str, Callable[..., Any]]] = None,
 ):
     from .executor import (
@@ -151,7 +151,8 @@ def run_on_policy_job(
     metadata_path = workspace / "metadata.json"
     
     pre_processor = _resolve_processor(job.pre_processor) if job.pre_processor else None
-    prompt_list = prompts if prompts is not None else collect_prompts(job.source, pre_processor=pre_processor)
+    prompt_rows = prompts if prompts is not None else collect_prompts(job.source, pre_processor=pre_processor)
+    prompt_list = [row["prompt"] for row in prompt_rows]
 
     use_gold_alignment = _needs_gold_alignment(student_model, options.teacher)
     logger.info(
