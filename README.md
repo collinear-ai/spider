@@ -2,9 +2,17 @@
 
 Lightweight on/off-policy distillation engine with a single client interface. Runnable in minimal lines of code.
 
-In the `.yaml` file, if `on_policy: false` is chosen, a complete pipeline for generating distillation data will be set up. 
+`spider` supports two types of jobs:
 
-If `on_policy: true` is chosen, a complete pipeline for online training job will be set up. The training supports teacher models of different tokenizers and enables multi-turn tool use. 
+- **Off-policy distillation**, which is to create a dataset with rollouts from a good teacher model. [This script](scripts/generate_tulu_precise_if.py) demonstrates how to generate a single-turn instruction dataset. [This script](scripts/generate_tool_search_nemo.py) demonstrates how to generate a multi-turn tool-enabled trajectory dataset, with minimally defined custom sandbox, dependencies, and tools.
+
+- **On-policy distillation**, which is to create a training run with online supervision from a good teacher model. [This script](scripts/train_on_policy_precise_if.py) demonstrates how to train on-policy with any teacher model with a different tokenizer, which is a novel feature of this repo. We have also enabled training on-policy with multi-turn tool rollouts, with a script coming soon.
+
+Highlighted features of the engine includes:
+
+- Plug-and-play with any tool definitions and custom pre/post-filtering functions. The user only needs to pass a fixed template of tool and filter definitions to the client. The client will recursively parse and package referenced modules, and the server will spin up a sandbox with dependencies to run the generation.
+
+- On-policy distillation with any chosen model. The backend will realign tokenization differences between student and teacher models to ensure the KL divergence loss is correct.
 
 ## Install
 
