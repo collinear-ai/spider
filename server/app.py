@@ -159,7 +159,6 @@ def _execute_job(job_id: str) -> None:
             "Job crashed.",
             level="error",
             code="job.crashed",
-            data={"error": crash_tb.splitlines()[-1]}
         )
     finally:
         _JOB_SECRETS.pop(job_id, None)

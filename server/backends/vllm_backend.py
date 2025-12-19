@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Dict, Iterable, List, Any, Optional, Union
-import threading, logging, contextlib, os, socket, subprocess, sys, time, httpx
+import threading, logging, contextlib, os, socket, subprocess, sys, time, httpx, json
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -64,11 +64,17 @@ class VLLMBackend:
         response = self._client.post("/v1/chat/completions", json=payload)
 
         if response.status_code >= 400:
+            body = (response.text or "").strip()
+            payload_preview = json.dumps(payload)[:2048]
             logger.error(
                 "vLLM chat request failed (status=%s) payload=%s body=%s",
                 response.status_code,
-                payload,
-                response.text[:2048].replace("\n", "\\n"),
+                payload_preview,
+                body[:2048].replace("\n", "\\n"),
+            )
+            raise RuntimeError(
+                f"vLLM chat failed (status={response.status_code}): "
+                f"{body[:512]} | payload={payload_preview}"
             )
         response.raise_for_status()
 

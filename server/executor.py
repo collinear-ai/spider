@@ -582,13 +582,6 @@ def _tool_batch_worker(
             )
         except Exception as exc:
             logger.exception("Job %s: prompt worker crashed while handling `%s`.", job_id, prompt[:20])
-            events.emit_for_job(
-                job_id,
-                "Tool prompt worker crashed.",
-                level="error",
-                code="batch.worker_failed",
-                data={"error": str(exc)}
-            )
             raise
 
         if transcript and transcript[-1].get("role") == "assistant":
