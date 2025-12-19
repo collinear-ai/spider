@@ -1,0 +1,24 @@
+server:
+  base_url: http://127.0.0.1:9000
+  request_timeout: 120
+job:
+  model:
+    provider: vllm
+    name: openai/gpt-oss-120b
+    parameters:
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.85
+  source:
+    dataset: nvidia/Nemotron-RL-knowledge-web_search-mcqa
+    split: train[0:64]
+  generation: 
+    max_turns: 18
+    parameters:
+      temperature: 0.6
+      top_p: 0.9
+      max_tokens: 32768
+  output:
+    mode: "upload_hf"
+    hf:
+      repo_id: collinear-ai/spider-rollouts-nemo-tool-web-search-gptoss-120b
+      private: false

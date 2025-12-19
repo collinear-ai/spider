@@ -6,12 +6,12 @@ from spider.config import AppConfig, RuntimeDependencyConfig
 
 TAVILY_ENDPOINT = "https://api.tavily.com/search"
 
-def web_search(query, max_results):
+def search(query):
     import httpx
     api_key = os.environ["TAVILY_API_KEY"]
     payload = {
         "query": query,
-        "max_results": max(1, min(max_results, 10)),
+        "max_results": 10,
         "include_images": False,
         "include_answer": False,
     }
@@ -41,7 +41,7 @@ def web_search(query, max_results):
         ]
     }
 
-def fetch_page(url, max_chars):
+def browse(url):
     import httpx
     from bs4 import BeautifulSoup
     
@@ -51,46 +51,37 @@ def fetch_page(url, max_chars):
         
     soup = BeautifulSoup(response.text, "html.parser")
     text = soup.get_text(separator=" ", strip=True)
-    snippet = text[: max_chars]
+    words = text.split()
+    trimmed = " ".join(words[:10000])
     return {
         "url": url,
-        "content": snippet,
+        "content": trimmed,
     }
 
-def _search_schema():
-    return {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "Natural language search query."},
-            "max_results": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 10,
-                "default": 5,
-                "description": "Number of search hits to return (1-10)."
-            }
-        },
-        "required": ["query"]
-    }
+SEARCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string", "description": "Natural language search query."},
+    },
+    "required": ["query"]
+}
 
-def _fetch_schema():
-    return {
-        "type": "object",
-        "properties": {
-            "url": {"type": "string", "description": "HTTP/HTTPS URL to download."},
-            "max_chars": {
-                "type": "integer",
-                "minimum": 200,
-                "maximum": 8000,
-                "default": 2000,
-                "description": "Maximum characters of cleaned text to return."
-            }
-        },
-        "required": ["url"]
-    }
+BROWSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "url": {"type": "string", "description": "HTTP/HTTPS URL to download."},
+    },
+    "required": ["url"],
+}
+
+def pre_processor(row):
+    responses_create_params = row.get("responses_create_params", {})
+    instructions = responses_create_params.get("instructions", "")
+    input_str = responses_create_params.get("input", "")
+    return instructions + "\n\n" + input_str
 
 def main():
-    config = AppConfig.load("config/generate_gaia_search.yaml")
+    config = AppConfig.load("config/generate_tool_search_nemo.yaml")
     runtime = config.job.runtime or RuntimeDependencyConfig()
     runtime.packages = ["httpx", "beautifulsoup4"]
     config.job.runtime = runtime
@@ -101,23 +92,27 @@ def main():
         "HF_HOME": os.environ["HF_HOME"],
     }
 
-    with SpiderClient(config=config, env=secrets) as client:
+    with SpiderClient(
+        config=config, 
+        env=secrets, 
+        pre_processor=pre_processor
+    ) as client:
         client.add_tool(
-            description="Run a web search and return relevant results.",
-            json_schema=_search_schema(),
-            func=web_search,
+            description="Search Google for a query and return up to 10 search results.",
+            json_schema=SEARCH_SCHEMA,
+            func=search,
         )
         client.add_tool(
-            description="Download a web page and return a cleaned text snippet.",
-            json_schema=_fetch_schema(),
-            func=fetch_page,
+            description="Returns the cleaned content of a webpage. If the page is too long, it will be truncated to 10,000 words.",
+            json_schema=BROWSE_SCHEMA,
+            func=browse,
         )
 
         submission = client.submit_job()
         status = client.poll_job(submission["job_id"], interval=5.0, wait_for_completion=True)
 
         if status["status"] == "completed":
-            client.download_result(submission["job_id"], destination="artifacts/generate_gaia_search.json")
+            client.download_result(submission["job_id"], destination="artifacts/generate_tool_search.json")
         else:
             raise RuntimeError(status.get("error") or status.get("messages"))
 
