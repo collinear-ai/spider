@@ -44,9 +44,14 @@ def search(query):
 def browse(url):
     import httpx
     from bs4 import BeautifulSoup
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; SpiderBot/1.0)",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     
     with httpx.Client(timeout=20.0) as client:
-        response = client.get(url, follow_redirects=True)
+        response = client.get(url, headers=headers, follow_redirects=True)
         response.raise_for_status()
         
     soup = BeautifulSoup(response.text, "html.parser")
