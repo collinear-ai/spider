@@ -29,7 +29,8 @@ class SpiderClient:
         self._post_processor_kwargs = dict(post_processor_kwargs or {})
 
         self._tool_payloads: Dict[str, Dict[str, Any]] = {}
-        self._job_env = dict(env or {})
+        raw_env = dict(env or {})
+        self._job_env = {key: value for key, value in raw_env.items() if value is not None}
 
     def __enter__(self) -> "SpiderClient":
         self._ensure_client()
@@ -57,6 +58,10 @@ class SpiderClient:
         payload = self._config.job.model_dump(exclude_none=True)
         if job_overrides:
             payload = self._deep_merge(payload, job_overrides)
+
+        for key, value in self._job_env.items():
+            if not isinstance(value, str):
+                raise ValueError(f"Environment variable `{key}` must be a string, got {type(value).__name__}.")
 
         if self._pre_processor is not None:
             payload["pre_processor"] = self._serialize_processor(
