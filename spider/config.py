@@ -48,11 +48,28 @@ class SourceConfig(BaseModel):
         default_factory=dict,
         description="Extra dataset loading options"
     )
+    multi_turn: bool = Field(
+        default=False,
+        description="Enable multi-turn user simulation for each source prompt"
+    )
+    user_simulation_prompt: Optional[str] = Field(
+        default=None,
+        description="System prompt used by the user-simulation model"
+    )
+    user_model: Optional["ModelConfig"] = Field(
+        default=None,
+        description="Model config for the user-simulation model"
+    )
 
     @model_validator(mode="after")
     def validate_source(self) -> "SourceConfig":
         if not self.dataset:
             raise ValueError("`dataset` is required")
+        if self.multi_turn:
+            if not self.user_simulation_prompt:
+                raise ValueError("`user_simulation_prompt` is required when `multi_turn` is true")
+            if not self.user_model:
+                raise ValueError("`user_model` is required when `multi_turn` is true")
         return self
 
 class OnPolicyConfig(BaseModel):
@@ -224,6 +241,12 @@ class JobConfig(BaseModel):
             raise ValueError("`output.mode` must be `upload_hf` when `generation.on_policy` is true")
         if not self.output.hf or not self.output.hf.repo_id.strip():
             raise ValueError("`output.hf.repo_id` is required when `generation.on_policy` is true")
+        return self
+
+    @model_validator(mode="after")
+    def validate_multi_turn_tools(self) -> "JobConfig":
+        if self.source.multi_turn and self.tools:
+            raise ValueError("`tools` cannot be used when `source.multi_turn` is true")
         return self
 
 class ServerConfig(BaseModel):

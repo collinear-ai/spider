@@ -358,6 +358,17 @@ def _build_batch_worker(
     post_processor: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]],
     tool_registry: Dict[str, Callable[..., Any]],
 ) -> Callable[[List[Dict[str, Any]]], Tuple[Future[List[Dict[str, Any]]], Dict[str, Any]]]:
+    if job.source.multi_turn:
+        return lambda prompts: (
+            _multi_turn_batch_worker(
+                job_id=job_id,
+                prompts=prompts,
+                backend=backend,
+                job=job,
+            ),
+            dict(backend.metrics() or {})
+        )
+        
     if not tool_registry:
         return lambda prompts: (
             _immediate_future(_text_batch_worker(
@@ -397,14 +408,15 @@ def _pair_records(
 def _build_generation_record(
     row: Dict[str, Any],
     *,
-    content: str,
+    content: Optional[str] = None,
     reasoning: Optional[str] = None,
     trajectory: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     record = {
         "prompt": row["prompt"],
-        "content": content,
     }
+    if content is not None and content != "":
+        record["content"] = content
     if reasoning:
         record["reasoning"] = reasoning
     if trajectory:
@@ -542,6 +554,42 @@ def _immediate_future(result: Iterable[Dict[str, Any]]) -> Future[List[Dict[str,
     future.set_result(list(result))
     return future
 
+def _collect_ordered_results(
+    futures: List[Future[Dict[str, Any]]],
+    executor: ThreadPoolExecutor,
+) -> List[Dict[str, Any]]:
+    try:
+        ordered_records = [None] * len(futures)
+        pending = set(futures)
+        while pending:
+            done, pending = concurrent.futures.wait(
+                pending, return_when=concurrent.futures.FIRST_EXCEPTION
+            )
+            for future in done:
+                idx = futures.index(future)
+                ordered_records[idx] = future.result()
+        return [record for record in ordered_records if record]
+    finally:
+        for future in futures:
+            if not future.done():
+                future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+
+def _wrap_async_results(
+    futures: List[Future[Dict[str, Any]]],
+    executor: ThreadPoolExecutor,
+) -> Future[List[Dict[str, Any]]]:
+    aggregate = Future()
+
+    def finalize():
+        try:
+            aggregate.set_result(_collect_ordered_results(futures, executor))
+        except Exception as exc:
+            aggregate.set_exception(exc)
+
+    threading.Thread(target=finalize, daemon=True).start()
+    return aggregate
+
 def _text_batch_worker(
     *,
     prompts: List[Dict[str, Any]],
@@ -630,34 +678,51 @@ def _tool_batch_worker(
     for row in prompts:
         futures.append(executor.submit(run_prompt, row))
 
-    def gather_results():
+    return _wrap_async_results(futures, executor)
+
+def _multi_turn_batch_worker(
+    *,
+    job_id: str,
+    prompts: List[Dict[str, Any]],
+    backend: Any,
+    job: JobConfig,
+) -> Future[List[Dict[str, Any]]]:
+    turn_limit = max(1, job.generation.max_turns or 4)
+    max_concurrency = max(1, job.generation.max_batch_size or 4)
+    max_concurrency = min(max_concurrency, len(prompts))
+
+    executor = ThreadPoolExecutor(max_workers=max_concurrency)
+
+    def run_prompt(row):
+        prompt = row["prompt"]
         try:
-            ordered_records = [None] * len(futures)
-            pending = set(futures)
-            while pending:
-                done, pending = concurrent.futures.wait(
-                    pending, return_when=concurrent.futures.FIRST_EXCEPTION
-                )
-                for future in done:
-                    idx = futures.index(future)
-                    ordered_records[idx] = future.result()
-            return [record for record in ordered_records if record]
-        finally:
-            for future in futures:
-                if not future.done():
-                    future.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
+            transcript = _run_prompt_with_user_simulation(
+                backend=backend,
+                job=job,
+                prompt=prompt,
+                turn_limit=turn_limit,
+                job_id=job_id,
+            )
+        except Exception:
+            logger.exception(
+                "Job %s: user-sim worker crashed while handling `%s`.",
+                job_id,
+                prompt[:20],
+            )
+            raise
 
-    aggregate = Future()
+        record = _build_generation_record(
+            row,
+            content=None,
+            reasoning=None,
+            trajectory=transcript,
+        )
 
-    def finalize():
-        try:
-            aggregate.set_result(gather_results())
-        except Exception as exc:
-            aggregate.set_exception(exc)
+        return record
 
-    threading.Thread(target=finalize, daemon=True).start()
-    return aggregate
+    futures = [executor.submit(run_prompt, row) for row in prompts]
+    return _wrap_async_results(futures, executor)
+
 
 def tool_descriptors(tool_specs: Optional[List[ToolConfig]]) -> List[Dict[str, Any]]:
     descriptors = []
@@ -685,6 +750,75 @@ def _serialize_tool_output(result: Any) -> str:
         except (TypeError, ValueError):
             pass
     return str(result)
+
+def _run_prompt_with_user_simulation(
+    *,
+    backend: Any,
+    job: JobConfig,
+    prompt: str,
+    turn_limit: int,
+    job_id: str,
+) -> List[Dict[str, Any]]:
+    if not job.source.user_simulation_prompt or not job.source.user_model:
+        raise JobExecutionError(
+            "User simulation requires `source.user_simulation_prompt` and `source.user_model`."
+        )
+
+    history = _initial_chat_history(prompt, job)
+    transcript = []
+
+    prompt_preview = prompt.replace("\n", "\\n")
+    prompt_preview = prompt_preview[:40] + ("..." if len(prompt_preview) > 80 else "")
+    logger.info("Job %s: user-sim runner invoked for prompt `%s`", job_id, prompt_preview)
+
+    for turn_idx in range(turn_limit):
+        logger.info(
+            "Job %s: starting assistant turn %d for prompt `%s`",
+            job_id,
+            turn_idx,
+            prompt_preview,
+        )
+        assistant_message = _call_backend_chat(
+            backend=backend,
+            messages=history,
+            tools=[],
+            parameters=job.generation.parameters,
+            include_logprobs=False,
+            model_name=job.model.name,
+        )
+        reasoning = assistant_message.get("reasoning")
+        assistant_snapshot = {
+            "role": "assistant",
+            "content": assistant_message.get("content", ""),
+        }
+        if reasoning:
+            assistant_snapshot["reasoning"] = reasoning
+        transcript.append(assistant_snapshot)
+        history.append(assistant_snapshot)
+
+        if turn_idx >= turn_limit - 1:
+            break
+
+        logger.info(
+            "Job %s: simulating user turn %d for prompt `%s`",
+            job_id,
+            turn_idx,
+            prompt_preview,
+        )
+        user_content = _call_user_simulation(
+            history=history,
+            user_simulation_prompt=job.source.user_simulation_prompt,
+            model_config=job.source.user_model,
+            job_id=job_id,
+        )
+        user_snapshot = {
+            "role": "user",
+            "content": user_content,
+        }
+        transcript.append(user_snapshot)
+        history.append(user_snapshot)
+
+    return transcript
 
 def _run_prompt_with_tools(
     *,
@@ -965,6 +1099,51 @@ def _call_backend_chat(
     except Exception as exc:
         logger.exception("Chat backend failed: %s", exc)
         raise JobExecutionError(f"Chat backend failed: {exc}") from exc
+
+def _serialize_history_for_user_simulation(history: List[Dict[str, Any]]) -> str:
+    lines = ["Conversation so far:"]
+    for message in history:
+        role = message.get("role")
+        content = message.get("content", "")
+        lines.append(f"{role}: {content}")
+    lines.append("")
+    lines.append("Generate the next user message only.")
+    return "\n".join(lines)
+
+def _call_user_simulation(
+    *,
+    history: List[Dict[str, Any]],
+    user_simulation_prompt: str,
+    model_config: ModelConfig,
+    job_id: str,
+) -> str:
+    if not model_config.name:
+        raise JobExecutionError("`source.user_model.name` is required for user simulation.")
+    
+    from openai import OpenAI
+    client = OpenAI() # will pick up env key
+    params = dict(model_config.parameters or {})
+
+    transcript = _serialize_history_for_user_simulation(history)
+    messages = [
+        {"role": "system", "content": user_simulation_prompt},
+        {"role": "user", "content": transcript}
+    ]
+
+    try:
+        response = client.chat.completions.create(
+            model=model_config.name,
+            messages=messages,
+            **params,
+        )
+    except Exception as exc:
+        raise JobExecutionError(f"User simulation call failed: {exc}") from exc
+
+    choices = response.choices or []
+    if not choices:
+        return ""
+    content = choices[0].message.content
+    return content or ""
 
 def _tinker_chat_and_logprobs(
     *,
