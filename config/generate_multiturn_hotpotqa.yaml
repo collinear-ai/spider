@@ -1,0 +1,35 @@
+server:
+  base_url: http://127.0.0.1:9000
+  api_key:
+  request_timeout: 120
+job:
+  model: 
+    provider: vllm
+    name: "openai/gpt-oss-120b"
+    parameters:
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.85
+  source:
+    dataset: "hotpotqa/hotpot_qa"
+    config_name: "fullwiki"
+    split: "train"
+    multi_turn: true
+    user_simulation_prompt: |
+      You are a user prompt generator. 
+      You are given a conversation history where the assistant responds to open-ended questions from the user prompt.
+      Given the history, generate the next user prompt that tests the assistant's thinking based on the given context.
+      Only generate the user prompt, no explanation needed.
+    user_model:
+      name: "gpt-5.2-mini"
+      provider: openai
+  generation:
+    max_turns: 4
+    parameters:
+      temperature: 0.7
+      top_p: 0.9
+      max_tokens: 16384
+  output:
+    mode: "upload_hf"
+    hf:
+      repo_id: collinear-ai/spider-openqa-hotpot-gptoss-samples
+      private: false
