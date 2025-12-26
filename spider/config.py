@@ -98,7 +98,7 @@ class GenerationConfig(BaseModel):
     max_turns: Optional[int] = Field(
         default=8,
         ge=1,
-        description="Maximum number of turns allowed for tool calls"
+        description="Maximum number of turns allowed for multi-turn generation (tool calls or user simulation)"
     )
     seed: Optional[int] = Field(default=None)
     parameters: Dict[str, Any] = Field(
