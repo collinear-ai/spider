@@ -368,7 +368,7 @@ def _build_batch_worker(
             ),
             dict(backend.metrics() or {})
         )
-        
+
     if not tool_registry:
         return lambda prompts: (
             _immediate_future(_text_batch_worker(
@@ -765,7 +765,7 @@ def _run_prompt_with_user_simulation(
         )
 
     history = _initial_chat_history(prompt, job)
-    transcript = []
+    transcript = [dict(message) for message in history]
 
     prompt_preview = prompt.replace("\n", "\\n")
     prompt_preview = prompt_preview[:40] + ("..." if len(prompt_preview) > 80 else "")
@@ -835,7 +835,7 @@ def _run_prompt_with_tools(
         raise JobExecutionError("include_logprobs with tools is only supported for Tinker backend.")
 
     history = _initial_chat_history(prompt, job)
-    transcript = []
+    transcript = [dict(message) for message in history]
 
     all_token_ids = []
     all_logprobs = []
