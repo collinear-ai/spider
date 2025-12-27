@@ -21,7 +21,7 @@ job:
       Given the history, generate the next user prompt that tests the assistant's thinking based on the given context.
       Only generate the user prompt, no explanation needed.
     user_model:
-      name: "gpt-5.2-mini"
+      name: "gpt-5-nano-2025-08-07"
       provider: openai
   generation:
     max_turns: 4
