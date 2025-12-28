@@ -22,8 +22,7 @@ def _load_hf_dataset(
 ) -> List[Dict[str, Any]]:
     from datasets import load_dataset
 
-    if source.field is None:
-        raise ValueError("`source.field` is required to extract prompts from rows.")
+    field = source.field or "prompt"
 
     load_kwargs = {
         "path": source.dataset,
@@ -62,11 +61,11 @@ def _load_hf_dataset(
                 continue
             if not isinstance(row, dict):
                 raise ValueError("Pre-processor must return a dict (can be empty) per record.")
-        if source.field not in row:
-            raise ValueError(f"`source.field` was set to `{source.field}` but the field is missing.")
-        value = row[source.field]
+        if field not in row:
+            raise ValueError(f"`source.field` was set to `{field}` but the field is missing.")
+        value = row[field]
         value = value if isinstance(value, str) else str(value)
-        row = _build_prompt_record(row, prompt=value, drop_field=source.field)
+        row = _build_prompt_record(row, prompt=value, drop_field=field)
         
         collected += 1
         if max_examples is None or not shuffle_requested:
