@@ -376,6 +376,7 @@ def _run_tool_on_policy_stream(
         JobExecutionError,
         tool_descriptors
     )
+    from tinker_cookbook.rl.metrics import discounted_future_sum_vectorized
 
     tool_defs = tool_descriptors(job.tools)
     service_client = tinker.ServiceClient()
@@ -444,7 +445,17 @@ def _run_tool_on_policy_stream(
                 raise JobExecutionError("KL mask must match reward mask positions.")
             
             kl_tensor = torch.tensor(kl_adj, device=student_logprobs.device, dtype=student_logprobs.dtype)
-            advantage = -kl_tensor
+            
+            kl_coef = float(getattr(options, "kl_penalty_coef", 1.0))
+            kl_discount = float(getattr(options, "kl_discount_factor", 0.0))
+            advantage = -kl_coef * kl_tensor
+
+            if kl_discount > 0:
+                advantage = torch.tensor(
+                    discounted_future_sum_vectorized(advantage.detach().cpu().numpy(), kl_discount),
+                    device=student_logprobs.device,
+                    dtype=student_logprobs.dtype,
+                )
 
             datum = tinker.Datum( # turn kl loss into CE loss with logprobs + kl delta
                 model_input=tinker.ModelInput.from_ints(list(token_ids)),
@@ -453,7 +464,7 @@ def _run_tool_on_policy_stream(
                     "mask": tinker.TensorData.from_list(list(reward_mask)),
                     "logprobs": tinker.TensorData.from_torch(student_logprobs),
                     "advantages": tinker.TensorData.from_torch(advantage),
-                }
+                } # use importance sampling as a surrogate
             )
 
             logger.info(
