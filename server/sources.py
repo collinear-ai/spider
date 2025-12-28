@@ -6,7 +6,7 @@ import random
 
 from spider.config import SourceConfig
 
-PreProcessor = Callable[[Dict[str, Any]], Optional[str]]
+PreProcessor = Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
 
 def collect_prompts(
     source: SourceConfig,
@@ -22,6 +22,9 @@ def _load_hf_dataset(
 ) -> List[Dict[str, Any]]:
     from datasets import load_dataset
 
+    if source.field is None:
+        raise ValueError("`source.field` is required to extract prompts from rows.")
+
     load_kwargs = {
         "path": source.dataset,
         "split": source.split,
@@ -35,6 +38,7 @@ def _load_hf_dataset(
         **load_kwargs,
         **source.options,
     )
+
     prompts = []
     max_examples = source.max_examples
     shuffle_requested = source.shuffle
@@ -51,19 +55,18 @@ def _load_hf_dataset(
     collected = 0
     for i, example in enumerate(iterable):
         record = dict(example)
+        row = record
         if pre_processor:
-            prompt = pre_processor(record)
-            if prompt is None:
+            row = pre_processor(record)
+            if row is None:
                 continue
-            value = prompt if isinstance(prompt, str) else str(prompt)
-            row = _build_prompt_record(record, prompt=value)
-        elif source.field is None:
-            value = str(record)
-            row = _build_prompt_record(record, prompt=value)
-        else:
-            value = example[source.field]
-            value = value if isinstance(value, str) else str(value)
-            row = _build_prompt_record(record, prompt=value, drop_field=source.field)
+            if not isinstance(row, dict):
+                raise ValueError("Pre-processor must return a dict (can be empty) per record.")
+        if source.field not in row:
+            raise ValueError(f"`source.field` was set to `{source.field}` but the field is missing.")
+        value = row[source.field]
+        value = value if isinstance(value, str) else str(value)
+        row = _build_prompt_record(row, prompt=value, drop_field=source.field)
         
         collected += 1
         if max_examples is None or not shuffle_requested:
