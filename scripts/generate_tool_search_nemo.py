@@ -83,7 +83,9 @@ def pre_processor(row):
     responses_create_params = row.get("responses_create_params", {})
     instructions = responses_create_params.get("instructions", "")
     input_str = responses_create_params.get("input", "")
-    return instructions + "\n\n" + input_str
+    updated = dict(row)
+    updated["prompt"] = instructions + "\n\n" + input_str
+    return updated
 
 def main():
     config = AppConfig.load("config/generate_tool_search_nemo.yaml")

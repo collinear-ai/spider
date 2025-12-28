@@ -9,8 +9,9 @@ def _preprocess_row(row):
     context_sent = context["sentences"]
     context_sent_flattened = [sent for group in context_sent for sent in group]
     context_text = "\n".join(context_sent_flattened)
-    prompt = f"{context_text}\n\nQuestion: {question}"
-    return prompt
+    updated = dict(row)
+    updated["prompt"] = f"{context_text}\n\nQuestion: {question}"
+    return updated
 
 # == main function for client call ==
 

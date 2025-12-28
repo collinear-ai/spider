@@ -105,20 +105,22 @@ def judge_difficulty(client, question):
     msg = resp.choices[0].message.content
     return int(json.loads(msg)["score"])
 
-def build_prompt(row: Dict[str, Any]) -> Optional[str]:
+def build_prompt(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     param: row (dict): a single prompt record
 
     return:
-    -- prompt (str): the transformed prompt to be sent to the rollout model
-    -- None: if the row is unwanted
+    -- record (dict): the updated record with a custom prompt field
+    -- None: if the record is unwanted
     """
     client = get_client()
     question = row.get("input")
     difficulty = judge_difficulty(client, question)
     if difficulty < 5:
         return None
-    return PROMPT_TEMPLATE.format(prompt=question)
+    updated = dict(row)
+    updated["prompt"] = PROMPT_TEMPLATE.format(prompt=question)
+    return updated
 
 # == main function for client call ==
 
