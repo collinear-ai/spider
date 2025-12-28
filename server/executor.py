@@ -554,6 +554,13 @@ def _immediate_future(result: Iterable[Dict[str, Any]]) -> Future[List[Dict[str,
     future.set_result(list(result))
     return future
 
+def _is_vllm_parse_error(exc: Exception) -> bool:
+    msg = str(exc)
+    return (
+        "vllm chat failed" in msg
+        and "unexpected tokens remaining" in msg
+    )
+
 def _collect_ordered_results(
     futures: List[Future[Dict[str, Any]]],
     executor: ThreadPoolExecutor,
@@ -643,6 +650,11 @@ def _tool_batch_worker(
                 job_id=job_id,
                 include_logprobs=include_logprobs,
             )
+        except JobExecutionError as exc:
+            if _is_vllm_parse_error(exc):
+                logger.warning("Job %s: skipping prompt due to vLLM parse error: %s", job_id, exc)
+                return {}
+            raise
         except Exception as exc:
             logger.exception("Job %s: prompt worker crashed while handling `%s`.", job_id, prompt[:20])
             raise
@@ -703,6 +715,11 @@ def _multi_turn_batch_worker(
                 turn_limit=turn_limit,
                 job_id=job_id,
             )
+        except JobExecutionError as exc:
+            if _is_vllm_parse_error(exc):
+                logger.warning("Job %s: skipping prompt due to vLLM parse error: %s", job_id, exc)
+                return {}
+            raise
         except Exception:
             logger.exception(
                 "Job %s: user-sim worker crashed while handling `%s`.",
