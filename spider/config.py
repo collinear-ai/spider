@@ -74,7 +74,6 @@ class SourceConfig(BaseModel):
 
 class OnPolicyConfig(BaseModel):
     teacher: str = Field(..., description="Teacher model to compute KL")
-    api_key: Optional[str] = Field(default=None, description="API key for Tinker")
     learning_rate: float = Field(default=1e-4, gt=0.0)
     groups_per_batch: int = Field(default=512, ge=1)
     group_size: int = Field(default=4, ge=1)

@@ -1376,24 +1376,12 @@ def _detect_available_gpus() -> int:
 def _processor_snapshot(spec: ProcessorConfig) -> Dict[str, Any]:
     return {"name": spec.name, "kwargs": dict(spec.kwargs or {})}
 
-def _sanitize_generation_config(payload: Dict[str, Any]) -> Dict[str, Any]:
-    options = payload.get("on_policy_options")
-    if isinstance(options, dict):
-        options.pop("api_key", None)
-    return payload
-
-def _sanitize_output_config(payload: Dict[str, Any]) -> Dict[str, Any]:
-    hf_config = payload.get("hf")
-    if isinstance(hf_config, dict):
-        payload["hf"] = dict(hf_config)
-    return payload
-
 def _job_snapshot(job: JobConfig) -> Dict[str, Any]:
     snapshot = {
         "model": job.model.model_dump(exclude_none=True),
         "source": job.source.model_dump(exclude_none=True),
-        "generation": _sanitize_generation_config(job.generation.model_dump(exclude_none=True)),
-        "output": _sanitize_output_config(job.output.model_dump(exclude_none=True)),
+        "generation": job.generation.model_dump(exclude_none=True),
+        "output": job.output.model_dump(exclude_none=True),
         "metadata": dict(job.metadata)
     }
     if job.runtime:

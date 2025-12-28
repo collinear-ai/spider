@@ -191,10 +191,9 @@ def run_on_policy_job(
 
     payload = _base_metadata(job_id, job)
     payload["generation_mode"] = "on_policy"
-    sanitized_options = options.model_dump(exclude_none=True).copy()
-    sanitized_options.pop("api_key", None)
-    sanitized_options["use_gold_alignment"] = use_gold_alignment
-    payload["on_policy"] = sanitized_options
+    on_policy_options = options.model_dump(exclude_none=True)
+    on_policy_options["use_gold_alignment"] = use_gold_alignment
+    payload["on_policy"] = on_policy_options
     _write_metadata(metadata_path, payload, 0)
 
     if not prompt_list:
