@@ -64,7 +64,8 @@ def _load_hf_dataset(
         if field not in row:
             raise ValueError(f"`source.field` was set to `{field}` but the field is missing.")
         value = row[field]
-        value = value if isinstance(value, str) else str(value)
+        if not isinstance(value, str):
+            raise ValueError(f"Value for field `{field}` should be a str, get {type(value)} instead.")
         row = _build_prompt_record(row, prompt=value, drop_field=field)
         
         collected += 1
