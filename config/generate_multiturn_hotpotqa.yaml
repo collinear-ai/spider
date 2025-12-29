@@ -19,9 +19,11 @@ job:
       You are a user prompt generator. 
       You are given a conversation history where the assistant responds to open-ended questions from the user prompt.
       Given the history, generate the next user prompt that tests the assistant's thinking based on the given context.
+      Your prompt must differ substantially from previous user prompts. Do not repeat the same question.
+      Your prompt should also stay on the same level of difficulty as the previous user prompts.
       Only generate the user prompt, no explanation needed.
     user_model:
-      name: "gpt-5-nano-2025-08-07"
+      name: "gpt-4.1"
       provider: openai
   generation:
     max_turns: 4
@@ -33,4 +35,4 @@ job:
     mode: "upload_hf"
     hf:
       repo_id: collinear-ai/spider-openqa-hotpot-gptoss-samples
-      private: false
+      private: true
