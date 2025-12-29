@@ -4,9 +4,14 @@ Lightweight on/off-policy distillation engine with a single client interface. Ru
 
 `spider` supports two types of jobs:
 
-- **Off-policy distillation**, which is to create a dataset with rollouts from a good teacher model. [This script](scripts/generate_tulu_precise_if.py) demonstrates how to generate a single-turn instruction dataset. [This script](scripts/generate_tool_search_nemo.py) demonstrates how to generate a multi-turn tool-enabled trajectory dataset, with minimally defined custom sandbox, dependencies, and tools.
+- **Off-policy distillation**, which is to create a dataset with rollouts from a good teacher model. 
+  - [This script](scripts/generate_tulu_precise_if.py) demonstrates how to generate a single-turn instruction dataset with custom processors to create prompt variations. 
+  - [This script](scripts/generate_tool_search_nemo.py) demonstrates how to generate a multi-turn tool-enabled trajectory dataset, with runnable sandbox, dependencies, and tools.
+  - [This script](scripts/generate_multiturn_hotpotqa.py) demonstrates how to generate a multi-turn user-simulated trajectory dataset, where an LLM is configured to play the role of a user to ask follow-up questions.
 
-- **On-policy distillation**, which is to create a training run with online supervision from a good teacher model. [This script](scripts/train_on_policy_precise_if.py) demonstrates how to train on-policy with any teacher model with a different tokenizer, which is a novel feature of this repo. We have also enabled training on-policy with multi-turn tool rollouts, with a script coming soon.
+- **On-policy distillation**, which is to create a training run with online supervision from a good teacher model. 
+  - [This script](scripts/train_on_policy_precise_if.py) demonstrates how to train on-policy with any teacher model with a different tokenizer, which is a novel feature of this repo. 
+  - We have also enabled training on-policy with multi-turn tool rollouts, with a script coming soon.
 
 Highlighted features of the engine includes:
 
@@ -37,11 +42,16 @@ For complete examples across on/off-policy distillation scenarios, see `/scripts
 from spider.client import SpiderClient
 from spider.config import AppConfig
 
-def pre_prcess_row(row) -> str: # custom transform of input prompt
-  return ""
+def pre_prcess_row(row) -> Dict[str, ANy]: # custom transform of inputs
+  return row
 
 def post_process_row(row) -> Dict[str, Any]: # custom transform of outputs
   return row # or None, if unwanted
+
+def tool_call(arg): # custom tool that will execute in sandbox
+  return ""
+
+TOOL_SCHEMA = {}
 
 config = AppConfig.load("config/test-remote-processor.yaml") # define rollout hyperparams
 env = {"HF_TOKEN": "", "OPENAI_API_KEY":""} # define env variables (can also fetch from local env)
@@ -52,6 +62,12 @@ with SpiderClient(
   pre_processor=pre_process_row,
   post_processor=post_process_row
 ) as client:
+    client.add_tool( # add tool
+      description="",
+      json_schema=TOOL_SCHEMA,
+      func=tool_call,
+    )
+
     submission = client.submit_job()
     job_id = submission["job_id"]
 
@@ -64,34 +80,39 @@ with SpiderClient(
 
 ### Config Snapshot
 
-The following is the config file for an off-policy distillation job.
+The following is the config file for an off-policy distillation job, enabling multi-turn user simulations.
 
 ```yaml
 server:
-  base_url: 
-  api_key:
-  request_timeout: 120
+  base_url: http://127.0.0.1:9000
 job:
   model: 
     provider: vllm
-    name: "Qwen/Qwen2.5-7B-Instruct"
+    name: "openai/gpt-oss-120b"
     parameters:
-      tensor_parallel_size: 4
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.85
   source:
-    dataset: "RiddleHe/OpenCodeReasoning-2-questions-dedup-34k-sample-1024"
-    split: "train[0:10]"
-    field: "question"
+    dataset: "hotpotqa/hotpot_qa"
+    config_name: "fullwiki"
+    split: "train"
+    max_examples: 100
+    multi_turn: true
+    user_simulation_prompt: 
+    user_model:
+      name: "gpt-5-nano-2025-08-07"
+      provider: openai
   generation:
+    max_turns: 4
     parameters:
       temperature: 0.7
       top_p: 0.9
-      max_tokens: 8196
+      max_tokens: 16384
   output:
     mode: "upload_hf"
     hf:
-      repo_id: collinear-ai/spider-rollouts-qwen2.5-7b-instruct-ocr2-ast-filter
-      repo_type: "dataset"
-      private: false
+      repo_id: collinear-ai/spider-openqa-hotpot-gptoss-samples
+      private: true
 ```
 
 The following is the config file for an on-policy distillation job.
