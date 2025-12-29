@@ -1,4 +1,5 @@
 import os
+import json
 from typing import Any, Dict, List, Optional
 
 from spider.client import SpiderClient
@@ -87,6 +88,42 @@ def pre_processor(row):
     updated["prompt"] = instructions + "\n\n" + input_str
     return updated
 
+def post_processor(row):
+    def _has_tool_calls(traj):
+        for msg in traj or []:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                return True
+        return False
+
+    def _tool_message_has_error(msg):
+        if msg.get("role") != "tool":
+            return False
+        content = msg.get("content") or ""
+        if not content:
+            return False
+        try:
+            payload = json.loads(content)
+            if isinstance(payload, dict) and payload.get("error"):
+                return True
+        except (TypeError, ValueError):
+            pass
+        
+        lowered = content.lower()
+        return (
+            "unauthorized" in lowered
+            or "forbidden" in lowered
+            or "401" in lowered
+            or "403" in lowered
+        )
+
+    trajectory = row.get("trajectory") or []
+    if not _has_tool_calls(trajectory):
+        return None
+    for msg in trajectory:
+        if _tool_message_has_error(msg):
+            return None
+    return row
+
 def main():
     config = AppConfig.load("config/generate_tool_search_nemo.yaml")
     runtime = config.job.runtime or RuntimeDependencyConfig()
@@ -102,7 +139,8 @@ def main():
     with SpiderClient(
         config=config, 
         env=secrets, 
-        pre_processor=pre_processor
+        pre_processor=pre_processor,
+        post_processor=post_processor,
     ) as client:
         client.add_tool(
             description="Search Google for a query and return up to 10 search results.",
