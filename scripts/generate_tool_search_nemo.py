@@ -50,6 +50,13 @@ def browse(url):
         "User-Agent": "Mozilla/5.0 (compatible; SpiderBot/1.0)",
         "Accept-Language": "en-US,en;q=0.9",
     }
+
+    if "wikipedia.org" in url:
+        url = "https://r.jina.ai/http://" + url.replace(
+            "https://", ""
+        ).replace(
+            "http://", ""
+        )
     
     with httpx.Client(timeout=20.0) as client:
         response = client.get(url, headers=headers, follow_redirects=True)
@@ -107,7 +114,7 @@ def post_processor(row):
                 return True
         except (TypeError, ValueError):
             pass
-        
+
         lowered = content.lower()
         return (
             "unauthorized" in lowered
