@@ -1,0 +1,31 @@
+server:
+  base_url: http://127.0.0.1:9000
+  request_timeout: 120
+job:
+  model:
+    provider: tinker
+    name: "Qwen/Qwen3-8B"
+  source:
+    dataset: nvidia/Nemotron-RL-knowledge-web_search-mcqa
+    split: train[0:128]
+  generation:
+    on_policy: true
+    parameters:
+      top_p: 0.9
+      max_tokens: 32768
+      tool_choice: auto
+    on_policy_options:
+      teacher: moonshotai/Kimi-K2-Thinking
+      learning_rate: 1e-7
+      groups_per_batch: 64
+      lora_rank: 16
+      num_substeps: 1
+      kl_penalty_coef: 1.0
+      kl_discount_factor: 0.0
+      loss_fn: importance_sampling
+      save_every: 20
+  output:
+    mode: upload_hf
+    hf:
+      repo_id: collinear-ai/spider-on-policy-tool-search-qwen-teacher-kimi-k2
+      repo_type: model
