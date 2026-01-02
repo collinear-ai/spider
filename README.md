@@ -98,7 +98,7 @@ job:
     split: "train"
     max_examples: 100
     multi_turn: true
-    user_simulation_prompt: 
+    user_simulation_prompt: You are a user prompt generator.
     user_model:
       name: "gpt-5-nano-2025-08-07"
       provider: openai
@@ -119,39 +119,34 @@ The following is the config file for an on-policy distillation job.
 
 ```yaml
 server:
-  base_url: 
-  api_key:
-  request_timeout: 180
-
+  base_url: http://127.0.0.1:9000
+  request_timeout: 120
 job:
   model:
     provider: tinker
     name: "Qwen/Qwen3-8B"
   source:
-    dataset: "RiddleHe/OpenCodeReasoning-2-questions-dedup-34k-sample-1024"
-    split: "train[0:8]"
-    field: "question"
+    dataset: nvidia/Nemotron-RL-knowledge-web_search-mcqa
+    split: train[0:128]
   generation:
     on_policy: true
+    parameters:
+      top_p: 0.9
+      max_tokens: 32768
+      tool_choice: auto
     on_policy_options:
-      teacher: "Qwen/Qwen3-30B-A3B"
-      api_key: 
-      learning_rate: 5e-5
-      groups_per_batch: 4
-      group_size: 2
-      max_tokens: 1024
+      teacher: moonshotai/Kimi-K2-Thinking
+      learning_rate: 1e-7
+      groups_per_batch: 64
       lora_rank: 16
       num_substeps: 1
-      kl_penalty_coef: 0.1
+      kl_penalty_coef: 1.0
       kl_discount_factor: 0.0
-      loss_fn: "importance_sampling"
-      compute_post_kl: true
-      eval_every: 5
+      loss_fn: importance_sampling
       save_every: 20
   output:
-    mode: "upload_hf"
+    mode: upload_hf
     hf:
-      repo_id: RiddleHe/qwen3-8B-on-policy-distill-teacher-qwen3-30B-A3B-OCR2-8-examples
-      repo_type: "model"
-      private: false
+      repo_id: collinear-ai/spider-on-policy-tool-search-qwen-teacher-kimi-k2
+      repo_type: model
 ```
