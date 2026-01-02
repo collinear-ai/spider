@@ -6,7 +6,6 @@ from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional, Callable
 from urllib.parse import urlparse
 import blobfile
 
-from server.executor import tool_descriptors
 import tinker
 from spider.config import JobConfig
 from tinker_cookbook import checkpoint_utils, model_info, renderers
@@ -560,7 +559,7 @@ def _tool_rollout_stream(
     tool_registry: Dict[str, Callable[..., Any]],
 ) -> Iterable[List[Dict[str, Any]]]:
     from concurrent.futures import ThreadPoolExecutor
-    from .executor import _initial_chat_history, _call_backend_chat, _execute_tool_calls
+    from .executor import _initial_chat_history, _call_backend_chat, _execute_tool_calls, tool_descriptors
 
     tool_defs = tool_descriptors(job.tools)
     turn_limit = max(1, job.generation.max_turns or 16)
