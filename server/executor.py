@@ -846,19 +846,9 @@ def _run_prompt_with_tools(
     tool_registry: Dict[str, Callable[..., Any]],
     turn_limit: int,
     job_id: str,
-    include_logprobs: bool = False,
-) -> Tuple[List[Dict[str, Any]], List[int], List[float], List[int]]:
-    if include_logprobs and not _is_tinker_backend(backend):
-        raise JobExecutionError("include_logprobs with tools is only supported for Tinker backend.")
-
+) -> List[Dict[str, Any]]:
     history = _initial_chat_history(prompt, job)
     transcript = [dict(message) for message in history]
-
-    all_token_ids = []
-    all_logprobs = []
-    all_reward_masks = []
-    turn_prompt_counts = []
-    turn_completion_lens = []
 
     base_model = job.model.name
     renderer_name = None
@@ -883,7 +873,7 @@ def _run_prompt_with_tools(
                 messages=history,
                 tools=tool_defs,
                 parameters=job.generation.parameters,
-                include_logprobs=include_logprobs,
+                include_logprobs=False,
                 model_name=job.model.name
             )
         except JobExecutionError as exc:
@@ -894,7 +884,7 @@ def _run_prompt_with_tools(
                     job_id,
                     turn_idx,
                 )
-                return transcript, all_token_ids, all_logprobs, all_reward_masks
+                return transcript
             raise
 
         logger.info(
@@ -914,14 +904,6 @@ def _run_prompt_with_tools(
         if reasoning:
             snapshot["reasoning"] = reasoning
 
-        token_ids = assistant_message.get("token_ids") or []
-        logprobs = assistant_message.get("logprobs") or []
-        reward_mask = assistant_message.get("reward_mask") or []
-        if include_logprobs:
-            prompt_len = assistant_message.get("prompt_token_count", 0)
-            turn_prompt_counts.append(prompt_len)
-            turn_completion_lens.append(len(token_ids))
-
         transcript.append(snapshot)
         history.append(snapshot)
         tool_calls = assistant_message.get("tool_calls") or []
@@ -931,106 +913,108 @@ def _run_prompt_with_tools(
                 job_id,
                 prompt_preview,
             )
-            if include_logprobs:
-                all_token_ids, all_logprobs, all_reward_masks = _finalize_tinker_rollout_logprobs(
-                    sampling_client=backend,
-                    base_model=base_model,
-                    history=history,
-                    renderer_name=renderer_name,
-                    turn_prompt_counts=turn_prompt_counts,
-                    turn_completion_lens=turn_completion_lens,
-                    tools=tool_defs,
-                )
-                logger.info(
-                    "Job %s: finalized rollout logprobs with %d completion tokens and %d positive reward masks",
-                    job_id,
-                    sum(turn_completion_lens),
-                    sum(all_reward_masks),
-                )
-            return transcript, all_token_ids, all_logprobs, all_reward_masks
+            return transcript
         
-        for call in tool_calls:
-            function_call = call.get("function") or {}
-            tool_name = function_call.get("name")
-            if not tool_name or tool_name not in tool_registry:
-                warning = (
-                    f"Tool `{tool_name or 'unknown'}` is not available. "
-                    "Please choose one of the provided tools."
-                )
-                logger.warning(
-                    "Job %s: assistant requested unknown tool `%s` for prompt `%s`",
-                    job_id,
-                    tool_name,
-                    prompt_preview,
-                )
-                tool_message = {
-                    "role": "tool",
-                    "name": tool_name or "unknown_tool",
-                    "content": warning,
-                    "tool_call_id": call.get("id"),
-                }
-                transcript.append(tool_message)
-                history.append(dict(tool_message))
-                continue
-
-            raw_args = function_call.get("arguments") or "{}"
-            turn_index = len(transcript) - 1
-            logger.info(
-                "Job %s: invoking tool `%s` (turn=%d) args=%s for prompt '%s'",
-                job_id,
-                tool_name,
-                turn_index,
-                raw_args,
-                prompt_preview
-            )
-            try:
-                tool_args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
-            except (TypeError, ValueError) as exc:
-                logger.warning(
-                    "Job %s: tool `%s` received invalid arguments; args=%s",
-                    job_id,
-                    tool_name,
-                    raw_args,
-                )
-                tool_message = {
-                    "role": "tool",
-                    "name": tool_name,
-                    "content": "Tool call failed: arguments were not valid JSON.",
-                    "tool_call_id": call.get("id"),
-                }
-                transcript.append(tool_message)
-                history.append(dict(tool_message))
-                continue
-
-            success = True
-            try:
-                result = tool_registry[tool_name](**tool_args)
-            except Exception as exc:
-                success = False
-                result = {"error": str(exc)}
-            payload = _serialize_tool_output(result)
-            tool_message = {
-                "role": "tool",
-                "name": tool_name,
-                "content": payload,
-                "tool_call_id": call.get("id"),
-            }
-            transcript.append(tool_message)
-            history.append(dict(tool_message))
-            logger.info(
-                "Job %s: Tool %s invoked. Success: %s for prompt `%s`", 
-                job_id,
-                tool_name, 
-                success,
-                prompt_preview,
-            )
+        _execute_tool_calls(
+            tool_calls=tool_calls,
+            tool_registry=tool_registry,
+            transcript=transcript,
+            history=history,
+            job_id=job_id,
+            prompt_preview=prompt_preview,
+        )
 
     logger.warning(
         "Job %s: tool-enabled generation exceeded %d turns without reaching a final response.",
         job_id,
         turn_limit,
     )
-    return transcript, all_token_ids, all_logprobs, all_reward_masks
+    return transcript
+
+def _execute_tool_calls(
+    *,
+    tool_calls: List[Dict[str, Any]],
+    tool_registry: Dict[str, Callable[..., Any]],
+    transcript: List[Dict[str, Any]],
+    history: List[Dict[str, Any]],
+    job_id: str,
+    prompt_preview: str,
+) -> None:
+    for call in tool_calls:
+        function_call = call.get("function") or {}
+        tool_name = function_call.get("name")
+        if not tool_name or tool_name not in tool_registry:
+            warning = (
+                f"Tool `{tool_name or 'unknown'}` is not available. "
+                "Please choose one of the provided tools."
+            )
+            logger.warning(
+                "Job %s: assistant requested unknown tool `%s` for prompt `%s`",
+                job_id,
+                tool_name,
+                prompt_preview,
+            )
+            tool_message = {
+                "role": "tool",
+                "name": tool_name or "unknown_tool",
+                "content": warning,
+                "tool_call_id": call.get("id"),
+            }
+            transcript.append(tool_message)
+            history.append(dict(tool_message))
+            continue
+
+        raw_args = function_call.get("arguments") or "{}"
+        turn_index = len(transcript) - 1
+        logger.info(
+            "Job %s: invoking tool `%s` (turn=%d) args=%s for prompt '%s'",
+            job_id,
+            tool_name,
+            turn_index,
+            raw_args,
+            prompt_preview
+        )
+        try:
+            tool_args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "Job %s: tool `%s` received invalid arguments; args=%s",
+                job_id,
+                tool_name,
+                raw_args,
+            )
+            tool_message = {
+                "role": "tool",
+                "name": tool_name,
+                "content": "Tool call failed: arguments were not valid JSON.",
+                "tool_call_id": call.get("id"),
+            }
+            transcript.append(tool_message)
+            history.append(dict(tool_message))
+            continue
+
+        success = True
+        try:
+            result = tool_registry[tool_name](**tool_args)
+        except Exception as exc:
+            success = False
+            result = {"error": str(exc)}
+        payload = _serialize_tool_output(result)
+        tool_message = {
+            "role": "tool",
+            "name": tool_name,
+            "content": payload,
+            "tool_call_id": call.get("id"),
+        }
+        transcript.append(tool_message)
+        history.append(dict(tool_message))
+        logger.info(
+            "Job %s: Tool %s invoked. Success: %s for prompt `%s`", 
+            job_id,
+            tool_name, 
+            success,
+            prompt_preview,
+        )
 
 def _prepare_runtime_env(
     job: JobConfig,
