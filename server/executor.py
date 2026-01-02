@@ -1214,6 +1214,7 @@ def _tinker_chat_and_logprobs(
         "content": parsed.content,
         "reasoning": parsed.reasoning,
         "tool_calls": parsed.tool_calls or None,
+        "assistant_raw_text": assistant_text,
         "token_ids": [],
         "logprobs": [],
         "reward_mask": [], 

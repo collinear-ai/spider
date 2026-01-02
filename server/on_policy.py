@@ -415,6 +415,7 @@ def _run_tool_on_policy_stream(
                 student_token_ids=token_ids,
                 student_logprobs=student_logprobs,
                 reward_mask=reward_mask,
+                assistant_raw_text=turn.get("assistant_raw_text"),
             )
 
             item = dict(turn)
@@ -607,6 +608,7 @@ def _tool_rollout_stream(
                     "assistant_content": content,
                     "assistant_reasoning": reasoning,
                     "assistant_tool_calls": tool_calls,
+                    "assistant_raw_text": assistant_message.get("assistant_raw_text"),
                     "prompt_token_count": assistant_message.get("prompt_token_count", 0),
                     "parser_fallback": assistant_message.get("parser_fallback", False),
                     "turn_index": turn_idx,
