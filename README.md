@@ -10,8 +10,8 @@ Lightweight on/off-policy distillation engine with a single client interface. Ru
   - [This script](scripts/generate_multiturn_hotpotqa.py) demonstrates how to generate a multi-turn user-simulated trajectory dataset, where an LLM is configured to play the role of a user to ask follow-up questions.
 
 - **On-policy distillation**, which is to create a training run with online supervision from a good teacher model. 
-  - [This script](scripts/train_on_policy_precise_if.py) demonstrates how to train on-policy with any teacher model with a different tokenizer, which is a novel feature of this repo. 
-  - We have also enabled training on-policy with multi-turn tool rollouts, with a script coming soon.
+  - [This script](scripts/train_on_policy_precise_if.py) demonstrates how to train on-policy with any teacher model with a different tokenizer, ensuring the correct chat template is used by both models. 
+  - [This script](scripts/train_on_policy_tool_search_nemo.py) demonstrates how to train on-policy with a specified set of tools so that the teacher can supervise the student's multi-turn tool-execution trajectories, closing the loop for training on-policy with the same setup as traditional SFT and RL. 
 
 Highlighted features of the engine includes:
 
@@ -29,7 +29,7 @@ python -m uvicorn server.app:app --host 0.0.0.0 --port 9000
 
 ```bash
 # install a client
-pip install -e .[client] # (available on cpu machines)z
+pip install -e .[client] # (available on cpu machines)
 ```
 
 ## Python client API
