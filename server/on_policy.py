@@ -6,6 +6,7 @@ from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional, Callable
 from urllib.parse import urlparse
 import blobfile
 
+from server.executor import tool_descriptors
 import tinker
 from spider.config import JobConfig
 from tinker_cookbook import checkpoint_utils, model_info, renderers
@@ -377,6 +378,7 @@ def _run_tool_on_policy_stream(
         tool_descriptors
     )
     from tinker_cookbook.rl.metrics import discounted_future_sum_vectorized
+    from .executor import _initial_chat_history, _execute_tool_calls, _call_backend_chat
 
     tool_defs = tool_descriptors(job.tools)
     service_client = tinker.ServiceClient()
@@ -389,27 +391,18 @@ def _run_tool_on_policy_stream(
     training_dir = workspace / "training"
     training_dir.mkdir(parents=True, exist_ok=True)
 
-    def _messages_with_prompt(prompt: str, transcript: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        messages = []
-        system_prompt = job.model.parameters.get("system_prompt") # TODO: check if sys prompt is used by student in stream
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
-        messages.extend(transcript or [])
-        return messages
-
     async def _process_batch(batch_index: int, trajectories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         items = []
         data_D = []
 
-        async def _process_traj(traj_index: int, traj: Dict[str, Any]) -> tuple[Dict[str, Any], tinker.Datum]:
-            prompt = traj.get("prompt", "")
-            transcript = traj.get("completion") or []
-            token_ids = traj.get("token_ids") or []
-            logprobs = traj.get("logprobs") or [0.0] * len(token_ids)
-            reward_mask = traj.get("reward_mask") or [0] * len(token_ids)
-
-            messages = _messages_with_prompt(prompt, transcript)
+        async def _process_turn(
+            turn_index: int, 
+            turn: Dict[str, Any]
+        ) -> tuple[Dict[str, Any], tinker.Datum]:
+            messages = turn["messages"]
+            token_ids = turn["token_ids"]
+            logprobs = turn["logprobs"]
+            reward_mask = turn["reward_mask"]
 
             student_logprobs = torch.tensor(logprobs, dtype=torch.float32)
             
@@ -424,18 +417,14 @@ def _run_tool_on_policy_stream(
                 reward_mask=reward_mask,
             )
 
-            item = {
-                "prompt": prompt,
-                "messages": messages,
-                "token_ids": token_ids,
-                "reward_mask": reward_mask,
+            item = dict(turn)
+            item.update({
                 "student_logprobs": student_logprobs,
                 "teacher_logprobs": teacher_alignment.get("teacher_logprobs"),
                 "kl_adjustments": teacher_alignment.get("kl_adjustments"),
                 "kl_mask": teacher_alignment.get("kl_mask"),
                 "teacher_token_ids": teacher_alignment.get("teacher_token_ids"),
-                "reward_spans": teacher_alignment.get("reward_spans"),
-            }
+            })
 
             kl_adj = teacher_alignment.get("kl_adjustments") or [0.0] * len(token_ids)
             kl_mask = teacher_alignment.get("kl_mask") or [0.0] * len(token_ids) 
@@ -471,14 +460,14 @@ def _run_tool_on_policy_stream(
                 "Job %s: tool rollout batch=%d traj=%d tokens=%d reward_tokens=%d",
                 job_id,
                 batch_index,
-                traj_index,
+                turn_index,
                 len(token_ids),
                 sum(reward_mask),
             )
 
             return item, datum
 
-        results = await asyncio.gather(*[asyncio.create_task(_process_traj(i, traj)) for i, traj in enumerate(trajectories)])
+        results = await asyncio.gather(*[asyncio.create_task(_process_turn(i, turn)) for i, turn in enumerate(trajectories)])
         for item, datum in results:
             items.append(item)
             data_D.append(datum)
@@ -568,23 +557,83 @@ def _tool_rollout_stream(
     student_client: Any,
     prompts: List[str],
     tool_registry: Dict[str, Callable[..., Any]],
-    batch_worker: Callable[..., Any],
 ) -> Iterable[List[Dict[str, Any]]]:
-    batch_size = getattr(job.generation.on_policy_options, "groups_per_batch", 64)
+    from concurrent.futures import ThreadPoolExecutor
+    from .executor import _initial_chat_history, _call_backend_chat, _execute_tool_calls
+
+    tool_defs = tool_descriptors(job.tools)
+    turn_limit = max(1, job.generation.max_turns or 16)
+    batch_size = getattr(job.generation.on_policy_options, "groups_per_batch", 64) # TODO: rename to batch size
     total_batches = (len(prompts) + batch_size - 1) // batch_size
+
+    def _run_prompt(prompt: str) -> List[Dict[str, Any]]:
+        history = _initial_chat_history(prompt, job)
+        transcript = []
+        turn_items = []
+
+        for turn_idx in range(turn_limit):
+            assistant_message = _call_backend_chat(
+                backend=student_client,
+                messages=history,
+                tools=tool_defs,
+                parameters=job.generation.parameters,
+                include_logprobs=True,
+                model_name=job.model.name,
+            )
+            token_ids = assistant_message.get("token_ids") or []
+            logprobs = assistant_message.get("logprobs") or [0.0] * len(token_ids)
+            reward_mask = assistant_message.get("reward_mask") or [1] * len(token_ids)
+
+            content = assistant_message.get("content", "")
+            tool_calls = assistant_message.get("tool_calls")
+
+            snapshot = {
+                "role": "assistant",
+                "content": content,
+                "tool_calls": tool_calls,
+            }
+            reasoning = assistant_message.get("reasoning")
+            if reasoning:
+                snapshot["reasoning"] = reasoning
+
+            messages = list(history) + [snapshot]
+            turn_items.append(
+                {
+                    "prompt": prompt,
+                    "messages": messages,
+                    "token_ids": token_ids,
+                    "logprobs": logprobs,
+                    "reward_mask": reward_mask,
+                    "assistant_content": content,
+                    "assistant_reasoning": reasoning,
+                    "assistant_tool_calls": tool_calls,
+                    "prompt_token_count": assistant_message.get("prompt_token_count", 0),
+                    "parser_fallback": assistant_message.get("parser_fallback", False),
+                    "turn_index": turn_idx,
+                }
+            )
+
+            transcript.append(snapshot)
+            history.append(snapshot)
+
+            if not tool_calls:
+                break
+
+            _execute_tool_calls(
+                tool_calls=tool_calls,
+                tool_registry=tool_registry,
+                transcript=transcript,
+                history=history,
+                job_id=job_id,
+            )
+
+        return turn_items
 
     for batch_index, start in enumerate(range(0, len(prompts), batch_size)):
         chunk = prompts[start: start + batch_size]
-        future = batch_worker(
-            job_id=job_id,
-            prompts=chunk,
-            backend=student_client,
-            job=job,
-            post_processor=None,
-            tool_registry=tool_registry,
-            include_logprobs=True,
-        )
-        trajectories = future.result()
+        with ThreadPoolExecutor(max_workers=min(len(chunk), 8)) as pool:
+            results = list(pool.map(_run_prompt, chunk))
+        turns = [turn for per_prompt in results for turn in per_prompt]
         events.emit(
             "Tool rollout batch ready.",
             code="tool_on_policy.batch_ready",
@@ -594,8 +643,8 @@ def _tool_rollout_stream(
                 "total_batches": total_batches,
             }
         )
-        if trajectories:
-            yield trajectories
+        if turns:
+            yield turns
 
 def _configure_tinker_logging() -> None:
     stream_formatter = logging.Formatter("[tinker] %(message)s")

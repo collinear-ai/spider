@@ -61,7 +61,7 @@ def reward_spans_from_mask(mask: Sequence[int]) -> List[Tuple[int, int]]:
         spans.append((start, len(mask)))
     return spans
 
-async def compute_teacher_alignment_for_rewards(
+async def compute_teacher_alignment_for_rewards( # TODO: optimize for single turn only
     *,
     sampling_client: tinker.SamplingClient,
     messages: Sequence[Dict[str, object]],

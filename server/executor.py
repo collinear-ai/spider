@@ -921,7 +921,6 @@ def _run_prompt_with_tools(
             transcript=transcript,
             history=history,
             job_id=job_id,
-            prompt_preview=prompt_preview,
         )
 
     logger.warning(
@@ -938,7 +937,6 @@ def _execute_tool_calls(
     transcript: List[Dict[str, Any]],
     history: List[Dict[str, Any]],
     job_id: str,
-    prompt_preview: str,
 ) -> None:
     for call in tool_calls:
         function_call = call.get("function") or {}
@@ -949,10 +947,9 @@ def _execute_tool_calls(
                 "Please choose one of the provided tools."
             )
             logger.warning(
-                "Job %s: assistant requested unknown tool `%s` for prompt `%s`",
+                "Job %s: assistant requested unknown tool `%s`",
                 job_id,
                 tool_name,
-                prompt_preview,
             )
             tool_message = {
                 "role": "tool",
@@ -960,19 +957,18 @@ def _execute_tool_calls(
                 "content": warning,
                 "tool_call_id": call.get("id"),
             }
-            transcript.append(tool_message)
+            transcript.append(tool_message) # TODO: do we need both?
             history.append(dict(tool_message))
             continue
 
         raw_args = function_call.get("arguments") or "{}"
         turn_index = len(transcript) - 1
         logger.info(
-            "Job %s: invoking tool `%s` (turn=%d) args=%s for prompt '%s'",
+            "Job %s: invoking tool `%s` (turn=%d) args=%s",
             job_id,
             tool_name,
             turn_index,
             raw_args,
-            prompt_preview
         )
         try:
             tool_args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
@@ -1009,11 +1005,10 @@ def _execute_tool_calls(
         transcript.append(tool_message)
         history.append(dict(tool_message))
         logger.info(
-            "Job %s: Tool %s invoked. Success: %s for prompt `%s`", 
+            "Job %s: Tool %s invoked. Success: %s", 
             job_id,
             tool_name, 
             success,
-            prompt_preview,
         )
 
 def _prepare_runtime_env(
@@ -1158,13 +1153,15 @@ def _tinker_chat_and_logprobs(
     import tinker
     from tinker_cookbook import renderers, model_info
     from tinker_cookbook.tokenizer_utils import get_tokenizer
+    from .vllm_parsers import parse_assistant_turn
+    from .backends.vllm_backend import _default_tool_parser, _default_reasoning_parser
+
     base_model = model_name
     if not base_model or "/" not in base_model:
         raise JobExecutionError("Tinker sampling client missing model id in org/name form.")
 
     renderer_name = model_info.get_recommended_renderer_name(base_model or "")
     tokenizer = get_tokenizer(base_model or "")
-    renderer = renderers.get_renderer(renderer_name, tokenizer=tokenizer)
 
     prompt_text = tokenizer.apply_chat_template(
         messages,
@@ -1179,7 +1176,6 @@ def _tinker_chat_and_logprobs(
     max_tokens = sampling_params.pop("max_tokens", None)
     temperature = sampling_params.pop("temperature", None)
     top_p = sampling_params.pop("top_p", None)
-    stop = renderer.get_stop_sequences()
 
     sample_resp = sampling_client.sample(
         prompt=prompt_input,
@@ -1188,74 +1184,58 @@ def _tinker_chat_and_logprobs(
             max_tokens=max_tokens or 1024,
             temperature=temperature if temperature is not None else 0.7,
             top_p=top_p if top_p is not None else 0.95,
-            stop=stop,
+            stop=None,
         )
     )
     sample_resp = sample_resp.result() # resolve the future
     seq = sample_resp.sequences[0]
     completion_tokens = seq.tokens
-    assistant_message, _ = renderer.parse_response(completion_tokens) # will fail natively
-    tool_calls = _normalize_tool_calls(
-        assistant_message.get("tool_calls"),
-        assistant_message.get("content", ""),
-        renderer_name,
+    
+    assistant_text = tokenizer.decode(completion_tokens, skip_special_tokens=False)
+    
+    tool_parser_name = _default_tool_parser(base_model or "")
+    reasoning_parser_name = _default_reasoning_parser(base_model or "")
+    tool_choice = parameters.get("tool_choice")
+
+    parsed = parse_assistant_turn(
+        messages=messages,
+        assistant_text=assistant_text,
+        tools=tools or None,
+        tool_choice=tool_choice,
+        tool_parser_name=tool_parser_name,
+        reasoning_parser_name=reasoning_parser_name,
+        tokenizer=tokenizer,
+        token_ids=completion_tokens,
+        chat_template_kwargs=None,
     )
 
     result = {
         "role": "assistant",
-        "content": assistant_message["content"],
-        "tool_calls": tool_calls or None,
+        "content": parsed.content,
+        "reasoning": parsed.reasoning,
+        "tool_calls": parsed.tool_calls or None,
         "token_ids": [],
         "logprobs": [],
         "reward_mask": [], 
         "prompt_token_count": len(prompt_tokens),
+        "parser_fallback": parsed.parser_fallback,
     }
 
     if include_logprobs:
-        result["token_ids"] = completion_tokens
-        result["logprobs"] = []
+        import asyncio
+        full_tokens = list(prompt_tokens) + list(completion_tokens)
+        lp_resp = asyncio.run(
+            sampling_client.compute_logprobs_async(
+                tinker.ModelInput.from_ints(full_tokens)
+            )
+        )
+        full_logprobs = list(lp_resp)
+        prompt_len = len(prompt_tokens)
+        result["token_ids"] = list(full_tokens)
+        result["logprobs"] = full_logprobs
+        result["reward_mask"] = [0] * prompt_len + [1] * len(completion_tokens)
 
-    return result
-
-def _finalize_tinker_rollout_logprobs(
-    *,
-    sampling_client: Any,
-    base_model: str,
-    history: List[Dict[str, Any]],
-    renderer_name: str,
-    turn_prompt_counts: List[int],
-    turn_completion_lens: List[int],
-    tools: List[Dict[str, Any]],
-) -> Tuple[List[int], List[float], List[int]]:
-    import asyncio
-    import tinker
-    from tinker_cookbook import renderers
-    from tinker_cookbook.tokenizer_utils import get_tokenizer
-
-    tokenizer = get_tokenizer(base_model)
-    renderer = renderers.get_renderer(renderer_name, tokenizer=tokenizer)
-
-    prompt_text = tokenizer.apply_chat_template(
-        history,
-        tools=tools or None,
-        add_generation_prompt=True,
-        tokenize=False,
-    )
-    full_tokens = _model_input_tokens(prompt_text, tokenizer=tokenizer)
-
-    full_inputs = tinker.ModelInput.from_ints(full_tokens)
-    lp_resp_coro = sampling_client.compute_logprobs_async(full_inputs)
-    lp_resp = asyncio.run(lp_resp_coro)
-    
-    reward_mask = [0] * len(full_tokens)
-    for prompt_len, completion_len in zip(turn_prompt_counts, turn_completion_lens):
-        start = max(0, prompt_len)
-        end = min(prompt_len + completion_len, len(full_tokens))
-
-        for idx in range(start, end):
-            reward_mask[idx] = 1
-
-    return full_tokens, lp_resp, reward_mask
+    return result 
 
 def _model_input_tokens(text: Any, tokenizer: Any) -> List[int]:
     # Different renderers return differen dtypes for text
@@ -1267,60 +1247,6 @@ def _model_input_tokens(text: Any, tokenizer: Any) -> List[int]:
             return tokens[0]
         return tokens
     return []   
-
-def _normalize_tool_calls(
-    renderer_calls: Optional[List[Dict[str, Any]]],
-    content: str,
-    renderer_name: str,
-) -> List[Dict[str, Any]]:
-    calls = renderer_calls or []
-    if not calls:
-        if renderer_name.lower().startswith("qwen3"):
-            calls = _extract_qwen3_tool_calls(content)
-        else:
-            pass
-    return calls
-
-def _extract_qwen3_tool_calls(content: str) -> List[Dict[str, Any]]:
-    calls = []
-    start_tag, end_tag = "<tool_call>", "</tool_call>"
-    start = 0
-    while True:
-        start = content.find(start_tag, start)
-        if start == -1:
-            break
-        start += len(start_tag)
-        end = content.find(end_tag, start)
-        if end == -1:
-            break
-        block = content[start:end].strip()
-        
-        try:
-            payload = json.loads(block)
-        except Exception:
-            start = end + len(end_tag)
-            continue
-        if not isinstance(payload, dict):
-            start = end + len(end_tag)
-            continue
-
-        name = payload.get("name")
-        if not isinstance(name, str):
-            start = end + len(end_tag)
-            continue
-
-        args = payload.get("arguments")
-        calls.append({
-            "id": f"call_{len(calls)}",
-            "type": "function",
-            "function": {
-                "name": name,
-                "arguments": args if isinstance(args, str) else json.dumps(args or {}),
-            }
-        })
-        start = end + len(end_tag)
-
-    return calls
 
 def _initial_chat_history(prompt: str, job: JobConfig) -> List[Dict[str, Any]]:
     history = []
