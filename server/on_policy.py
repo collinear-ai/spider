@@ -176,7 +176,6 @@ def run_on_policy_job(
             student_client=student_client,
             prompts=prompt_list,
             tool_registry=tool_registry,
-            batch_worker=_tool_batch_worker,
         )
         events.emit(
             "Finished Setup for tool rollouts streaming for on-policy distillation.",
