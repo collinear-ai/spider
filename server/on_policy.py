@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from token import LPAR
 import asyncio, logging, os, shutil, tarfile, urllib.request, zipfile
 from pathlib import Path
 from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional, Callable, TypedDict
@@ -583,6 +584,11 @@ def _tool_rollout_stream(
             logprobs = assistant_message.get("logprobs") or [0.0] * len(token_ids)
             reward_mask = assistant_message.get("reward_mask") or [1] * len(token_ids)
 
+            logprobs = [
+                0.0 if (lp is None and int(mask) == 0) else lp
+                for lp, mask in zip(logprobs, reward_mask)
+            ]
+
             none_count = sum(lp is None for lp in logprobs)
             none_idx = [i for i, lp in enumerate(logprobs) if lp is None]
             masked_count = sum(1 for m in reward_mask if int(m) == 0)
@@ -591,8 +597,9 @@ def _tool_rollout_stream(
                 if lp is None and int(m) == 0
             )
             logger.info(
-                "Job %s: logprobs None=%d masked=%d none_on_masked=%d none_idx=%s",
+                "Job %s: prompt=`%s...` logprobs None=%d masked=%d none_on_masked=%d none_idx=%s",
                 job_id,
+                prompt[:20],
                 none_count,
                 masked_count,
                 none_on_masked,
