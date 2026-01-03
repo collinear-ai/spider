@@ -402,25 +402,6 @@ def _run_tool_on_policy_stream(
             logprobs = turn["logprobs"]
             reward_mask = turn["reward_mask"]
 
-            if len(logprobs) != len(token_ids):
-                raise JobExecutionError(
-                    f"logprobs/token_ids mismatch: logprobs={len(logprobs)} tokens={len(token_ids)}"
-                )
-
-            if len(reward_mask) != len(token_ids):
-                raise JobExecutionError(
-                    f"reward_mask/token_ids mismatch: reward_mask={len(reward_mask)} tokens={len(token_ids)}"
-                )
-
-            bad_indices = [
-                i for i, (lp, mask) in enumerate(zip(logprobs, reward_mask))
-                if int(mask) == 1 and lp is None
-            ]
-            if bad_indices:
-                raise JobExecutionError(
-                    f"logprobs None on masked tokens (count={len(bad_indices)})"
-                )
-
             student_logprobs = torch.tensor(logprobs, dtype=torch.float32)
             
             teacher_alignment = await compute_teacher_alignment_for_rewards(
@@ -577,7 +558,7 @@ def _tool_rollout_stream(
     tool_registry: Dict[str, Callable[..., Any]],
 ) -> Iterable[List[Dict[str, Any]]]:
     from concurrent.futures import ThreadPoolExecutor
-    from .executor import _initial_chat_history, _call_backend_chat, _execute_tool_calls, tool_descriptors
+    from .executor import _initial_chat_history, _call_backend_chat, _execute_tool_calls, tool_descriptors, JobExecutionError
 
     tool_defs = tool_descriptors(job.tools)
     turn_limit = max(1, job.generation.max_turns or 16)
@@ -601,6 +582,39 @@ def _tool_rollout_stream(
             token_ids = assistant_message.get("token_ids") or []
             logprobs = assistant_message.get("logprobs") or [0.0] * len(token_ids)
             reward_mask = assistant_message.get("reward_mask") or [1] * len(token_ids)
+
+            if len(logprobs) != len(token_ids):
+                raise JobExecutionError(
+                    f"logprobs/token_ids mismatch: logprobs={len(logprobs)} tokens={len(token_ids)}"
+                )
+
+            if len(reward_mask) != len(token_ids):
+                raise JobExecutionError(
+                    f"reward_mask/token_ids mismatch: reward_mask={len(reward_mask)} tokens={len(token_ids)}"
+                )
+
+            bad_indices = [
+                i for i, (lp, mask) in enumerate(zip(logprobs, reward_mask))
+                if int(mask) == 1 and lp is None
+            ]
+            if bad_indices:
+                raise JobExecutionError(
+                    f"logprobs None on masked tokens (count={len(bad_indices)})"
+                )
+
+            none_count = sum(lp is None for lp in logprobs)
+            masked_count = sum(1 for m in reward_mask if int(m) == 1)
+            none_on_masked = sum(
+                1 for lp, m in zip(logprobs, reward_mask)
+                if lp is None and int(m) == 1
+            )
+            logger.info(
+                "Job %s: logprobs None=%d masked=%d none_on_masked=%d",
+                job_id,
+                none_count,
+                masked_count,
+                none_on_masked,
+            )
 
             content = assistant_message.get("content", "")
             tool_calls = assistant_message.get("tool_calls")
