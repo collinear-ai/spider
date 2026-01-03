@@ -402,6 +402,16 @@ def _run_tool_on_policy_stream(
             logprobs = turn["logprobs"]
             reward_mask = turn["reward_mask"]
 
+            if len(logprobs) != len(token_ids):
+                raise JobExecutionError(
+                    f"logprobs/token_ids mismatch: logprobs={len(logprobs)} tokens={len(token_ids)}"
+                )
+
+            if any(value is None for value in logprobs):
+                raise JobExecutionError(
+                    "logprobs contains None values (length check passed)."
+                )
+
             student_logprobs = torch.tensor(logprobs, dtype=torch.float32)
             
             teacher_alignment = await compute_teacher_alignment_for_rewards(
