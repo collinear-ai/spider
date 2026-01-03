@@ -14,7 +14,7 @@ job:
     max_turns: 4
     parameters:
       top_p: 0.9
-      max_tokens: 32768
+      max_tokens: 16384
     on_policy_options:
       teacher: moonshotai/Kimi-K2-Thinking
       learning_rate: 1e-7
