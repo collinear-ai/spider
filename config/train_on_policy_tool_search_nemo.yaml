@@ -4,7 +4,7 @@ server:
 job:
   model:
     provider: tinker
-    name: "Qwen/Qwen3-8B"
+    name: "Qwen/Qwen3-30B-A3B-Instruct-2507"
   source:
     dataset: nvidia/Nemotron-RL-knowledge-web_search-mcqa
     split: train[0:128]

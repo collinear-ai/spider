@@ -28,4 +28,4 @@ def get_tokenizer(model_name: str) -> Tokenizer:
     if model_name.startswith("meta-llama/Llama-3"):
         model_name = "baseten/Meta-Llama-3-tokenizer"
 
-    return AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    return AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
