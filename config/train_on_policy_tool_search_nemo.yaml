@@ -8,16 +8,17 @@ job:
   source:
     dataset: nvidia/Nemotron-RL-knowledge-web_search-mcqa
     split: train[0:128]
+    max_examples: 16
   generation:
     on_policy: true
+    max_turns: 4
     parameters:
       top_p: 0.9
       max_tokens: 32768
-      tool_choice: auto
     on_policy_options:
       teacher: moonshotai/Kimi-K2-Thinking
       learning_rate: 1e-7
-      groups_per_batch: 64
+      groups_per_batch: 16
       lora_rank: 16
       num_substeps: 1
       kl_penalty_coef: 1.0

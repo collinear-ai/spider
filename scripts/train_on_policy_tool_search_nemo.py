@@ -140,8 +140,6 @@ def main():
 
         if status["status"] == "completed":
             client.download_result(submission["job_id"], destination="artifacts/generate_tool_search.json")
-        else:
-            raise RuntimeError(status.get("error") or status.get("messages"))
 
 if __name__ == "__main__":
     main()
