@@ -446,11 +446,11 @@ def _run_tool_on_policy_stream(
                     dtype=student_logprobs.dtype,
                 )
 
-            datum = tinker.Datum( # turn kl loss into CE loss with logprobs + kl delta
+            datum = tinker.Datum(
                 model_input=tinker.ModelInput.from_ints(list(token_ids)),
                 loss_fn_inputs={
-                    "target_tokens": tinker.TensorData.from_list(list(token_ids)),
-                    "mask": tinker.TensorData.from_list(list(reward_mask)),
+                    "target_tokens": tinker.TensorData.from_torch(torch.tensor(list(token_ids), dtype=torch.int64)),
+                    "mask": tinker.TensorData.from_torch(torch.tensor(list(reward_mask), dtype=torch.float32)),
                     "logprobs": tinker.TensorData.from_torch(student_logprobs),
                     "advantages": tinker.TensorData.from_torch(advantage),
                 } # use importance sampling as a surrogate
