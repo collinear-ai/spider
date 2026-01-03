@@ -117,6 +117,7 @@ def main():
         "TAVILY_API_KEY": os.environ["TAVILY_API_KEY"],
         "HF_TOKEN": os.environ["HF_TOKEN"],
         "HF_HOME": os.environ["HF_HOME"],
+        "TINKER_API_KEY": os.environ["TINKER_API_KEY"],
     }
 
     with SpiderClient(
