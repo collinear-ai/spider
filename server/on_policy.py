@@ -584,6 +584,16 @@ def _tool_rollout_stream(
             logprobs = assistant_message.get("logprobs") or [0.0] * len(token_ids)
             reward_mask = assistant_message.get("reward_mask") or [1] * len(token_ids)
 
+            if len(logprobs) != len(token_ids):
+                raise JobExecutionError(
+                    f"logprobs/token_ids mismatch: logprobs={len(logprobs)} tokens={len(token_ids)}"
+                )
+
+            if len(reward_mask) != len(token_ids):
+                raise JobExecutionError(
+                    f"reward_mask/token_ids mismatch: reward_mask={len(reward_mask)} tokens={len(token_ids)}"
+                )
+
             none_count = sum(lp is None for lp in logprobs)
             none_idx = [i for i, lp in enumerate(logprobs) if lp is None]
             masked_count = sum(1 for m in reward_mask if int(m) == 0)
