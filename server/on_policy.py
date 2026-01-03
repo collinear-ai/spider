@@ -407,9 +407,18 @@ def _run_tool_on_policy_stream(
                     f"logprobs/token_ids mismatch: logprobs={len(logprobs)} tokens={len(token_ids)}"
                 )
 
-            if any(value is None for value in logprobs):
+            if len(reward_mask) != len(token_ids):
                 raise JobExecutionError(
-                    "logprobs contains None values (length check passed)."
+                    f"reward_mask/token_ids mismatch: reward_mask={len(reward_mask)} tokens={len(token_ids)}"
+                )
+
+            bad_indices = [
+                i for i, (lp, mask) in enumerate(zip(logprobs, reward_mask))
+                if int(mask) == 1 and lp is None
+            ]
+            if bad_indices:
+                raise JobExecutionError(
+                    f"logprobs None on masked tokens (count={len(bad_indices)})"
                 )
 
             student_logprobs = torch.tensor(logprobs, dtype=torch.float32)
