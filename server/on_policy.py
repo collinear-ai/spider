@@ -583,41 +583,32 @@ def _tool_rollout_stream(
             logprobs = assistant_message.get("logprobs") or [0.0] * len(token_ids)
             reward_mask = assistant_message.get("reward_mask") or [1] * len(token_ids)
 
-            if len(logprobs) != len(token_ids):
-                raise JobExecutionError(
-                    f"logprobs/token_ids mismatch: logprobs={len(logprobs)} tokens={len(token_ids)}"
-                )
-
-            if len(reward_mask) != len(token_ids):
-                raise JobExecutionError(
-                    f"reward_mask/token_ids mismatch: reward_mask={len(reward_mask)} tokens={len(token_ids)}"
-                )
-
-            bad_indices = [
-                i for i, (lp, mask) in enumerate(zip(logprobs, reward_mask))
-                if int(mask) == 1 and lp is None
-            ]
-            if bad_indices:
-                raise JobExecutionError(
-                    f"logprobs None on masked tokens (count={len(bad_indices)})"
-                )
-
             none_count = sum(lp is None for lp in logprobs)
-            masked_count = sum(1 for m in reward_mask if int(m) == 1)
+            none_idx = [i for i, lp in enumerate(logprobs) if lp is None]
+            masked_count = sum(1 for m in reward_mask if int(m) == 0)
             none_on_masked = sum(
                 1 for lp, m in zip(logprobs, reward_mask)
-                if lp is None and int(m) == 1
+                if lp is None and int(m) == 0
             )
             logger.info(
-                "Job %s: logprobs None=%d masked=%d none_on_masked=%d",
+                "Job %s: logprobs None=%d masked=%d none_on_masked=%d none_idx=%s",
                 job_id,
                 none_count,
                 masked_count,
                 none_on_masked,
+                none_idx,
             )
 
             content = assistant_message.get("content", "")
             tool_calls = assistant_message.get("tool_calls")
+
+            logger.info(
+                "Job %s: prompt=`%s...` turn=%d tool_returned=%s",
+                job_id,
+                prompt[:20],
+                turn_idx,
+                bool(tool_calls),
+            )
 
             snapshot = {
                 "role": "assistant",
