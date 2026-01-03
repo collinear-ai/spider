@@ -205,6 +205,7 @@ def _run_tool_on_policy_job(
         job=job,
         runtime_env=runtime_env,
         pre_processor=job.pre_processor,
+        post_processor=job.post_processor,
     )
 
     tool_registry = _resolve_tools(job.tools, runtime_env=runtime_env)
