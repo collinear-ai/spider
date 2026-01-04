@@ -2,78 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
-from typing import Any, Callable, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional
+
+from .container_manager import ContainerManager
 
 ToolFn = Callable[[Dict[str, Any]], str]
-
-class RuntimeAdapter(Protocol):
-    def exec_bash(
-        self,
-        command: str,
-        *,
-        timeout: Optional[float] = None,
-        is_input: bool = False,
-    ) -> str:
-        ...
-
-    def read_file(
-        self,
-        path: str,
-        *,
-        view_range: Optional[List[int]] = None,
-    ) -> str:
-        ...
-
-    def write_file(
-        self,
-        path: str,
-        content: str,
-        *,
-        create: bool = False,
-    ) -> None:
-        ...
-
-
-    def list_dir(
-        self,
-        path: str,
-    ) -> List[str]:
-        ...
-
-    def is_dir(
-        self,
-        path: str,
-    ) -> bool:
-        ...
-
-    def is_file(
-        self,
-        path: str,
-    ) -> bool:
-        ...
-
-    def replace_in_file(
-        self,
-        path: str,
-        old: str,
-        new: str,
-    ) -> int:
-        ...
-
-    def insert_in_file(
-        self,
-        path: str,
-        insert_line: int,
-        new: str
-    ) -> None:
-        ...
-
-    def apply_patch(
-        self,
-        path: str,
-        patch: str,
-    ) -> str:
-        ...
 
 
 @dataclass
@@ -89,7 +22,7 @@ class TaskTracker:
 
 @dataclass
 class ToolRegistry:
-    runtime: Optional[RuntimeAdapter] = None
+    runtime: Optional[ContainerManager] = None
     task_tracker: TaskTracker = field(default_factory=TaskTracker)
 
     def build(self) -> Dict[str, ToolFn]:
@@ -101,7 +34,7 @@ class ToolRegistry:
             "task_tracker": self._task_tracker,
         }
 
-    def _require_runtime(self) -> RuntimeAdapter:
+    def _require_runtime(self) -> ContainerManager:
         if self.runtime is None:
             raise RuntimeError("Tool runtime is not configured")
         return self.runtime
