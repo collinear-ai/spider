@@ -446,13 +446,19 @@ def _run_tool_on_policy_stream(
                     dtype=student_logprobs.dtype,
                 )
 
+            input_tokens = list(token_ids)[:-1]
+            target_tokens = list(token_ids)[1:]
+            mask_tokens = list(reward_mask)[1:]
+            logprobs_tokens = student_logprobs[1:]
+            advantages_tokens = advantage[1:]
+
             datum = tinker.Datum(
-                model_input=tinker.ModelInput.from_ints(list(token_ids)),
+                model_input=tinker.ModelInput.from_ints(input_tokens),
                 loss_fn_inputs={
-                    "target_tokens": tinker.TensorData.from_torch(torch.tensor(list(token_ids), dtype=torch.int64)),
-                    "mask": tinker.TensorData.from_torch(torch.tensor(list(reward_mask), dtype=torch.float32)),
-                    "logprobs": tinker.TensorData.from_torch(student_logprobs),
-                    "advantages": tinker.TensorData.from_torch(advantage),
+                    "target_tokens": tinker.TensorData.from_torch(torch.tensor(target_tokens, dtype=torch.int64)),
+                    "mask": tinker.TensorData.from_torch(torch.tensor(mask_tokens, dtype=torch.float32)),
+                    "logprobs": tinker.TensorData.from_torch(logprobs_tokens),
+                    "advantages": tinker.TensorData.from_torch(advantages_tokens),
                 } # use importance sampling as a surrogate
             )
 
