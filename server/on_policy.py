@@ -586,14 +586,26 @@ def _tool_rollout_stream(
         turn_items = []
 
         for turn_idx in range(turn_limit):
-            assistant_message = _call_backend_chat(
-                backend=student_client,
-                messages=history,
-                tools=tool_defs,
-                parameters=job.generation.parameters,
-                include_logprobs=True,
-                model_name=job.model.name,
-            )
+            try:
+                assistant_message = _call_backend_chat(
+                    backend=student_client,
+                    messages=history,
+                    tools=tool_defs,
+                    parameters=job.generation.parameters,
+                    include_logprobs=True,
+                    model_name=job.model.name,
+                )
+            except Exception as exc:
+                if _is_context_window_error(exc):
+                    logger.warning(
+                        "Job %s: prompt=`%s...` turn=%d exceeded context window; ending trajectory.",
+                        job_id,
+                        prompt[:20],
+                        turn_idx,
+                    )
+                    break
+                raise
+            
             token_ids = assistant_message.get("token_ids") or []
             logprobs = assistant_message.get("logprobs") or [0.0] * len(token_ids)
             reward_mask = assistant_message.get("reward_mask") or [1] * len(token_ids)
@@ -966,3 +978,10 @@ def _compute_batch_stats(prompts: list[str], options: Any) -> tuple[int, int]:
     batch_size = max(1, getattr(options, "groups_per_batch", 64))
     total_batches = (len(prompts) + batch_size - 1) // batch_size
     return batch_size, total_batches
+
+def _is_context_window_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "context window" in text
+        or "max_tokens" in text
+    )
