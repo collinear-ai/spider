@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from token import LPAR
-import asyncio, logging, os, shutil, tarfile, urllib.request, zipfile
+import asyncio, logging, os, shutil, tarfile, urllib.request, zipfile, time
 from pathlib import Path
 from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional, Callable, TypedDict
 from urllib.parse import urlparse
@@ -825,12 +825,22 @@ def _download_tinker_artifact(uri: str, dest_root: Path) -> Path | None:
     service_client = tinker.ServiceClient()
     rest_client = service_client.create_rest_client()
     
-    try:
-        future = rest_client.get_checkpoint_archive_url_from_tinker_path(uri)
-        response = future.result(timeout=300)
-    except Exception as exc:
-        logger.warning("Failed to resolve Tinker checkpoint URL for %s: %s", uri, exc)
-        return None
+    retry_wait = 5.0
+    max_attempts = 6
+    response = None
+    for attempt in range(max_attempts):
+        try:
+            future = rest_client.get_checkpoint_archive_url_from_tinker_path(uri)
+            response = future.result(timeout=300)
+            break
+        except Exception as exc:
+            msg = str(exc)
+            logger.warning(
+                "Failed checkpoint URL resoluation attempt %d/%d: %s... Retrying in %d seconds...",
+                attempt + 1, max_attempts, msg, retry_wait, 
+            )
+            time.sleep(retry_wait)
+            retry_wait = min(retry_wait * 1.5, 30.0)
 
     signed_url = getattr(response, "url", None)
     if not signed_url:
