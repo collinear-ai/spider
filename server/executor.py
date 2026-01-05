@@ -198,6 +198,11 @@ def _run_tool_on_policy_job(
 ) -> JobExecutionResult:
     if not job.tools:
         raise JobExecutionError("Tool-aware on-policy jobs require at least one tool.")
+        
+    if job.generation.parameters is None:
+        job.generation.parameters = {}
+    if job.generation.parameters.get("tool_choice") is None:
+        job.generation.parameters["tool_choice"] = "auto"
     
     runtime_env, runtime_stack, _ = _prepare_runtime_env(job, job_env)
     
