@@ -452,6 +452,26 @@ def _run_tool_on_policy_stream(
             logprobs_tokens = student_logprobs[1:]
             advantages_tokens = advantage[1:]
 
+            if not (
+                len(input_tokens)
+                == len(target_tokens)
+                == len(mask_tokens)
+                == len(logprobs_tokens)
+                == len(advantages_tokens)
+            ):
+                raise JobExecutionError(
+                    "Shifted loss_fn_inputs length mismatch: "
+                    f"input={len(input_tokens)} target={len(target_tokens)} "
+                    f"mask={len(mask_tokens)} logprobs={len(logprobs_tokens)} "
+                    f"advantages={len(advantages_tokens)}"
+                )
+
+            if not torch.isfinite(logprobs_tokens).all():
+                raise JobExecutionError("Non-finite values in logprobs_tokens")
+
+            if not torch.isfinite(advantages_tokens).all():
+                raise JobExecutionError("Non-finite values in advantages_tokens.")
+
             datum = tinker.Datum(
                 model_input=tinker.ModelInput.from_ints(input_tokens),
                 loss_fn_inputs={
@@ -598,6 +618,11 @@ def _tool_rollout_stream(
             if len(reward_mask) != len(token_ids):
                 raise JobExecutionError(
                     f"reward_mask/token_ids mismatch: reward_mask={len(reward_mask)} tokens={len(token_ids)}"
+                )
+
+            if len(token_ids) <= 1:
+                raise JobExecutionError(
+                    f"token_ids too short for shifted training: tokens={len(token_ids)}"
                 )
 
             none_count = sum(lp is None for lp in logprobs)
