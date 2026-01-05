@@ -249,8 +249,10 @@ def _default_tool_parser(model_name: str) -> Optional[str]:
     lower = (model_name or "").lower()
     if "llama" in lower:
         return "llama3_json"
-    if "qwen3" in lower: # qwen3 and qwen3-coder
+    if "qwen3-coder" in lower:
         return "qwen3_xml"
+    if "qwen3" in lower: 
+        return "hermes"
     if "deepseek" in lower:
         return "deepseek_v31" if "v3.1" in lower else "deepseek_v3"
     if "glm-4" in lower:
