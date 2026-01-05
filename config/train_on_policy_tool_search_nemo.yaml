@@ -24,7 +24,7 @@ job:
       kl_penalty_coef: 1.0
       kl_discount_factor: 0.0
       loss_fn: importance_sampling
-      save_every: 20
+      save_every: 1
   output:
     mode: upload_hf
     hf:

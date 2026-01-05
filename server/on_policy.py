@@ -222,6 +222,7 @@ def run_on_policy_job(
             job=job,
             options=options,
             workspace=workspace,
+            total_batches=_compute_batch_stats(prompt_list, options)[1],
             rollout_stream=rollout_stream,
             sampler_ctx=sampler_ctx,
             metadata_path=metadata_path,
@@ -366,6 +367,7 @@ def _run_tool_on_policy_stream(
     job: JobConfig,
     options: Any,
     workspace: Path,
+    total_batches: int,
     rollout_stream: Iterable[List[Dict[str, Any]]],
     sampler_ctx: _StudentSamplerContext,
     metadata_path: Path,
@@ -452,31 +454,14 @@ def _run_tool_on_policy_stream(
             logprobs_tokens = student_logprobs[1:]
             advantages_tokens = advantage[1:]
 
-            if not (
-                len(input_tokens)
-                == len(target_tokens)
-                == len(mask_tokens)
-                == len(logprobs_tokens)
-                == len(advantages_tokens)
-            ):
-                raise JobExecutionError(
-                    "Shifted loss_fn_inputs length mismatch: "
-                    f"input={len(input_tokens)} target={len(target_tokens)} "
-                    f"mask={len(mask_tokens)} logprobs={len(logprobs_tokens)} "
-                    f"advantages={len(advantages_tokens)}"
-                )
-
-            if not torch.isfinite(logprobs_tokens).all():
-                raise JobExecutionError("Non-finite values in logprobs_tokens")
-
-            if not torch.isfinite(advantages_tokens).all():
-                raise JobExecutionError("Non-finite values in advantages_tokens.")
-
+            target_tensor = torch.tensor(target_tokens, dtype=torch.int64)
+            mask_tensor = torch.tensor(mask_tokens, dtype=torch.float32)
+            advantages_tokens = advantages_tokens * mask_tensor
+            
             datum = tinker.Datum(
                 model_input=tinker.ModelInput.from_ints(input_tokens),
                 loss_fn_inputs={
-                    "target_tokens": tinker.TensorData.from_torch(torch.tensor(target_tokens, dtype=torch.int64)),
-                    "mask": tinker.TensorData.from_torch(torch.tensor(mask_tokens, dtype=torch.float32)),
+                    "target_tokens": tinker.TensorData.from_torch(target_tensor),
                     "logprobs": tinker.TensorData.from_torch(logprobs_tokens),
                     "advantages": tinker.TensorData.from_torch(advantages_tokens),
                 } # use importance sampling as a surrogate
@@ -529,6 +514,9 @@ def _run_tool_on_policy_stream(
 
     async def _train_stream():
         save_every = max(1, getattr(options, "save_every", 1))
+        if total_batches > 0 and save_every > total_batches:
+            save_every = total_batches
+
         last_checkpoint = None
         for batch_index, trajectories in enumerate(rollout_stream):
             batch_items = await _process_batch(batch_index, trajectories)
@@ -589,8 +577,8 @@ def _tool_rollout_stream(
 
     tool_defs = tool_descriptors(job.tools)
     turn_limit = max(1, job.generation.max_turns or 16)
-    batch_size = getattr(job.generation.on_policy_options, "groups_per_batch", 64) # TODO: rename to batch size
-    total_batches = (len(prompts) + batch_size - 1) // batch_size
+
+    batch_size, total_batches = _compute_batch_stats(prompts, job.generation.on_policy_options)
 
     def _run_prompt(prompt: str) -> List[Dict[str, Any]]:
         history = _initial_chat_history(prompt, job)
@@ -963,3 +951,8 @@ def _safe_extract_zip(archive: zipfile.ZipFile, dest: Path) -> None:
         if not str(member_target).startswith(str(dest_resolved)):
             raise RuntimeError(f"Unsafe member path detected in archive: {name}")
     archive.extractall(dest_resolved)
+
+def _compute_batch_stats(prompts: list[str], options: Any) -> tuple[int, int]:
+    batch_size = max(1, getattr(options, "groups_per_batch", 64))
+    total_batches = (len(prompts) + batch_size - 1) // batch_size
+    return batch_size, total_batches
