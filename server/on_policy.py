@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from pdb import run
 from token import LPAR
 import asyncio, logging, os, shutil, tarfile, urllib.request, zipfile, time
 from pathlib import Path
-from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional, Callable, TypedDict
+from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional, Callable, TypedDict, final
 from urllib.parse import urlparse
 import blobfile
 
@@ -128,6 +129,7 @@ def run_on_policy_job(
     job_env: dict[str, str],
     prompts: Optional[List[Dict[str, Any]]] = None,
     tool_registry: Optional[Dict[str, Callable[..., Any]]] = None,
+    runtime_factory: Optional[Callable[[Dict[str, Any]], Any]] = None,
 ):
     from .executor import (
         JobExecutionResult,
@@ -175,8 +177,9 @@ def run_on_policy_job(
             job_id=job_id,
             job=job,
             student_client=student_client,
-            prompts=prompt_list,
+            prompts=prompt_rows,
             tool_registry=tool_registry,
+            runtime_factory=runtime_factory,
         )
         events.emit(
             "Finished Setup for tool rollouts streaming for on-policy distillation.",
@@ -571,6 +574,7 @@ def _tool_rollout_stream(
     student_client: Any,
     prompts: List[str],
     tool_registry: Dict[str, Callable[..., Any]],
+    runtime_factory: Optional[Callable[[Dict[str, Any]], Any]] = None,
 ) -> Iterable[List[Dict[str, Any]]]:
     from concurrent.futures import ThreadPoolExecutor
     from .executor import _initial_chat_history, _call_backend_chat, _execute_tool_calls, tool_descriptors, JobExecutionError
@@ -580,124 +584,134 @@ def _tool_rollout_stream(
 
     batch_size, total_batches = _compute_batch_stats(prompts, job.generation.on_policy_options)
 
-    def _run_prompt(prompt: str) -> List[Dict[str, Any]]:
+    def _run_prompt(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+        prompt = row["prompt"]
         history = _initial_chat_history(prompt, job)
         transcript = []
         turn_items = []
+        runtime = None
 
-        for turn_idx in range(turn_limit):
-            try:
-                assistant_message = _call_backend_chat(
-                    backend=student_client,
-                    messages=history,
-                    tools=tool_defs,
-                    parameters=job.generation.parameters,
-                    include_logprobs=True,
-                    model_name=job.model.name,
-                )
-            except Exception as exc:
-                if _is_context_window_error(exc):
-                    logger.warning(
-                        "Job %s: prompt=`%s...` turn=%d exceeded context window; ending trajectory.",
-                        job_id,
-                        prompt[:20],
-                        turn_idx,
+        if runtime_factory:
+            runtime = runtime_factory(row)
+
+        try:
+            for turn_idx in range(turn_limit):
+                try:
+                    assistant_message = _call_backend_chat(
+                        backend=student_client,
+                        messages=history,
+                        tools=tool_defs,
+                        parameters=job.generation.parameters,
+                        include_logprobs=True,
+                        model_name=job.model.name,
                     )
-                    break
-                raise
-            
-            token_ids = assistant_message.get("token_ids") or []
-            logprobs = assistant_message.get("logprobs") or [0.0] * len(token_ids)
-            reward_mask = assistant_message.get("reward_mask") or [1] * len(token_ids)
+                except Exception as exc:
+                    if _is_context_window_error(exc):
+                        logger.warning(
+                            "Job %s: prompt=`%s...` turn=%d exceeded context window; ending trajectory.",
+                            job_id,
+                            prompt[:20],
+                            turn_idx,
+                        )
+                        break
+                    raise
+                
+                token_ids = assistant_message.get("token_ids") or []
+                logprobs = assistant_message.get("logprobs") or [0.0] * len(token_ids)
+                reward_mask = assistant_message.get("reward_mask") or [1] * len(token_ids)
 
-            if len(logprobs) != len(token_ids):
-                raise JobExecutionError(
-                    f"logprobs/token_ids mismatch: logprobs={len(logprobs)} tokens={len(token_ids)}"
+                if len(logprobs) != len(token_ids):
+                    raise JobExecutionError(
+                        f"logprobs/token_ids mismatch: logprobs={len(logprobs)} tokens={len(token_ids)}"
+                    )
+
+                if len(reward_mask) != len(token_ids):
+                    raise JobExecutionError(
+                        f"reward_mask/token_ids mismatch: reward_mask={len(reward_mask)} tokens={len(token_ids)}"
+                    )
+
+                if len(token_ids) <= 1:
+                    raise JobExecutionError(
+                        f"token_ids too short for shifted training: tokens={len(token_ids)}"
+                    )
+
+                none_count = sum(lp is None for lp in logprobs)
+                none_idx = [i for i, lp in enumerate(logprobs) if lp is None]
+                masked_count = sum(1 for m in reward_mask if int(m) == 0)
+                none_on_masked = sum(
+                    1 for lp, m in zip(logprobs, reward_mask)
+                    if lp is None and int(m) == 0
+                )
+                logger.info(
+                    "Job %s: prompt=`%s...` logprobs None=%d masked=%d none_on_masked=%d none_idx=%s. Setting None to 0.0...",
+                    job_id,
+                    prompt[:20],
+                    none_count,
+                    masked_count,
+                    none_on_masked,
+                    none_idx,
                 )
 
-            if len(reward_mask) != len(token_ids):
-                raise JobExecutionError(
-                    f"reward_mask/token_ids mismatch: reward_mask={len(reward_mask)} tokens={len(token_ids)}"
+                logprobs = [
+                    0.0 if (lp is None and int(mask) == 0) else lp
+                    for lp, mask in zip(logprobs, reward_mask)
+                ]
+
+                content = assistant_message.get("content", "")
+                tool_calls = assistant_message.get("tool_calls")
+
+                logger.info(
+                    "Job %s: prompt=`%s...` turn=%d tool_returned=%s",
+                    job_id,
+                    prompt[:20],
+                    turn_idx,
+                    bool(tool_calls),
                 )
 
-            if len(token_ids) <= 1:
-                raise JobExecutionError(
-                    f"token_ids too short for shifted training: tokens={len(token_ids)}"
-                )
-
-            none_count = sum(lp is None for lp in logprobs)
-            none_idx = [i for i, lp in enumerate(logprobs) if lp is None]
-            masked_count = sum(1 for m in reward_mask if int(m) == 0)
-            none_on_masked = sum(
-                1 for lp, m in zip(logprobs, reward_mask)
-                if lp is None and int(m) == 0
-            )
-            logger.info(
-                "Job %s: prompt=`%s...` logprobs None=%d masked=%d none_on_masked=%d none_idx=%s. Setting None to 0.0...",
-                job_id,
-                prompt[:20],
-                none_count,
-                masked_count,
-                none_on_masked,
-                none_idx,
-            )
-
-            logprobs = [
-                0.0 if (lp is None and int(mask) == 0) else lp
-                for lp, mask in zip(logprobs, reward_mask)
-            ]
-
-            content = assistant_message.get("content", "")
-            tool_calls = assistant_message.get("tool_calls")
-
-            logger.info(
-                "Job %s: prompt=`%s...` turn=%d tool_returned=%s",
-                job_id,
-                prompt[:20],
-                turn_idx,
-                bool(tool_calls),
-            )
-
-            snapshot = {
-                "role": "assistant",
-                "content": content,
-                "tool_calls": tool_calls,
-            }
-            reasoning = assistant_message.get("reasoning")
-            if reasoning:
-                snapshot["reasoning"] = reasoning
-
-            messages = list(history) + [snapshot]
-            turn_items.append(
-                {
-                    "prompt": prompt,
-                    "messages": messages,
-                    "token_ids": token_ids,
-                    "logprobs": logprobs,
-                    "reward_mask": reward_mask,
-                    "assistant_content": content,
-                    "assistant_reasoning": reasoning,
-                    "assistant_tool_calls": tool_calls,
-                    "assistant_raw_text": assistant_message.get("assistant_raw_text"),
-                    "prompt_token_count": assistant_message.get("prompt_token_count", 0),
-                    "parser_fallback": assistant_message.get("parser_fallback", False),
-                    "turn_index": turn_idx,
+                snapshot = {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": tool_calls,
                 }
-            )
+                reasoning = assistant_message.get("reasoning")
+                if reasoning:
+                    snapshot["reasoning"] = reasoning
 
-            transcript.append(snapshot)
-            history.append(snapshot)
+                messages = list(history) + [snapshot]
+                turn_items.append(
+                    {
+                        "prompt": prompt,
+                        "messages": messages,
+                        "token_ids": token_ids,
+                        "logprobs": logprobs,
+                        "reward_mask": reward_mask,
+                        "assistant_content": content,
+                        "assistant_reasoning": reasoning,
+                        "assistant_tool_calls": tool_calls,
+                        "assistant_raw_text": assistant_message.get("assistant_raw_text"),
+                        "prompt_token_count": assistant_message.get("prompt_token_count", 0),
+                        "parser_fallback": assistant_message.get("parser_fallback", False),
+                        "turn_index": turn_idx,
+                    }
+                )
 
-            if not tool_calls:
-                break
+                transcript.append(snapshot)
+                history.append(snapshot)
 
-            _execute_tool_calls(
-                tool_calls=tool_calls,
-                tool_registry=tool_registry,
-                transcript=transcript,
-                history=history,
-                job_id=job_id,
-            )
+                if not tool_calls:
+                    break
+
+                _execute_tool_calls(
+                    tool_calls=tool_calls,
+                    tool_registry=tool_registry,
+                    transcript=transcript,
+                    history=history,
+                    job_id=job_id,
+                )
+
+        finally:
+            if runtime is not None:
+                runtime.cleanup()
 
         return turn_items
 
