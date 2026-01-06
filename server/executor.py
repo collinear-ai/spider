@@ -1261,7 +1261,7 @@ def _model_input_tokens(text: Any, tokenizer: Any) -> List[int]:
 
 def _initial_chat_history(prompt: str, job: JobConfig) -> List[Dict[str, Any]]:
     history = []
-    system_prompt = job.model.parameters.get("system_prompt")
+    system_prompt = job.generation.system_prompt
     if system_prompt:
         history.append({"role": "system", "content": system_prompt})
     history.append({"role": "user", "content": prompt})
