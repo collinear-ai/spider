@@ -104,6 +104,10 @@ class GenerationConfig(BaseModel):
         default_factory=dict,
         description="Sampler parameters forwarded to the remote backend"
     )
+    system_prompt: Optional[str] = Field(
+        default=None,
+        description="System prompt prepended to each chat history",
+    )
     on_policy: bool = Field(
         default=False,
         description="Enable on-policy training"
