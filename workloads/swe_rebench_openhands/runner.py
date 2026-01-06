@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+import logging
 from dataclasses import dataclass
 from datasets import load_dataset
 from pathlib import Path
@@ -12,6 +13,8 @@ from server.on_policy import run_on_policy_job
 
 from .container_manager import ContainerManager
 from .tool_registry import ToolRegistry
+
+logger = logging.getLogger(__name__)
 
 _CURRENT_RUNTIME = contextvars.ContextVar(
     "swe_rebench_runtime"
@@ -27,6 +30,10 @@ class _RuntimeHandle:
         self.runtime.cleanup()
 
 def _runtime_factory(row: Dict[str, Any]) -> _RuntimeHandle:
+    instance_id = row.get("instance_id", "unknown")
+    image = row.get("docker_image") or row.get("image_name") or "unknown"
+    logger.info("Dispatching runtime for instance_id=%s image=%s", instance_id, image)
+    
     runtime = ContainerManager.from_row(row)
     runtime.create()
     token = _CURRENT_RUNTIME.set(runtime)
@@ -73,8 +80,11 @@ def _load_swe_rebench_instances(
     instance_ids: Optional[Sequence[str]] = None,
     dataset_name: str = "nebius/SWE-rebench",
     dataset_config: str = "default",
+    max_examples: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     ds = load_dataset(dataset_name, dataset_config, split=split)
+    if max_examples:
+        ds = ds.select(range(max_examples))
     rows = [dict(row) for row in ds]
     if instance_ids:
         wanted = set(instance_ids)
@@ -129,7 +139,11 @@ def run_server_only(
     if system_prompt_path.exists():
         job.generation.system_prompt = system_prompt_path.read_text(encoding="utf-8")
 
-    rows = _load_swe_rebench_instances(split=split, instance_ids=instance_ids)
+    rows = _load_swe_rebench_instances(
+        split=split, 
+        instance_ids=instance_ids,
+        max_examples=job.source.max_examples,
+    )
     for row in rows:
         row["prompt"] = _build_prompt(row)
 
