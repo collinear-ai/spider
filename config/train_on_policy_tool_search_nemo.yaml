@@ -19,11 +19,8 @@ job:
       teacher: moonshotai/Kimi-K2-Thinking
       learning_rate: 1e-7
       groups_per_batch: 16
+      group_size: 1
       lora_rank: 16
-      num_substeps: 1
-      kl_penalty_coef: 1.0
-      kl_discount_factor: 0.0
-      loss_fn: importance_sampling
       save_every: 1
   output:
     mode: upload_hf
