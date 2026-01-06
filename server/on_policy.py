@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from token import LPAR
-import asyncio, logging, os, shutil, tarfile, urllib.request, zipfile
+import asyncio, logging, os, shutil, tarfile, urllib.request, zipfile, time
 from pathlib import Path
 from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional, Callable, TypedDict
 from urllib.parse import urlparse
@@ -222,6 +222,7 @@ def run_on_policy_job(
             job=job,
             options=options,
             workspace=workspace,
+            total_batches=_compute_batch_stats(prompt_list, options)[1],
             rollout_stream=rollout_stream,
             sampler_ctx=sampler_ctx,
             metadata_path=metadata_path,
@@ -366,6 +367,7 @@ def _run_tool_on_policy_stream(
     job: JobConfig,
     options: Any,
     workspace: Path,
+    total_batches: int,
     rollout_stream: Iterable[List[Dict[str, Any]]],
     sampler_ctx: _StudentSamplerContext,
     metadata_path: Path,
@@ -446,13 +448,22 @@ def _run_tool_on_policy_stream(
                     dtype=student_logprobs.dtype,
                 )
 
+            input_tokens = list(token_ids)[:-1]
+            target_tokens = list(token_ids)[1:]
+            mask_tokens = list(reward_mask)[1:]
+            logprobs_tokens = student_logprobs[1:]
+            advantages_tokens = advantage[1:]
+
+            target_tensor = torch.tensor(target_tokens, dtype=torch.int64)
+            mask_tensor = torch.tensor(mask_tokens, dtype=torch.float32)
+            advantages_tokens = advantages_tokens * mask_tensor
+            
             datum = tinker.Datum(
-                model_input=tinker.ModelInput.from_ints(list(token_ids)),
+                model_input=tinker.ModelInput.from_ints(input_tokens),
                 loss_fn_inputs={
-                    "target_tokens": tinker.TensorData.from_torch(torch.tensor(list(token_ids), dtype=torch.int64)),
-                    "mask": tinker.TensorData.from_torch(torch.tensor(list(reward_mask), dtype=torch.float32)),
-                    "logprobs": tinker.TensorData.from_torch(student_logprobs),
-                    "advantages": tinker.TensorData.from_torch(advantage),
+                    "target_tokens": tinker.TensorData.from_torch(target_tensor),
+                    "logprobs": tinker.TensorData.from_torch(logprobs_tokens),
+                    "advantages": tinker.TensorData.from_torch(advantages_tokens),
                 } # use importance sampling as a surrogate
             )
 
@@ -503,6 +514,9 @@ def _run_tool_on_policy_stream(
 
     async def _train_stream():
         save_every = max(1, getattr(options, "save_every", 1))
+        if total_batches > 0 and save_every > total_batches:
+            save_every = total_batches
+
         last_checkpoint = None
         for batch_index, trajectories in enumerate(rollout_stream):
             batch_items = await _process_batch(batch_index, trajectories)
@@ -563,8 +577,8 @@ def _tool_rollout_stream(
 
     tool_defs = tool_descriptors(job.tools)
     turn_limit = max(1, job.generation.max_turns or 16)
-    batch_size = getattr(job.generation.on_policy_options, "groups_per_batch", 64) # TODO: rename to batch size
-    total_batches = (len(prompts) + batch_size - 1) // batch_size
+
+    batch_size, total_batches = _compute_batch_stats(prompts, job.generation.on_policy_options)
 
     def _run_prompt(prompt: str) -> List[Dict[str, Any]]:
         history = _initial_chat_history(prompt, job)
@@ -572,14 +586,26 @@ def _tool_rollout_stream(
         turn_items = []
 
         for turn_idx in range(turn_limit):
-            assistant_message = _call_backend_chat(
-                backend=student_client,
-                messages=history,
-                tools=tool_defs,
-                parameters=job.generation.parameters,
-                include_logprobs=True,
-                model_name=job.model.name,
-            )
+            try:
+                assistant_message = _call_backend_chat(
+                    backend=student_client,
+                    messages=history,
+                    tools=tool_defs,
+                    parameters=job.generation.parameters,
+                    include_logprobs=True,
+                    model_name=job.model.name,
+                )
+            except Exception as exc:
+                if _is_context_window_error(exc):
+                    logger.warning(
+                        "Job %s: prompt=`%s...` turn=%d exceeded context window; ending trajectory.",
+                        job_id,
+                        prompt[:20],
+                        turn_idx,
+                    )
+                    break
+                raise
+            
             token_ids = assistant_message.get("token_ids") or []
             logprobs = assistant_message.get("logprobs") or [0.0] * len(token_ids)
             reward_mask = assistant_message.get("reward_mask") or [1] * len(token_ids)
@@ -592,6 +618,11 @@ def _tool_rollout_stream(
             if len(reward_mask) != len(token_ids):
                 raise JobExecutionError(
                     f"reward_mask/token_ids mismatch: reward_mask={len(reward_mask)} tokens={len(token_ids)}"
+                )
+
+            if len(token_ids) <= 1:
+                raise JobExecutionError(
+                    f"token_ids too short for shifted training: tokens={len(token_ids)}"
                 )
 
             none_count = sum(lp is None for lp in logprobs)
@@ -806,12 +837,22 @@ def _download_tinker_artifact(uri: str, dest_root: Path) -> Path | None:
     service_client = tinker.ServiceClient()
     rest_client = service_client.create_rest_client()
     
-    try:
-        future = rest_client.get_checkpoint_archive_url_from_tinker_path(uri)
-        response = future.result(timeout=300)
-    except Exception as exc:
-        logger.warning("Failed to resolve Tinker checkpoint URL for %s: %s", uri, exc)
-        return None
+    retry_wait = 5.0
+    max_attempts = 6
+    response = None
+    for attempt in range(max_attempts):
+        try:
+            future = rest_client.get_checkpoint_archive_url_from_tinker_path(uri)
+            response = future.result(timeout=300)
+            break
+        except Exception as exc:
+            msg = str(exc)
+            logger.warning(
+                "Failed checkpoint URL resoluation attempt %d/%d: %s... Retrying in %d seconds...",
+                attempt + 1, max_attempts, msg, retry_wait, 
+            )
+            time.sleep(retry_wait)
+            retry_wait = min(retry_wait * 1.5, 30.0)
 
     signed_url = getattr(response, "url", None)
     if not signed_url:
@@ -932,3 +973,15 @@ def _safe_extract_zip(archive: zipfile.ZipFile, dest: Path) -> None:
         if not str(member_target).startswith(str(dest_resolved)):
             raise RuntimeError(f"Unsafe member path detected in archive: {name}")
     archive.extractall(dest_resolved)
+
+def _compute_batch_stats(prompts: list[str], options: Any) -> tuple[int, int]:
+    batch_size = max(1, getattr(options, "groups_per_batch", 64))
+    total_batches = (len(prompts) + batch_size - 1) // batch_size
+    return batch_size, total_batches
+
+def _is_context_window_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "context window" in text
+        or "max_tokens" in text
+    )

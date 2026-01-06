@@ -251,6 +251,8 @@ def _default_tool_parser(model_name: str) -> Optional[str]:
         return "llama3_json"
     if "qwen3-coder" in lower:
         return "qwen3_xml"
+    if "qwen3" in lower: 
+        return "hermes"
     if "deepseek" in lower:
         return "deepseek_v31" if "v3.1" in lower else "deepseek_v3"
     if "glm-4" in lower:

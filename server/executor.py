@@ -198,6 +198,11 @@ def _run_tool_on_policy_job(
 ) -> JobExecutionResult:
     if not job.tools:
         raise JobExecutionError("Tool-aware on-policy jobs require at least one tool.")
+        
+    if job.generation.parameters is None:
+        job.generation.parameters = {}
+    if job.generation.parameters.get("tool_choice") is None:
+        job.generation.parameters["tool_choice"] = "auto"
     
     runtime_env, runtime_stack, _ = _prepare_runtime_env(job, job_env)
     
@@ -940,7 +945,11 @@ def _execute_tool_calls(
     job_id: str,
 ) -> None:
     for call in tool_calls:
+        call = _as_dict(call)
         function_call = call.get("function") or {}
+        if not isinstance(function_call, dict):
+            function_call = _as_dict(function_call)
+
         tool_name = function_call.get("name")
         if not tool_name or tool_name not in tool_registry:
             warning = (
@@ -963,12 +972,12 @@ def _execute_tool_calls(
             continue
 
         raw_args = function_call.get("arguments") or "{}"
-        turn_index = len(transcript) - 1
+        message_idx = len(transcript) - 1
         logger.info(
-            "Job %s: invoking tool `%s` (turn=%d) args=%s",
+            "Job %s: invoking tool `%s` (message_idx=%d) args=%s",
             job_id,
             tool_name,
-            turn_index,
+            message_idx,
             raw_args,
         )
         try:
@@ -1360,3 +1369,12 @@ def _shutdown_backend(job_id: str, backend: Any) -> None:
 def _is_tinker_backend(backend: Any) -> bool:
     import tinker
     return isinstance(backend, tinker.SamplingClient)
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if hasattr(value, "dict"):
+        return value.dict()
+    return dict(value)
