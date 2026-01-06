@@ -949,7 +949,7 @@ def _execute_tool_calls(
         function_call = call.get("function") or {}
         if not isinstance(function_call, dict):
             function_call = _as_dict(function_call)
-            
+
         tool_name = function_call.get("name")
         if not tool_name or tool_name not in tool_registry:
             warning = (
@@ -972,12 +972,12 @@ def _execute_tool_calls(
             continue
 
         raw_args = function_call.get("arguments") or "{}"
-        turn_index = len(transcript) - 1
+        message_idx = len(transcript) - 1
         logger.info(
-            "Job %s: invoking tool `%s` (turn=%d) args=%s",
+            "Job %s: invoking tool `%s` (message_idx=%d) args=%s",
             job_id,
             tool_name,
-            turn_index,
+            message_idx,
             raw_args,
         )
         try:
