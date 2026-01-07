@@ -34,13 +34,13 @@ class ContainerSpec:
     install_config: Optional[Dict[str, Any]] = None
 
 class ContainerManager:
-    def __init__(self, spec: ContainerSpec, *, workdir: str = "/repo") -> None:
+    def __init__(self, spec: ContainerSpec, *, workdir: str = "/testbed") -> None:
         self.spec = spec
         self.workdir = workdir
         self.container_name = f"swe-rebench-{spec.instance_id}"
 
     @classmethod
-    def from_row(cls, row: Dict[str, Any], *, workdir: str = "/repo") -> "ContainerManager":
+    def from_row(cls, row: Dict[str, Any], *, workdir: str = "/testbed") -> "ContainerManager":
         spec = ContainerSpec(
             instance_id=_ensure_str(row.get("instance_id"), "instance_id"),
             docker_image=_ensure_str(row.get("docker_image") or row.get("image_name"), "docker_image"),
