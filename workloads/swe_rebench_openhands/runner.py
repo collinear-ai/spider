@@ -99,24 +99,6 @@ def _image_for_row(row: Dict[str, Any]) -> Optional[str]:
     image = row.get("docker_image") or row.get("image_name")
     return str(image) if image else None
 
-def _image_size_bytes(image: str) -> Optional[int]:
-    proc = subprocess.run(
-        ["docker", "image", "inspect", image, "--format", f"{{.Size}}"],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    if proc.returncode != 0:
-        return None
-    value = proc.stdout.strip()
-    if not value:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
-
 def _pull_image(image: str) -> str:
     proc = subprocess.run(
         ["docker", "pull", image],
@@ -153,7 +135,6 @@ def _prepull_images(
             "image": image, 
             "status": "pulled", 
             "output_tail": output[-2000:],
-            "size_bytes": _image_size_bytes(image),
         }
 
     total = len(images)
@@ -165,18 +146,9 @@ def _prepull_images(
             completed += 1
             print(f"[prepull] pulled {completed}/{total} images", flush=True)
 
-    sizes = [entry["size_bytes"] for entry in results if entry.get("size_bytes")]
-    stats = {
-        "image_count": len(results),
-        "total_bytes": sum(sizes) if sizes else None,
-        "mean_bytes": int(statistics.mean(sizes)) if sizes else None,
-        "max_bytes": max(sizes) if sizes else None,
-    }
-
     payload = {
         "started_at": start_ts,
         "finished_at": time.time(),
-        "stats": stats,
         "images": results,
         "note": "Images are stored in the local Docker daemon cache.",
     }
