@@ -16,6 +16,16 @@ def _ensure_str(value: Any, name: str) -> str:
         raise ValueError(f"missing required field: {name}")
     return str(value)
 
+def image_exists(image: str) -> bool:
+    proc = subprocess.run(
+        ["docker", "image", "inspect", image],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return proc.returncode == 0
+
 @dataclass
 class ContainerSpec:
     instance_id: str
@@ -41,7 +51,8 @@ class ContainerManager:
 
     def create(self) -> None:
         image = self.spec.docker_image
-        _run(["docker", "pull", image])
+        if not image_exists(image):
+            _run(["docker", "pull", image])
         _run([
             "docker", "run", "-d", 
             "--name", self.container_name,

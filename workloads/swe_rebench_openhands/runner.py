@@ -5,6 +5,7 @@ import json
 import time
 import logging
 import subprocess
+import statistics
 from dataclasses import dataclass
 from datasets import load_dataset
 from pathlib import Path
@@ -14,7 +15,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 from spider.config import JobConfig, ToolConfig
 from server.on_policy import run_on_policy_job
 
-from .container_manager import ContainerManager
+from .container_manager import ContainerManager, image_exists
 from .tool_registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -98,15 +99,23 @@ def _image_for_row(row: Dict[str, Any]) -> Optional[str]:
     image = row.get("docker_image") or row.get("image_name")
     return str(image) if image else None
 
-def _image_exists(image: str) -> bool:
+def _image_size_bytes(image: str) -> Optional[int]:
     proc = subprocess.run(
-        ["docker", "image", "inspect", image],
+        ["docker", "image", "inspect", image, "--format", f"{{.Size}}"],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
-    return proc.returncode == 0
+    if proc.returncode != 0:
+        return None
+    value = proc.stdout.strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 def _pull_image(image: str) -> str:
     proc = subprocess.run(
@@ -137,18 +146,32 @@ def _prepull_images(
     results = []
 
     def _maybe_pull(image: str) -> Dict[str, Any]:
-        if _image_exists(image):
+        if image_exists(image):
             return {"image": image, "status": "present"}
         output = _pull_image(image)
-        return {"image": image, "status": "pulled", "output_tail": output[-2000:]}
+        return {
+            "image": image, 
+            "status": "pulled", 
+            "output_tail": output[-2000:],
+            "size_bytes": _image_size_bytes(image),
+        }
 
     with ThreadPoolExecutor(max_workers=max_parallel) as pool:
         for result in pool.map(_maybe_pull, images):
             results.append(result)
 
+    sizes = [entry["size_bytes"] for entry in results if entry.get("size_bytes")]
+    stats = {
+        "image_count": len(results),
+        "total_bytes": sum(sizes) if sizes else None,
+        "mean_bytes": int(statistics.mean(sizes)) if sizes else None,
+        "max_bytes": max(sizes) if sizes else None,
+    }
+
     payload = {
         "started_at": start_ts,
         "finished_at": time.time(),
+        "stats": stats,
         "images": results,
         "note": "Images are stored in the local Docker daemon cache.",
     }
