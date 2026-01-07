@@ -269,7 +269,7 @@ def _build_prompt(row: Dict[str, Any]) -> str:
     test_cmd = install_cfg.get("test_cmd") if isinstance(install_cfg, dict) else ""
 
     repo_dir = repo.replace("/", "__") if repo else "repo"
-    uploaded_path = f"/workspace/{repo_dir}"
+    uploaded_path = "/testbed"
 
     template_path = Path(__file__).parent / "prompts" / "user.txt"
     template = template_path.read_text(encoding="utf-8")

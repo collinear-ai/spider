@@ -2,7 +2,7 @@
 {uploaded_path}
 </uploaded_files>
 
-I've uploaded a python code repository in the directory {repo_dir}. Consider the following issue description:
+I've uploaded a python code repository in the directory {uploaded_path}. Consider the following issue description:
 
 <issue_description>
 {problem_statement}
