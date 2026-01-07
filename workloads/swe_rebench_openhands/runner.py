@@ -153,6 +153,46 @@ def _prefetch_images_async(
     for image in images:
         pool.submit(_maybe_pull_image, image)
 
+def _list_running_container_images() -> Set[str]:
+    proc = subprocess.run(
+        ["docker", "ps", "--format", f"{{.Image}}"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+def _list_local_images() -> Set[str]:
+    proc = subprocess.run(
+        ["docker", "image", "ls", "--format", f"{{.Repository}}:{{.Tag}}"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    images = set()
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line or line == "<none>:<none>":
+            continue
+        images.add(line)
+    return images
+
+def _prune_unused_images(keep_images: Set[str]) -> None:
+    running = _list_running_container_images()
+    local = _list_local_images()
+    candidates = sorted(local - keep_images - running)
+    if not candidates:
+        return
+    subprocess.run(
+        ["docker", "rmi", "-f", *candidates],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
 def _pull_image(image: str) -> str:
     proc = subprocess.run(
         ["docker", "pull", image],
@@ -291,6 +331,7 @@ def run_server_only(
 
     def _on_batch_complete(rows):
         image_cache_state.add(_collect_batch_images(rows))
+        _prune_unused_images(image_cache_state.recent_union())
 
     return run_on_policy_job(
         job_id="swe-rebench-openhands",
