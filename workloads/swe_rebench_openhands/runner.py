@@ -153,18 +153,6 @@ def _prefetch_images_async(
     for image in images:
         pool.submit(_maybe_pull_image, image)
 
-def _build_image_prefetcher(
-    *,
-    max_parallel: int = 2,
-) -> Callable[[List[Dict[str, Any]]], None]:
-    pool = ThreadPoolExecutor(max_workers=max_parallel)
-
-    def _prefetch(rows: List[Dict[str, Any]]) -> None:
-        images = _collect_batch_images(rows)
-        _prefetch_images_async(images, pool=pool)
-
-    return _prefetch
-
 def _pull_image(image: str) -> str:
     proc = subprocess.run(
         ["docker", "pull", image],
@@ -271,6 +259,9 @@ def run_server_only(
     instance_ids: Optional[List[str]] = None,
     schema_path: Optional[Path] = None,
     job_env: Optional[Dict[str, str]] = None,
+    on_batch_start_lookahead: int = 2,
+    prefetch_max_workers: int = 2,
+    max_batches_keep: int = 2,
 ) -> Any:
     schema_path = schema_path or (Path(__file__).parent / "schemas.json")
     tool_schemas = _load_tool_schemas(schema_path)
@@ -291,8 +282,12 @@ def run_server_only(
         row["prompt"] = _build_prompt(row)
 
     tool_registry = _build_tool_registry()
-    image_prefetcher = _build_image_prefetcher(max_parallel=2)
-    image_cache_state = ImageCacheState(max_batches_keep=2)
+    image_cache_state = ImageCacheState(max_batches_keep=max_batches_keep)
+    prefetch_pool = ThreadPoolExecutor(max_workers=prefetch_max_workers)
+
+    def _on_batch_start(rows):
+        images = _collect_batch_images(rows)
+        _prefetch_images_async(images, pool=prefetch_pool)
 
     def _on_batch_complete(rows):
         image_cache_state.add(_collect_batch_images(rows))
@@ -305,7 +300,7 @@ def run_server_only(
         prompts=rows,
         tool_registry=tool_registry,
         runtime_factory=_runtime_factory,
-        image_prefetcher=image_prefetcher,
-        prefetch_batches=2,
+        on_batch_start=_on_batch_start,
+        on_batch_start_lookahead=on_batch_start_lookahead,
         on_batch_complete=_on_batch_complete,
     )

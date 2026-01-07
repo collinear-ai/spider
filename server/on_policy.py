@@ -130,8 +130,8 @@ def run_on_policy_job(
     prompts: Optional[List[Dict[str, Any]]] = None,
     tool_registry: Optional[Dict[str, Callable[..., Any]]] = None,
     runtime_factory: Optional[Callable[[Dict[str, Any]], Any]] = None,
-    image_prefetcher: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
-    prefetch_batches: int = 0,
+    on_batch_start: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+    on_batch_start_lookahead: int = 0,
     on_batch_complete: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
 ):
     from .executor import (
@@ -183,8 +183,8 @@ def run_on_policy_job(
             prompts=prompt_rows,
             tool_registry=tool_registry,
             runtime_factory=runtime_factory,
-            image_prefetcher=image_prefetcher,
-            prefetch_batches=prefetch_batches,
+            on_batch_start=on_batch_start,
+            on_batch_start_lookahead=on_batch_start_lookahead,
             on_batch_complete=on_batch_complete,
         )
         events.emit(
@@ -677,8 +677,8 @@ def _tool_rollout_stream(
     prompts: List[str],
     tool_registry: Dict[str, Callable[..., Any]],
     runtime_factory: Optional[Callable[[Dict[str, Any]], Any]] = None,
-    image_prefetcher: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
-    prefetch_batches: int = 0,
+    on_batch_start: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+    on_batch_start_lookahead: int = 0,
     on_batch_complete: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
 ) -> Iterable[List[Dict[str, Any]]]:
     from concurrent.futures import ThreadPoolExecutor
@@ -821,13 +821,13 @@ def _tool_rollout_stream(
         return turn_items
 
     for batch_index, start in enumerate(range(0, len(prompts), batch_size)):
-        if image_prefetcher and prefetch_batches > 0:
-            for ahead in range(1, prefetch_batches + 1):
+        if on_batch_start and on_batch_start_lookahead > 0:
+            for ahead in range(1, on_batch_start_lookahead + 1):
                 next_start = start + ahead * batch_size
                 if next_start >= len(prompts):
                     break
                 next_chunk = prompts[next_start: next_start + batch_size]
-                image_prefetcher(next_chunk)
+                on_batch_start(next_chunk)
 
         chunk = prompts[start: start + batch_size]
         with ThreadPoolExecutor(max_workers=min(len(chunk), 8)) as pool:
