@@ -9,7 +9,7 @@ import statistics
 from dataclasses import dataclass
 from datasets import load_dataset
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 from spider.config import JobConfig, ToolConfig
@@ -156,9 +156,14 @@ def _prepull_images(
             "size_bytes": _image_size_bytes(image),
         }
 
+    total = len(images)
+    completed = 0
     with ThreadPoolExecutor(max_workers=max_parallel) as pool:
-        for result in pool.map(_maybe_pull, images):
-            results.append(result)
+        futures = [pool.submit(_maybe_pull, image) for image in images]
+        for fut in as_completed(futures):
+            results.append(fut.result())
+            completed += 1
+            print(f"[prepull] pulled {completed}/{total} images", flush=True)
 
     sizes = [entry["size_bytes"] for entry in results if entry.get("size_bytes")]
     stats = {
