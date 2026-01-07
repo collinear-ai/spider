@@ -78,6 +78,29 @@ def _build_tool_registry() -> Dict[str, Callable[..., Any]]:
         "task_tracker": _tool_wrapper("_task_tracker"),
     }
 
+def _cleanup_existing_containers(prefix: str = "swe-rebench-") -> None:
+    proc = subprocess.run(
+        ["docker", "ps", "-aq", "--filter", f"name={prefix}"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    container_ids = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    if not container_ids:
+        return
+    
+    logger.info(
+        "Cleaning up %d existing SWE-rebench container(s).", len(container_ids),
+    )
+    subprocess.run(
+        ["docker", "rm", "-f", *container_ids],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
 def _load_swe_rebench_instances(
     *,
     split: str = "filtered",
@@ -202,6 +225,8 @@ def run_server_only(
     if system_prompt_path.exists():
         job.generation.system_prompt = system_prompt_path.read_text(encoding="utf-8")
 
+    _cleanup_existing_containers()
+    
     rows = _load_swe_rebench_instances(
         split=split, 
         instance_ids=instance_ids,

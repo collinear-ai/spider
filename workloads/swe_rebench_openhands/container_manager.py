@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 import json
 import os
 import shlex
@@ -10,6 +11,14 @@ from typing import Any, Dict, List, Optional, Sequence
 
 def _run(cmd: Sequence[str], *, check: bool = True, text: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, check=check, text=text, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+def _sanitize_container_name(value: str) -> str:
+    return value.replace("/", "_").replace(":", "_")
+
+def _short_image_name(image: str) -> str:
+    name = image.rsplit("/", 1)[-1]
+    name = name.split(":", 1)[0]
+    return name[-12:] if len(name) > 12 else name
 
 def _ensure_str(value: Any, name: str) -> str:
     if not value:
@@ -34,10 +43,19 @@ class ContainerSpec:
     install_config: Optional[Dict[str, Any]] = None
 
 class ContainerManager:
-    def __init__(self, spec: ContainerSpec, *, workdir: str = "/testbed") -> None:
+    def __init__(
+        self, 
+        spec: ContainerSpec, 
+        *, 
+        workdir: str = "/testbed", 
+    ) -> None:
         self.spec = spec
         self.workdir = workdir
-        self.container_name = f"swe-rebench-{spec.instance_id}"
+
+        run_id = str(time.time_ns())
+        image_short = _short_image_name(spec.docker_image)
+        raw_name = f"swe-rebench-{spec.instance_id}-{image_short}-{run_id}"
+        self.container_name = _sanitize_container_name(raw_name)
 
     @classmethod
     def from_row(cls, row: Dict[str, Any], *, workdir: str = "/testbed") -> "ContainerManager":
@@ -60,8 +78,6 @@ class ContainerManager:
             image,
             "sleep", "infinity",
         ])
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stdout.strip())
         self._apply_install_config()
 
     def cleanup(self) -> None:
