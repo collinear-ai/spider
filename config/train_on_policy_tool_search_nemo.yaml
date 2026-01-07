@@ -21,6 +21,8 @@ job:
       groups_per_batch: 16
       lora_rank: 16
       save_every: 1
+      wandb_project: spider-on-policy
+      wandb_name: test
   output:
     mode: upload_hf
     hf:

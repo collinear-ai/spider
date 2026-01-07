@@ -61,6 +61,7 @@ server = [
     "openai",
     "tqdm",
     "httpx",
+    "wandb",
 ]
 all = [
     "httpx",
@@ -92,6 +93,7 @@ all = [
     "openai",
     "tqdm",
     "httpx",
+    "wandb",
 ]
 
 [project.scripts]
