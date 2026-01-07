@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import contextvars
 import json
+import time
 import logging
+import subprocess
 from dataclasses import dataclass
 from datasets import load_dataset
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 from spider.config import JobConfig, ToolConfig
@@ -33,7 +36,7 @@ def _runtime_factory(row: Dict[str, Any]) -> _RuntimeHandle:
     instance_id = row.get("instance_id", "unknown")
     image = row.get("docker_image") or row.get("image_name") or "unknown"
     logger.info("Dispatching runtime for instance_id=%s image=%s", instance_id, image)
-    
+
     runtime = ContainerManager.from_row(row)
     runtime.create()
     token = _CURRENT_RUNTIME.set(runtime)
@@ -91,6 +94,66 @@ def _load_swe_rebench_instances(
         rows = [row for row in rows if row.get("instance_id") in wanted]
     return rows
 
+def _image_for_row(row: Dict[str, Any]) -> Optional[str]:
+    image = row.get("docker_image") or row.get("image_name")
+    return str(image) if image else None
+
+def _image_exists(image: str) -> bool:
+    proc = subprocess.run(
+        ["docker", "image", "inspect", image],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return proc.returncode == 0
+
+def _pull_image(image: str) -> str:
+    proc = subprocess.run(
+        ["docker", "pull", image],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stdout.strip())
+    return proc.stdout
+
+def _prepull_images(
+    rows: List[Dict[str, Any]],
+    *,
+    workspace: Path,
+    max_parallel: int = 2,
+) -> None:
+    images = sorted({img for img in (_image_for_row(row) for row in rows) if img})
+    if not images:
+        return
+
+    workspace.mkdir(parents=True, exist_ok=True)
+    manifest_path = workspace / "swe-rebench-image-pulls.json"
+    
+    start_ts = time.time()
+    results = []
+
+    def _maybe_pull(image: str) -> Dict[str, Any]:
+        if _image_exists(image):
+            return {"image": image, "status": "present"}
+        output = _pull_image(image)
+        return {"image": image, "status": "pulled", "output_tail": output[-2000:]}
+
+    with ThreadPoolExecutor(max_workers=max_parallel) as pool:
+        for result in pool.map(_maybe_pull, images):
+            results.append(result)
+
+    payload = {
+        "started_at": start_ts,
+        "finished_at": time.time(),
+        "images": results,
+        "note": "Images are stored in the local Docker daemon cache.",
+    }
+    manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
 def _build_prompt(row: Dict[str, Any]) -> str:
     repo = row.get("repo", "")
     base_commit = row.get("base_commit", "")
@@ -146,6 +209,8 @@ def run_server_only(
     )
     for row in rows:
         row["prompt"] = _build_prompt(row)
+
+    _prepull_images(rows, workspace=workspace)
 
     tool_registry = _build_tool_registry()
     return run_on_policy_job(
