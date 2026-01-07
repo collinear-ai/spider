@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datasets import load_dataset
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
 
 from spider.config import JobConfig, ToolConfig
 from server.on_policy import run_on_policy_job
@@ -122,6 +122,42 @@ def _image_for_row(row: Dict[str, Any]) -> Optional[str]:
     image = row.get("docker_image") or row.get("image_name")
     return str(image) if image else None
 
+def _collect_batch_images(rows: List[Dict[str, Any]]) -> Set[str]:
+    images = set()
+    for row in rows:
+        image = _image_for_row(row)
+        if image:
+            images.add(image)
+    return images
+
+def _maybe_pull_image(image: str) -> None:
+    if image_exists(image):
+        return
+    try:
+        _pull_image(image)
+    except Exception as exc:
+        logger.warning("Failed to prefetch image %s: %s", image, exc)
+
+def _prefetch_images_async(
+    images: Iterable[str],
+    *,
+    pool: ThreadPoolExecutor,
+) -> None:
+    for image in images:
+        pool.submit(_maybe_pull_image, image)
+
+def _build_image_prefetcher(
+    *,
+    max_parallel: int = 2,
+) -> Callable[[List[Dict[str, Any]]], None]:
+    pool = ThreadPoolExecutor(max_workers=max_parallel)
+
+    def _prefetch(rows: List[Dict[str, Any]]) -> None:
+        images = _collect_batch_images(rows)
+        _prefetch_images_async(images, pool=pool)
+
+    return _prefetch
+
 def _pull_image(image: str) -> str:
     proc = subprocess.run(
         ["docker", "pull", image],
@@ -226,7 +262,7 @@ def run_server_only(
         job.generation.system_prompt = system_prompt_path.read_text(encoding="utf-8")
 
     _cleanup_existing_containers()
-    
+
     rows = _load_swe_rebench_instances(
         split=split, 
         instance_ids=instance_ids,
@@ -235,9 +271,9 @@ def run_server_only(
     for row in rows:
         row["prompt"] = _build_prompt(row)
 
-    _prepull_images(rows, workspace=workspace)
-
     tool_registry = _build_tool_registry()
+    image_prefetcher = _build_image_prefetcher(max_parallel=2)
+
     return run_on_policy_job(
         job_id="swe-rebench-openhands",
         job=job,
@@ -246,4 +282,6 @@ def run_server_only(
         prompts=rows,
         tool_registry=tool_registry,
         runtime_factory=_runtime_factory,
+        image_prefetcher=image_prefetcher,
+        prefetch_batches=2,
     )
