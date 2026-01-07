@@ -6,5 +6,6 @@ artifacts/
 .artifacts/
 *private.yaml
 *private.py
+.env
 
 **/tests/

@@ -377,6 +377,7 @@ def _run_tool_on_policy_stream(
     artifact_path: Path,
 ):
     import torch
+    import wandb
     from .executor import (
         JobExecutionError,
         tool_descriptors
@@ -392,17 +393,53 @@ def _run_tool_on_policy_stream(
         rank=options.lora_rank,
     )
 
+    # Initialize wandb
+    wandb_project = getattr(options, "wandb_project", None)
+    wandb_name = getattr(options, "wandb_name", None) or f"tool-on-policy-{job_id[:8]}"
+    wandb_run = None
+    if wandb_project:
+        wandb_run = wandb.init(
+            project=wandb_project,
+            name=wandb_name,
+            config={
+                "job_id": job_id,
+                "student_model": job.model.name,
+                "teacher_model": options.teacher,
+                "learning_rate": options.learning_rate,
+                "lora_rank": options.lora_rank,
+                "kl_penalty_coef": getattr(options, "kl_penalty_coef", 1.0),
+                "kl_discount_factor": getattr(options, "kl_discount_factor", 0.0),
+                "loss_fn": getattr(options, "loss_fn", "importance_sampling"),
+                "total_batches": total_batches,
+            },
+        )
+        logger.info("Job %s: wandb initialized. project=%s name=%s url=%s", job_id, wandb_project, wandb_name, wandb_run.url)
+        events.emit(
+            "Wandb logging initialized.",
+            code="tool_on_policy.wandb_initialized",
+            data={"project": wandb_project, "name": wandb_name, "url": wandb_run.url},
+        )
+    else:
+        logger.info("Job %s: wandb_project not set, skipping wandb logging.", job_id)
+
     training_dir = workspace / "training"
     training_dir.mkdir(parents=True, exist_ok=True)
 
-    async def _process_batch(batch_index: int, trajectories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    async def _process_batch(batch_index: int, trajectories: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Dict[str, float]]:
         items = []
         data_D = []
+        batch_metrics = {
+            "kl_sum": 0.0,
+            "kl_count": 0,
+            "advantage_sum": 0.0,
+            "advantage_sq_sum": 0.0,
+            "advantage_count": 0,
+        }
 
         async def _process_turn(
             turn_index: int, 
             turn: Dict[str, Any]
-        ) -> tuple[Dict[str, Any], tinker.Datum]:
+        ) -> tuple[Dict[str, Any], tinker.Datum, Dict[str, float]]:
             messages = turn["messages"]
             token_ids = turn["token_ids"]
             logprobs = turn["logprobs"]
@@ -470,28 +507,43 @@ def _run_tool_on_policy_stream(
                 } # use importance sampling as a surrogate
             )
 
+            n_tokens = len(token_ids)
+            n_reward = sum(reward_mask)
+            kl_vals = kl_tensor[torch.tensor(reward_mask, dtype=torch.bool)].tolist() if kl_tensor.numel() > 0 else []
+            adv_vals = advantages_tokens[mask_tensor.bool()].tolist() if advantages_tokens.numel() > 0 else []
+
+            turn_metrics = {
+                "kl_sum": sum(kl_vals),
+                "kl_count": len(kl_vals),
+                "advantage_sum": sum(adv_vals),
+                "advantage_sq_sum": sum(v * v for v in adv_vals),
+                "advantage_count": len(adv_vals),
+            }
+
             logger.info(
                 "Job %s: tool rollout batch=%d traj=%d tokens=%d reward_tokens=%d",
                 job_id,
                 batch_index,
                 turn_index,
-                len(token_ids),
-                sum(reward_mask),
+                n_tokens,
+                n_reward,
             )
 
-            return item, datum
+            return item, datum, turn_metrics
 
         results = await asyncio.gather(*[asyncio.create_task(_process_turn(i, turn)) for i, turn in enumerate(trajectories)])
-        for item, datum in results:
+        for item, datum, turn_metrics in results:
             items.append(item)
             data_D.append(datum)
+            for k in batch_metrics:
+                batch_metrics[k] += turn_metrics[k]
         
         # train!
         fwd_bwd_future = await training_client.forward_backward_async(
             data_D,
             loss_fn=getattr(options, "loss_fn", "importance_sampling"),
         )
-        _ = await fwd_bwd_future.result_async()
+        fwd_bwd_result = await fwd_bwd_future.result_async()
 
         adam_params = tinker.AdamParams(
             learning_rate=options.learning_rate,
@@ -502,10 +554,20 @@ def _run_tool_on_policy_stream(
         step_future = await training_client.optim_step_async(adam_params)
         await step_future.result_async()
 
+        # Extract loss from forward_backward result
+        loss_value = None
+        if hasattr(fwd_bwd_result, "loss"):
+            loss_value = float(fwd_bwd_result.loss)
+        elif isinstance(fwd_bwd_result, dict) and "loss" in fwd_bwd_result:
+            loss_value = float(fwd_bwd_result["loss"])
+        batch_metrics["loss"] = loss_value
+        logger.info("Job %s: fwd_bwd_result type=%s, loss=%s", job_id, type(fwd_bwd_result).__name__, loss_value)
+
         logger.info(
-            "Job %s: tool rollout batch=%d training step complete.",
+            "Job %s: tool rollout batch=%d training step complete. loss=%s",
             job_id,
             batch_index,
+            loss_value,
         )
         events.emit(
             "Tool rollout batch KL training step complete.",
@@ -513,7 +575,7 @@ def _run_tool_on_policy_stream(
             data={"batch_index": batch_index},
         )
 
-        return items
+        return items, batch_metrics
 
     async def _train_stream():
         save_every = max(1, getattr(options, "save_every", 1))
@@ -521,9 +583,39 @@ def _run_tool_on_policy_stream(
             save_every = total_batches
 
         last_checkpoint = None
+        global_step = 0
         for batch_index, trajectories in enumerate(rollout_stream):
-            batch_items = await _process_batch(batch_index, trajectories)
-            
+            batch_start = time.time()
+            batch_items, batch_metrics = await _process_batch(batch_index, trajectories)
+            batch_time = time.time() - batch_start
+            global_step += 1
+
+            # Log to wandb
+            if wandb_run:
+                log_data = {
+                    "progress/done_frac": (batch_index + 1) / total_batches if total_batches > 0 else 1.0,
+                    "optim/lr": options.learning_rate,
+                    "rollouts": len(trajectories),
+                    "time/total_seconds": batch_time,
+                    "time/per_step_seconds": batch_time / len(trajectories),
+                }
+                # Flatten log_data keys to not include folder/dir structure
+                if batch_metrics.get("loss") is not None:
+                    log_data["loss"] = batch_metrics["loss"]
+                if batch_metrics["kl_count"] > 0:
+                    log_data["kl_mean"] = batch_metrics["kl_sum"] / batch_metrics["kl_count"]
+                if batch_metrics["advantage_count"] > 0:
+                    adv_mean = batch_metrics["advantage_sum"] / batch_metrics["advantage_count"]
+                    adv_var = (batch_metrics["advantage_sq_sum"] / batch_metrics["advantage_count"]) - adv_mean ** 2
+                    log_data["advantage_mean"] = adv_mean
+                    log_data["advantage_std"] = adv_var ** 0.5 if adv_var > 0 else 0.0
+                # Flattened progress/time keys as well
+                flat_log_data = {}
+                for k, v in log_data.items():
+                    key = k.split("/")[-1] if "/" in k else k
+                    flat_log_data[key] = v
+                wandb_run.log(flat_log_data, step=global_step)
+
             if (batch_index + 1) % save_every == 0:
                 last_checkpoint = await checkpoint_utils.save_checkpoint_async(
                     training_client=training_client,
@@ -548,24 +640,28 @@ def _run_tool_on_policy_stream(
                     )
         return last_checkpoint
         
-    last_checkpoint = asyncio.run(_train_stream())
-    if not last_checkpoint:
-        last_checkpoint = asyncio.run(
-            checkpoint_utils.save_checkpoint_async(
-                training_client=training_client,
-                name="final",
-                log_path=str(training_dir),
-                loop_state={"batch": 0},
-                kind="sampler",
+    try:
+        last_checkpoint = asyncio.run(_train_stream())
+        if not last_checkpoint:
+            last_checkpoint = asyncio.run(
+                checkpoint_utils.save_checkpoint_async(
+                    training_client=training_client,
+                    name="final",
+                    log_path=str(training_dir),
+                    loop_state={"batch": 0},
+                    kind="sampler",
+                )
             )
-        )
-    if not last_checkpoint or "sampler_path" not in last_checkpoint:
-        raise JobExecutionError("Tool on-policy training did not produce a sampler checkpoint.")
+        if not last_checkpoint or "sampler_path" not in last_checkpoint:
+            raise JobExecutionError("Tool on-policy training did not produce a sampler checkpoint.")
 
-    return {
-        "checkpoint": last_checkpoint,
-        "training_dir": training_dir,
-    }
+        return {
+            "checkpoint": last_checkpoint,
+            "training_dir": training_dir,
+        }
+    finally:
+        if wandb_run:
+            wandb_run.finish()
 
 def _tool_rollout_stream(
     *,
