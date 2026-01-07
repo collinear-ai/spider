@@ -90,6 +90,8 @@ class OnPolicyConfig(BaseModel):
         description="Whether to compute post-kl metrics after each step"
     )
     save_every: int = Field(default=20, ge=0)
+    wandb_project: Optional[str] = Field(default=None, description="Wandb project name for logging")
+    wandb_name: Optional[str] = Field(default=None, description="Wandb run name")
 
 class GenerationConfig(BaseModel):
     duplications: int = Field(default=1, ge=1)
