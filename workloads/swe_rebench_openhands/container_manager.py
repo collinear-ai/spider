@@ -53,13 +53,15 @@ class ContainerManager:
         image = self.spec.docker_image
         if not image_exists(image):
             _run(["docker", "pull", image])
-        _run([
+        proc = _run([
             "docker", "run", "-d", 
             "--name", self.container_name,
             "-w", self.workdir,
             image,
             "sleep", "infinity",
         ])
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stdout.strip())
         self._apply_install_config()
 
     def cleanup(self) -> None:
