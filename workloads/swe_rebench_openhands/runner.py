@@ -6,11 +6,12 @@ import time
 import logging
 import subprocess
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from collections import deque
 from datasets import load_dataset
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Deque
 
 from spider.config import JobConfig, ToolConfig
 from server.on_policy import run_on_policy_job
@@ -32,6 +33,24 @@ class _RuntimeHandle:
     def cleanup(self) -> None:
         _CURRENT_RUNTIME.reset(self.token)
         self.runtime.cleanup()
+
+@dataclass
+class ImageCacheState:
+    max_batches_keep: int
+    recent_batches: Deque[Set[str]] = field(default_factory=deque)
+
+    def add(self, batch_images: Set[str]) -> None:
+        if not batch_images:
+            return
+        self.recent_batches.append(batch_images)
+        while len(self.recent_batches) > self.max_batches_keep:
+            self.recent_batches.popleft()
+
+    def recent_union(self) -> Set[str]:
+        union = set()
+        for batch_images in self.recent_batches:
+            union.update(batch_images)
+        return union
 
 def _runtime_factory(row: Dict[str, Any]) -> _RuntimeHandle:
     instance_id = row.get("instance_id", "unknown")
@@ -118,18 +137,6 @@ def _load_swe_rebench_instances(
         rows = [row for row in rows if row.get("instance_id") in wanted]
     return rows
 
-def _image_for_row(row: Dict[str, Any]) -> Optional[str]:
-    image = row.get("docker_image") or row.get("image_name")
-    return str(image) if image else None
-
-def _collect_batch_images(rows: List[Dict[str, Any]]) -> Set[str]:
-    images = set()
-    for row in rows:
-        image = _image_for_row(row)
-        if image:
-            images.add(image)
-    return images
-
 def _maybe_pull_image(image: str) -> None:
     if image_exists(image):
         return
@@ -169,6 +176,18 @@ def _pull_image(image: str) -> str:
     if proc.returncode != 0:
         raise RuntimeError(proc.stdout.strip())
     return proc.stdout
+
+def _collect_batch_images(rows: List[Dict[str, Any]]) -> Set[str]:
+    images = set()
+    for row in rows:
+        image = _image_for_row(row)
+        if image:
+            images.add(image)
+    return images
+
+def _image_for_row(row: Dict[str, Any]) -> Optional[str]:
+    image = row.get("docker_image") or row.get("image_name")
+    return str(image) if image else None
 
 def _prepull_images(
     rows: List[Dict[str, Any]],
@@ -273,6 +292,10 @@ def run_server_only(
 
     tool_registry = _build_tool_registry()
     image_prefetcher = _build_image_prefetcher(max_parallel=2)
+    image_cache_state = ImageCacheState(max_batches_keep=2)
+
+    def _on_batch_complete(rows):
+        image_cache_state.add(_collect_batch_images(rows))
 
     return run_on_policy_job(
         job_id="swe-rebench-openhands",
@@ -284,4 +307,5 @@ def run_server_only(
         runtime_factory=_runtime_factory,
         image_prefetcher=image_prefetcher,
         prefetch_batches=2,
+        on_batch_complete=_on_batch_complete,
     )
