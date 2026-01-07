@@ -90,6 +90,9 @@ class ToolRegistry:
     def _finish(self, args: Dict[str, Any]) -> str:
         return str(args.get("message", ""))
 
+    def _think(self, args: Dict[str, Any]) -> str:
+        return str(args.get("thought", ""))
+
     def _task_tracker(self, args: Dict[str, Any]) -> str:
         command = args.get("command")
         if command == "view":
