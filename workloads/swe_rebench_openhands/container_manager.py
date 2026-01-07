@@ -3,11 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 import time
 import json
+import logging
 import os
 import shlex
 import subprocess
 import tempfile
 from typing import Any, Dict, List, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 def _run(cmd: Sequence[str], *, check: bool = True, text: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, check=check, text=text, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -70,7 +73,11 @@ class ContainerManager:
     def create(self) -> None:
         image = self.spec.docker_image
         if not image_exists(image):
+            logger.info("Pulling Docker image: %s", image)
             _run(["docker", "pull", image])
+        else:
+            logger.info("Using cached Docker image: %s", image)
+            
         proc = _run([
             "docker", "run", "-d", 
             "--name", self.container_name,

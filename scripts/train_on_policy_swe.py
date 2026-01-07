@@ -1,3 +1,8 @@
+"""
+export TINKER_API_KEY=
+export HF_TOKEN=
+"""
+
 import sys
 from pathlib import Path
 import yaml
