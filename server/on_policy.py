@@ -593,23 +593,28 @@ def _run_tool_on_policy_stream(
             # Log to wandb
             if wandb_run:
                 log_data = {
-                    "progress/batch_count": batch_index,
                     "progress/done_frac": (batch_index + 1) / total_batches if total_batches > 0 else 1.0,
                     "optim/lr": options.learning_rate,
                     "rollouts": len(trajectories),
                     "time/total_seconds": batch_time,
                     "time/per_step_seconds": batch_time / len(trajectories),
                 }
+                # Flatten log_data keys to not include folder/dir structure
                 if batch_metrics.get("loss") is not None:
                     log_data["loss"] = batch_metrics["loss"]
                 if batch_metrics["kl_count"] > 0:
-                    log_data["kl/mean"] = batch_metrics["kl_sum"] / batch_metrics["kl_count"]
+                    log_data["kl_mean"] = batch_metrics["kl_sum"] / batch_metrics["kl_count"]
                 if batch_metrics["advantage_count"] > 0:
                     adv_mean = batch_metrics["advantage_sum"] / batch_metrics["advantage_count"]
                     adv_var = (batch_metrics["advantage_sq_sum"] / batch_metrics["advantage_count"]) - adv_mean ** 2
-                    log_data["advantage/mean"] = adv_mean
-                    log_data["advantage/std"] = adv_var ** 0.5 if adv_var > 0 else 0.0
-                wandb_run.log(log_data, step=global_step)
+                    log_data["advantage_mean"] = adv_mean
+                    log_data["advantage_std"] = adv_var ** 0.5 if adv_var > 0 else 0.0
+                # Flattened progress/time keys as well
+                flat_log_data = {}
+                for k, v in log_data.items():
+                    key = k.split("/")[-1] if "/" in k else k
+                    flat_log_data[key] = v
+                wandb_run.log(flat_log_data, step=global_step)
 
             if (batch_index + 1) % save_every == 0:
                 last_checkpoint = await checkpoint_utils.save_checkpoint_async(
