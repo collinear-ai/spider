@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import logging
 from typing import Any, Callable, Dict, List, Optional
 
 from .container_manager import ContainerManager
 
 ToolFn = Callable[[Dict[str, Any]], str]
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class TaskTracker:
@@ -43,8 +45,13 @@ class ToolRegistry:
         runtime = self._require_runtime()
         command = args.get("command", "")
         timeout = args.get("timeout")
+
         is_input = str(args.get("is_input", "false")).lower() == "true"
-        return runtime.exec_bash(command, timeout=timeout, is_input=is_input)
+        if is_input:
+            logger.warning("execute_bash received is_input=true; streaming input is not supported.")
+            return "execute_bash: is_input is not supported in this runtime."
+
+        return runtime.exec_bash(command, timeout=timeout)
 
     def _str_replace_editor(self, args: Dict[str, Any]) -> str:
         runtime = self._require_runtime()
