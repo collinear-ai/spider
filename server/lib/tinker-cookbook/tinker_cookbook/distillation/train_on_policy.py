@@ -396,23 +396,37 @@ def _build_alignment_groups(
         cur_s = []
         cur_t = []
 
+    def check_match() -> bool:
+        """Check if current groups match by comparing full decoded strings"""
+        if not cur_s or not cur_t:
+            return False
+        import unicodedata
+        s_full = unicodedata.normalize('NFC', 
+            student_tokenizer.decode([student_token_ids[idx] for idx in cur_s], skip_special_tokens=False))
+        t_full = unicodedata.normalize('NFC',
+            teacher_tokenizer.decode([teacher_token_ids[idx] for idx in cur_t], skip_special_tokens=False))
+        return s_full == t_full and s_full
+
     while i < len(student_pieces) or j < len(teacher_pieces):
-        if s_buf == t_buf and s_buf != "":
+        if check_match():
             flush()
             continue
+        
         if i < len(student_pieces) and (s_buf == "" or len(s_buf) <= len(t_buf)):
             s_buf += student_pieces[i]
             cur_s.append(i)
             i += 1
             continue
+        
         if j < len(teacher_pieces):
             t_buf += teacher_pieces[j]
             cur_t.append(j)
             j += 1
             continue
+        
         break
 
-    if s_buf == t_buf and s_buf != "":
+    if check_match():
         flush()
 
     return student_groups, teacher_groups
