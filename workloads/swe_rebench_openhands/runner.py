@@ -6,11 +6,12 @@ import time
 import logging
 import subprocess
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from collections import deque
 from datasets import load_dataset
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Deque
 
 from spider.config import JobConfig, ToolConfig
 from server.on_policy import run_on_policy_job
@@ -32,6 +33,24 @@ class _RuntimeHandle:
     def cleanup(self) -> None:
         _CURRENT_RUNTIME.reset(self.token)
         self.runtime.cleanup()
+
+@dataclass
+class ImageCacheState:
+    max_batches_keep: int
+    recent_batches: Deque[Set[str]] = field(default_factory=deque)
+
+    def add(self, batch_images: Set[str]) -> None:
+        if not batch_images:
+            return
+        self.recent_batches.append(batch_images)
+        while len(self.recent_batches) > self.max_batches_keep:
+            self.recent_batches.popleft()
+
+    def recent_union(self) -> Set[str]:
+        union = set()
+        for batch_images in self.recent_batches:
+            union.update(batch_images)
+        return union
 
 def _runtime_factory(row: Dict[str, Any]) -> _RuntimeHandle:
     instance_id = row.get("instance_id", "unknown")
@@ -118,9 +137,61 @@ def _load_swe_rebench_instances(
         rows = [row for row in rows if row.get("instance_id") in wanted]
     return rows
 
-def _image_for_row(row: Dict[str, Any]) -> Optional[str]:
-    image = row.get("docker_image") or row.get("image_name")
-    return str(image) if image else None
+def _maybe_pull_image(image: str) -> None:
+    if image_exists(image):
+        return
+    try:
+        _pull_image(image)
+    except Exception as exc:
+        logger.warning("Failed to prefetch image %s: %s", image, exc)
+
+def _prefetch_images_async(
+    images: Iterable[str],
+    *,
+    pool: ThreadPoolExecutor,
+) -> None:
+    for image in images:
+        pool.submit(_maybe_pull_image, image)
+
+def _list_running_container_images() -> Set[str]:
+    proc = subprocess.run(
+        ["docker", "ps", "--format", f"{{.Image}}"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+def _list_local_images() -> Set[str]:
+    proc = subprocess.run(
+        ["docker", "image", "ls", "--format", f"{{.Repository}}:{{.Tag}}"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    images = set()
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line or line == "<none>:<none>":
+            continue
+        images.add(line)
+    return images
+
+def _prune_unused_images(keep_images: Set[str]) -> None:
+    running = _list_running_container_images()
+    local = _list_local_images()
+    candidates = sorted(local - keep_images - running)
+    if not candidates:
+        return
+    subprocess.run(
+        ["docker", "rmi", "-f", *candidates],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
 
 def _pull_image(image: str) -> str:
     proc = subprocess.run(
@@ -133,6 +204,18 @@ def _pull_image(image: str) -> str:
     if proc.returncode != 0:
         raise RuntimeError(proc.stdout.strip())
     return proc.stdout
+
+def _collect_batch_images(rows: List[Dict[str, Any]]) -> Set[str]:
+    images = set()
+    for row in rows:
+        image = _image_for_row(row)
+        if image:
+            images.add(image)
+    return images
+
+def _image_for_row(row: Dict[str, Any]) -> Optional[str]:
+    image = row.get("docker_image") or row.get("image_name")
+    return str(image) if image else None
 
 def _prepull_images(
     rows: List[Dict[str, Any]],
@@ -186,7 +269,7 @@ def _build_prompt(row: Dict[str, Any]) -> str:
     test_cmd = install_cfg.get("test_cmd") if isinstance(install_cfg, dict) else ""
 
     repo_dir = repo.replace("/", "__") if repo else "repo"
-    uploaded_path = f"/workspace/{repo_dir}"
+    uploaded_path = "/testbed"
 
     template_path = Path(__file__).parent / "prompts" / "user.txt"
     template = template_path.read_text(encoding="utf-8")
@@ -216,6 +299,9 @@ def run_server_only(
     instance_ids: Optional[List[str]] = None,
     schema_path: Optional[Path] = None,
     job_env: Optional[Dict[str, str]] = None,
+    on_batch_start_lookahead: int = 2,
+    prefetch_max_workers: int = 2,
+    max_batches_keep: int = 2,
 ) -> Any:
     schema_path = schema_path or (Path(__file__).parent / "schemas.json")
     tool_schemas = _load_tool_schemas(schema_path)
@@ -226,7 +312,7 @@ def run_server_only(
         job.generation.system_prompt = system_prompt_path.read_text(encoding="utf-8")
 
     _cleanup_existing_containers()
-    
+
     rows = _load_swe_rebench_instances(
         split=split, 
         instance_ids=instance_ids,
@@ -235,9 +321,18 @@ def run_server_only(
     for row in rows:
         row["prompt"] = _build_prompt(row)
 
-    _prepull_images(rows, workspace=workspace)
-
     tool_registry = _build_tool_registry()
+    image_cache_state = ImageCacheState(max_batches_keep=max_batches_keep)
+    prefetch_pool = ThreadPoolExecutor(max_workers=prefetch_max_workers)
+
+    def _on_batch_start(rows):
+        images = _collect_batch_images(rows)
+        _prefetch_images_async(images, pool=prefetch_pool)
+
+    def _on_batch_complete(rows):
+        image_cache_state.add(_collect_batch_images(rows))
+        _prune_unused_images(image_cache_state.recent_union())
+
     return run_on_policy_job(
         job_id="swe-rebench-openhands",
         job=job,
@@ -246,4 +341,7 @@ def run_server_only(
         prompts=rows,
         tool_registry=tool_registry,
         runtime_factory=_runtime_factory,
+        on_batch_start=_on_batch_start,
+        on_batch_start_lookahead=on_batch_start_lookahead,
+        on_batch_complete=_on_batch_complete,
     )

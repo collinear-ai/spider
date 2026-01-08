@@ -1,3 +1,8 @@
+"""
+export TINKER_API_KEY=
+export HF_TOKEN=
+"""
+
 import sys
 from pathlib import Path
 import yaml
@@ -18,6 +23,9 @@ def main():
         job=job,
         workspace=Path("./workspace"),
         split="filtered",
+        on_batch_start_lookahead=2,
+        prefetch_max_workers=2,
+        max_batches_keep=2,
     )
 
 if __name__ == "__main__":

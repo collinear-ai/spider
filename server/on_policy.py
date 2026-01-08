@@ -4,7 +4,7 @@ from pdb import run
 from token import LPAR
 import asyncio, logging, os, shutil, tarfile, urllib.request, zipfile, time
 from pathlib import Path
-from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional, Callable, TypedDict, final
+from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional, Callable, Deque, Set
 from urllib.parse import urlparse
 import blobfile
 
@@ -130,6 +130,9 @@ def run_on_policy_job(
     prompts: Optional[List[Dict[str, Any]]] = None,
     tool_registry: Optional[Dict[str, Callable[..., Any]]] = None,
     runtime_factory: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    on_batch_start: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+    on_batch_start_lookahead: int = 0,
+    on_batch_complete: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
 ):
     from .executor import (
         JobExecutionResult,
@@ -180,6 +183,9 @@ def run_on_policy_job(
             prompts=prompt_rows,
             tool_registry=tool_registry,
             runtime_factory=runtime_factory,
+            on_batch_start=on_batch_start,
+            on_batch_start_lookahead=on_batch_start_lookahead,
+            on_batch_complete=on_batch_complete,
         )
         events.emit(
             "Finished Setup for tool rollouts streaming for on-policy distillation.",
@@ -671,6 +677,9 @@ def _tool_rollout_stream(
     prompts: List[str],
     tool_registry: Dict[str, Callable[..., Any]],
     runtime_factory: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    on_batch_start: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+    on_batch_start_lookahead: int = 0,
+    on_batch_complete: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
 ) -> Iterable[List[Dict[str, Any]]]:
     from concurrent.futures import ThreadPoolExecutor
     from .executor import _initial_chat_history, _call_backend_chat, _execute_tool_calls, tool_descriptors, JobExecutionError
@@ -812,9 +821,21 @@ def _tool_rollout_stream(
         return turn_items
 
     for batch_index, start in enumerate(range(0, len(prompts), batch_size)):
+        if on_batch_start and on_batch_start_lookahead > 0:
+            for ahead in range(1, on_batch_start_lookahead + 1):
+                next_start = start + ahead * batch_size
+                if next_start >= len(prompts):
+                    break
+                next_chunk = prompts[next_start: next_start + batch_size]
+                on_batch_start(next_chunk)
+
         chunk = prompts[start: start + batch_size]
         with ThreadPoolExecutor(max_workers=min(len(chunk), 8)) as pool:
             results = list(pool.map(_run_prompt, chunk))
+
+        if on_batch_complete is not None:
+            on_batch_complete(chunk)
+
         turns = [turn for per_prompt in results for turn in per_prompt]
         events.emit(
             "Tool rollout batch ready.",
