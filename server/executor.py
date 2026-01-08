@@ -1005,6 +1005,13 @@ def _execute_tool_calls(
         except Exception as exc:
             success = False
             result = {"error": str(exc)}
+            logger.warning(
+                "Job %s: tool `%s` failed. %s: %s",
+                job_id,
+                tool_name,
+                exc.__class__.__name__,
+                exc,
+            )
         payload = _serialize_tool_output(result)
         tool_message = {
             "role": "tool",
