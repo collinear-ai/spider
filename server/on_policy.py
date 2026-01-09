@@ -139,10 +139,7 @@ def run_on_policy_job(
         JobExecutionError,
         _base_metadata,
         _resolve_processor,
-        _summarize_metrics,
         _write_metadata,
-        _shutdown_backend,
-        _tool_batch_worker,
     )
     options = job.generation.on_policy_options
     if not options:
@@ -565,7 +562,7 @@ def _run_tool_on_policy_stream(
         elif isinstance(fwd_bwd_result, dict) and "loss" in fwd_bwd_result:
             loss_value = float(fwd_bwd_result["loss"])
         batch_metrics["loss"] = loss_value
-        logger.info("Job %s: fwd_bwd_result type=%s, loss=%s", job_id, type(fwd_bwd_result).__name__, loss_value)
+        logger.info("fwd_bwd_result type=%s, loss=%s", type(fwd_bwd_result).__name__, loss_value)
 
         logger.info(
             "tool rollout batch=%d training step complete. loss=%s",

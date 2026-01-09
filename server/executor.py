@@ -658,11 +658,11 @@ def _tool_batch_worker(
             )
         except JobExecutionError as exc:
             if _is_vllm_parse_error(exc):
-                logger.warning("Job %s: skipping prompt due to vLLM parse error: %s", job_id, exc)
+                logger.warning("Skipping prompt due to vLLM parse error: %s", exc)
                 return {}
             raise
         except Exception as exc:
-            logger.exception("Job %s: prompt worker crashed while handling `%s`.", job_id, prompt[:20])
+            logger.exception("Prompt worker crashed while handling `%s`.", prompt[:20])
             raise
 
         if transcript and transcript[-1].get("role") == "assistant":
@@ -723,13 +723,12 @@ def _multi_turn_batch_worker(
             )
         except JobExecutionError as exc:
             if _is_vllm_parse_error(exc):
-                logger.warning("Job %s: skipping prompt due to vLLM parse error: %s", job_id, exc)
+                logger.warning("Skipping prompt due to vLLM parse error: %s", exc)
                 return {}
             raise
         except Exception:
             logger.exception(
-                "Job %s: user-sim worker crashed while handling `%s`.",
-                job_id,
+                "User-sim worker crashed while handling `%s`.",
                 prompt[:20],
             )
             raise
@@ -789,16 +788,13 @@ def _run_prompt_with_user_simulation(
 
     history = _initial_chat_history(prompt, job)
 
-    prompt_preview = prompt.replace("\n", "\\n")
-    prompt_preview = prompt_preview[:40] + ("..." if len(prompt_preview) > 80 else "")
-    logger.info("Job %s: user-sim runner invoked for prompt `%s`", job_id, prompt_preview)
+    logger.info("User-sim runner invoked for prompt `%s...`", prompt[:16])
 
     for turn_idx in range(turn_limit):
         logger.info(
-            "Job %s: starting assistant turn %d for prompt `%s`",
-            job_id,
+            "Starting assistant turn %d for prompt `%s...`",
             turn_idx,
-            prompt_preview,
+            prompt[:16],
         )
         assistant_message = _call_backend_chat(
             backend=backend,
@@ -821,10 +817,9 @@ def _run_prompt_with_user_simulation(
             break
 
         logger.info(
-            "Job %s: simulating user turn %d for prompt `%s`",
-            job_id,
+            "Simulating user turn %d for prompt `%s...`",
             turn_idx,
-            prompt_preview,
+            prompt[:16],
         )
         user_content = _call_user_simulation(
             history=history,
@@ -858,16 +853,13 @@ def _run_prompt_with_tools(
         from tinker_cookbook import model_info
         renderer_name = model_info.get_recommended_renderer_name(base_model)
 
-    prompt_preview = prompt.replace("\n", "\\n")
-    prompt_preview = prompt_preview[:40] + ("..." if len(prompt_preview) > 80 else "")
-    logger.info("Job %s: Tool-runner invoked for prompt `%s`", job_id, prompt_preview)
+    logger.info("Tool-runner invoked for prompt `%s...`", prompt[:16])
 
     for turn_idx in range(turn_limit):
         logger.info(
-            "Job %s: starting turn %d for prompt `%s`",
-            job_id,
+            "Starting turn %d for prompt `%s...`",
             turn_idx,
-            prompt_preview
+            prompt[:16]
         )
         try:
             assistant_message = _call_backend_chat(
@@ -889,10 +881,9 @@ def _run_prompt_with_tools(
             raise
 
         logger.info(
-            "Job %s: assistant turn %d for prompt `%s` returned keys=%s tool_calls=%s",
-            job_id,
+            "Assistant turn %d for prompt `%s...` returned keys=%s tool_calls=%s",
             turn_idx,
-            prompt_preview,
+            prompt[:16],
             sorted(list(assistant_message.keys())),
             bool(assistant_message.get("tool_calls")) 
         )
@@ -909,9 +900,8 @@ def _run_prompt_with_tools(
         tool_calls = assistant_message.get("tool_calls") or []
         if not tool_calls:
             logger.info(
-                "Job %s: trajectory finished for prompt `%s'",
-                job_id,
-                prompt_preview,
+                "Trajectory finished for prompt `%s...'",
+                prompt[:16],
             )
             return history
         
@@ -922,8 +912,7 @@ def _run_prompt_with_tools(
         )
 
     logger.warning(
-        "Job %s: tool-enabled generation exceeded %d turns without reaching a final response.",
-        job_id,
+        "Tool-enabled generation exceeded %d turns without reaching a final response.",
         turn_limit,
     )
     return history
