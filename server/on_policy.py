@@ -681,13 +681,23 @@ def _tool_rollout_stream(
     on_batch_start_lookahead: int = 0,
     on_batch_complete: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
 ) -> Iterable[List[Dict[str, Any]]]:
+    import threading
+    from tinker_cookbook.tokenizer_utils import get_tokenizer
     from concurrent.futures import ThreadPoolExecutor
     from .executor import _initial_chat_history, _call_backend_chat, _execute_tool_calls, tool_descriptors, JobExecutionError
 
     tool_defs = tool_descriptors(job.tools)
     turn_limit = max(1, job.generation.max_turns or 16)
+    thread_state = threading.local()
 
     batch_size, total_batches = _compute_batch_stats(prompts, job.generation.on_policy_options)
+
+    def _get_thread_tokenizer() -> Any:
+        tokenizer = getattr(thread_state, "tokenizer", None)
+        if tokenizer is None:
+            tokenizer = get_tokenizer(job.model.name)
+            thread_state.tokenizer = tokenizer
+        return tokenizer
 
     def _run_prompt(row: Dict[str, Any]) -> List[Dict[str, Any]]:
         prompt = row["prompt"]
@@ -695,6 +705,7 @@ def _tool_rollout_stream(
         transcript = []
         turn_items = []
         runtime = None
+        tokenizer = _get_thread_tokenizer()
 
         if runtime_factory:
             runtime = runtime_factory(row)
@@ -708,6 +719,7 @@ def _tool_rollout_stream(
                         tools=tool_defs,
                         parameters=job.generation.parameters,
                         include_logprobs=True,
+                        tokenizer=tokenizer,
                         model_name=job.model.name,
                     )
                 except Exception as exc:

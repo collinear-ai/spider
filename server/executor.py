@@ -1075,15 +1075,20 @@ def _call_backend_chat(
     tools: List[Dict[str, Any]],
     parameters: Dict[str, Any],
     include_logprobs: bool = False,
+    tokenizer: Any | None = None,
     model_name: str | None = None,
 ) -> Dict[str, Any]:
     if _is_tinker_backend(backend):
+        if tokenizer is None:
+            raise JobExecutionError("Tinker backend requires a tokenizer passed from caller.")
+            
         return _tinker_chat_and_logprobs(
             sampling_client=backend,
             messages=messages,
             tools=tools,
             parameters=parameters,
             include_logprobs=include_logprobs,
+            tokenizer=tokenizer,
             model_name=model_name
         )
 
@@ -1165,11 +1170,11 @@ def _tinker_chat_and_logprobs(
     tools: List[Dict[str, Any]],
     parameters: Dict[str, Any],
     include_logprobs: bool,
+    tokenizer: Any,
     model_name: str | None = None,
 ) -> Dict[str, Any]:
     import tinker
     from tinker_cookbook import renderers, model_info
-    from tinker_cookbook.tokenizer_utils import get_tokenizer
     from .vllm_parsers import parse_assistant_turn
     from .backends.vllm_backend import _default_tool_parser, _default_reasoning_parser
 
@@ -1178,7 +1183,6 @@ def _tinker_chat_and_logprobs(
         raise JobExecutionError("Tinker sampling client missing model id in org/name form.")
 
     renderer_name = model_info.get_recommended_renderer_name(base_model or "")
-    tokenizer = get_tokenizer(base_model or "")
 
     prompt_text = tokenizer.apply_chat_template(
         messages,
