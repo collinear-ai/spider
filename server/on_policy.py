@@ -389,7 +389,6 @@ def _run_tool_on_policy_stream(
         tool_descriptors
     )
     from tinker_cookbook.rl.metrics import discounted_future_sum_vectorized
-    from .executor import _initial_chat_history, _execute_tool_calls, _call_backend_chat
 
     tool_defs = tool_descriptors(job.tools)
     service_client = tinker.ServiceClient()
@@ -527,8 +526,7 @@ def _run_tool_on_policy_stream(
             }
 
             logger.info(
-                "Job %s: tool rollout batch=%d traj=%d tokens=%d reward_tokens=%d",
-                job_id,
+                "tool rollout batch=%d turn=%d n_tokens=%d n_reward_tokens=%d",
                 batch_index,
                 turn_index,
                 n_tokens,
@@ -570,7 +568,7 @@ def _run_tool_on_policy_stream(
         logger.info("Job %s: fwd_bwd_result type=%s, loss=%s", job_id, type(fwd_bwd_result).__name__, loss_value)
 
         logger.info(
-            "Job %s: tool rollout batch=%d training step complete. loss=%s",
+            "tool rollout batch=%d training step complete. loss=%s",
             job_id,
             batch_index,
             loss_value,
@@ -634,8 +632,7 @@ def _run_tool_on_policy_stream(
                 if sampler_path:
                     sampler_ctx.refresh_from_sampler_path(sampler_path)
                     logger.info(
-                        "Job %s: refreshed student sampler from checkpoint at batch=%d path=%s.",
-                        job_id,
+                        "Refreshed student sampler from checkpoint at batch=%d path=%s.",
                         batch_index,
                         sampler_path,
                     )
@@ -746,7 +743,6 @@ def _tool_rollout_stream(
     def _run_prompt(row: Dict[str, Any]) -> List[Dict[str, Any]]:
         prompt = row["prompt"]
         history = _initial_chat_history(prompt, job)
-        transcript = []
         turn_items = []
         runtime = None
         tokenizer = _get_thread_tokenizer()
@@ -804,9 +800,8 @@ def _tool_rollout_stream(
                     if lp is None and int(m) == 0
                 )
                 logger.info(
-                    "Job %s: prompt=`%s...` logprobs None=%d masked=%d none_on_masked=%d none_idx=%s. Setting None to 0.0...",
-                    job_id,
-                    prompt[:20],
+                    "prompt=`%s...` logprobs None=%d masked=%d none_on_masked=%d none_idx=%s. Setting None to 0.0...",
+                    prompt[:8],
                     none_count,
                     masked_count,
                     none_on_masked,
@@ -847,11 +842,11 @@ def _tool_rollout_stream(
                     match,
                 )
 
-                messages = list(history) + [snapshot]
+                history.append(snapshot)
                 turn_items.append(
                     {
                         "prompt": prompt,
-                        "messages": messages,
+                        "messages": list(history),
                         "token_ids": token_ids,
                         "logprobs": logprobs,
                         "reward_mask": reward_mask,
@@ -866,18 +861,13 @@ def _tool_rollout_stream(
                     }
                 )
 
-                transcript.append(snapshot)
-                history.append(snapshot)
-
                 if not tool_calls:
                     break
 
                 _execute_tool_calls(
                     tool_calls=tool_calls,
                     tool_registry=tool_registry,
-                    transcript=transcript,
                     history=history,
-                    job_id=job_id,
                 )
 
             all_turns_match = all(item.get("retokenize_match") for item in turn_items)

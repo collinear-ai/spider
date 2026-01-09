@@ -788,7 +788,6 @@ def _run_prompt_with_user_simulation(
         )
 
     history = _initial_chat_history(prompt, job)
-    transcript = [dict(message) for message in history]
 
     prompt_preview = prompt.replace("\n", "\\n")
     prompt_preview = prompt_preview[:40] + ("..." if len(prompt_preview) > 80 else "")
@@ -816,7 +815,6 @@ def _run_prompt_with_user_simulation(
         }
         if reasoning:
             assistant_snapshot["reasoning"] = reasoning
-        transcript.append(assistant_snapshot)
         history.append(assistant_snapshot)
 
         if turn_idx >= turn_limit - 1:
@@ -838,10 +836,9 @@ def _run_prompt_with_user_simulation(
             "role": "user",
             "content": user_content,
         }
-        transcript.append(user_snapshot)
         history.append(user_snapshot)
 
-    return transcript
+    return history
 
 def _run_prompt_with_tools(
     *,
@@ -854,7 +851,6 @@ def _run_prompt_with_tools(
     job_id: str,
 ) -> List[Dict[str, Any]]:
     history = _initial_chat_history(prompt, job)
-    transcript = [dict(message) for message in history]
 
     base_model = job.model.name
     renderer_name = None
@@ -886,11 +882,10 @@ def _run_prompt_with_tools(
             msg = str(exc).lower()
             if "max_tokens" in msg: # hit max token limit
                 logger.warning(
-                    "Job %s: max token reached during tool chat at turn %d; returning partial transcript.",
-                    job_id,
+                    "Max token reached during tool chat at turn %d; returning partial transcript.",
                     turn_idx,
                 )
-                return transcript
+                return history
             raise
 
         logger.info(
@@ -910,7 +905,6 @@ def _run_prompt_with_tools(
         if reasoning:
             snapshot["reasoning"] = reasoning
 
-        transcript.append(snapshot)
         history.append(snapshot)
         tool_calls = assistant_message.get("tool_calls") or []
         if not tool_calls:
@@ -919,14 +913,12 @@ def _run_prompt_with_tools(
                 job_id,
                 prompt_preview,
             )
-            return transcript
+            return history
         
         _execute_tool_calls(
             tool_calls=tool_calls,
             tool_registry=tool_registry,
-            transcript=transcript,
             history=history,
-            job_id=job_id,
         )
 
     logger.warning(
@@ -934,15 +926,13 @@ def _run_prompt_with_tools(
         job_id,
         turn_limit,
     )
-    return transcript
+    return history
 
 def _execute_tool_calls(
     *,
     tool_calls: List[Dict[str, Any]],
     tool_registry: Dict[str, Callable[..., Any]],
-    transcript: List[Dict[str, Any]],
     history: List[Dict[str, Any]],
-    job_id: str,
 ) -> None:
     for call in tool_calls:
         call = _as_dict(call)
@@ -957,8 +947,7 @@ def _execute_tool_calls(
                 "Please choose one of the provided tools."
             )
             logger.warning(
-                "Job %s: assistant requested unknown tool `%s`",
-                job_id,
+                "Assistant requested unknown tool `%s`",
                 tool_name,
             )
             tool_message = {
@@ -967,25 +956,21 @@ def _execute_tool_calls(
                 "content": warning,
                 "tool_call_id": call.get("id"),
             }
-            transcript.append(tool_message) # TODO: do we need both?
             history.append(dict(tool_message))
             continue
 
         raw_args = function_call.get("arguments") or "{}"
-        message_idx = len(transcript) - 1
+        message_idx = len(history) - 1
         logger.info(
-            "Job %s: invoking tool `%s` (message_idx=%d) args=%s",
-            job_id,
+            "Invoking tool `%s` (message_idx=%d)",
             tool_name,
             message_idx,
-            raw_args,
         )
         try:
             tool_args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
         except (TypeError, ValueError) as exc:
             logger.warning(
-                "Job %s: tool `%s` received invalid arguments; args=%s",
-                job_id,
+                "Tool `%s` received invalid JSON arguments; args=%s",
                 tool_name,
                 raw_args,
             )
@@ -995,7 +980,6 @@ def _execute_tool_calls(
                 "content": "Tool call failed: arguments were not valid JSON.",
                 "tool_call_id": call.get("id"),
             }
-            transcript.append(tool_message)
             history.append(dict(tool_message))
             continue
 
@@ -1006,8 +990,7 @@ def _execute_tool_calls(
             success = False
             result = {"error": str(exc)}
             logger.warning(
-                "Job %s: tool `%s` failed. %s: %s",
-                job_id,
+                "Tool `%s` failed. %s: %s",
                 tool_name,
                 exc.__class__.__name__,
                 exc,
@@ -1019,11 +1002,9 @@ def _execute_tool_calls(
             "content": payload,
             "tool_call_id": call.get("id"),
         }
-        transcript.append(tool_message)
         history.append(dict(tool_message))
         logger.info(
-            "Job %s: Tool %s invoked. Success: %s", 
-            job_id,
+            "Tool %s invoked. Success: %s", 
             tool_name, 
             success,
         )
