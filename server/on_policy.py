@@ -684,13 +684,57 @@ def _tool_rollout_stream(
     import threading
     from tinker_cookbook.tokenizer_utils import get_tokenizer
     from concurrent.futures import ThreadPoolExecutor
-    from .executor import _initial_chat_history, _call_backend_chat, _execute_tool_calls, tool_descriptors, JobExecutionError
+    from .executor import (
+        _initial_chat_history, 
+        _call_backend_chat, 
+        _execute_tool_calls, 
+        tool_descriptors, 
+        JobExecutionError,
+        _model_input_tokens,
+    )
 
     tool_defs = tool_descriptors(job.tools)
     turn_limit = max(1, job.generation.max_turns or 16)
     thread_state = threading.local()
 
     batch_size, total_batches = _compute_batch_stats(prompts, job.generation.on_policy_options)
+
+    def _retokenize_last_turn_with_history(
+        *,
+        tokenizer: Any,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        assistant_snapshot: Dict[str, Any],
+    ) -> List[int]:
+        prompt_text_before = tokenizer.apply_chat_template(
+            messages,
+            tools=tools or None,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        prompt_tokens_before = _model_input_tokens(prompt_text_before, tokenizer=tokenizer)
+
+        messages_with_assistant = messages + [assistant_snapshot]
+        prompt_text_after = tokenizer.apply_chat_template(
+            messages_with_assistant,
+            tools=tools or None,
+            add_generation_prompt=False,
+            tokenize=False,
+        )
+        if not prompt_text_after.startswith(prompt_text_before):
+            logger.warning(
+                "Prompt text prefix mismatch after adding assistant turn."
+            )
+            return []
+
+        prompt_tokens_after = _model_input_tokens(prompt_text_after, tokenizer=tokenizer)
+        if prompt_tokens_after[:len(prompt_tokens_before)] != prompt_tokens_before:
+            logger.warning(
+                "Prompt token prefix mismatch after adding assistant turn."
+            )
+            return []
+
+        return list(prompt_tokens_after[len(prompt_tokens_before):])
 
     def _get_thread_tokenizer() -> Any:
         tokenizer = getattr(thread_state, "tokenizer", None)
@@ -777,14 +821,6 @@ def _tool_rollout_stream(
                 content = assistant_message.get("content", "")
                 tool_calls = assistant_message.get("tool_calls")
 
-                logger.info(
-                    "Job %s: prompt=`%s...` turn=%d tool_returned=%s",
-                    job_id,
-                    prompt[:20],
-                    turn_idx,
-                    bool(tool_calls),
-                )
-
                 snapshot = {
                     "role": "assistant",
                     "content": content,
@@ -793,6 +829,23 @@ def _tool_rollout_stream(
                 reasoning = assistant_message.get("reasoning")
                 if reasoning:
                     snapshot["reasoning"] = reasoning
+
+                # tokenization consistency check
+                retokenized = _retokenize_last_turn_with_history(
+                    tokenizer=tokenizer,
+                    messages=history,
+                    tools=tool_defs,
+                    assistant_snapshot=snapshot,
+                )
+                match = retokenized == token_ids[assistant_message.get("prompt_token_count", 0):]
+
+                logger.info(
+                    "prompt=`%s...` turn=%d tool_returned=%s retokenized_matched=%s",
+                    prompt[:8],
+                    turn_idx,
+                    bool(tool_calls),
+                    match,
+                )
 
                 messages = list(history) + [snapshot]
                 turn_items.append(
@@ -809,6 +862,7 @@ def _tool_rollout_stream(
                         "prompt_token_count": assistant_message.get("prompt_token_count", 0),
                         "parser_fallback": assistant_message.get("parser_fallback", False),
                         "turn_index": turn_idx,
+                        "retokenize_match": match,
                     }
                 )
 
@@ -825,6 +879,8 @@ def _tool_rollout_stream(
                     history=history,
                     job_id=job_id,
                 )
+
+            all_turns_match = all(item.get("retokenize_match") for item in turn_items)
 
         finally:
             if runtime is not None:
