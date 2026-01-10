@@ -73,6 +73,10 @@ def parse_assistant_turn(
             except Exception:
                 parser_fallback = True
 
+    # handle tokenizer vs parser mismatch
+    if content and not content.strip():
+        content = ""
+
     return ParsedTurn(
         content=content or "",
         reasoning=reasoning,
