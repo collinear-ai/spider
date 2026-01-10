@@ -816,9 +816,9 @@ def _tool_rollout_stream(
                     "content": content,
                     "tool_calls": tool_calls,
                 }
-                reasoning = assistant_message.get("reasoning")
-                if reasoning:
-                    snapshot["reasoning"] = reasoning
+                reasoning_content = assistant_message.get("reasoning")
+                if reasoning_content:
+                    snapshot["reasoning_content"] = reasoning_content
 
                 # tokenization consistency check
                 retokenized = _retokenize_last_turn_with_history(
@@ -853,7 +853,7 @@ def _tool_rollout_stream(
                         "logprobs": logprobs,
                         "reward_mask": reward_mask,
                         "assistant_content": content,
-                        "assistant_reasoning": reasoning,
+                        "assistant_reasoning_content": reasoning_content,
                         "assistant_tool_calls": tool_calls,
                         "assistant_raw_text": assistant_message.get("assistant_raw_text"),
                         "prompt_token_count": assistant_message.get("prompt_token_count", 0),
