@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pdb import run
+from re import L
 from token import LPAR
 import asyncio, logging, os, shutil, tarfile, urllib.request, zipfile, time
 from pathlib import Path
@@ -699,6 +700,14 @@ def _tool_rollout_stream(
         tools: List[Dict[str, Any]],
         assistant_snapshot: Dict[str, Any],
     ) -> List[int]:
+        content = assistant_snapshot.get("content") or ""
+        tool_calls = assistant_snapshot.get("tool_calls")
+        logger.info(
+            "retok_last_turn: content=%s tool_calls=%s",
+            _preview_literal(content),
+            _preview_literal(tool_calls),
+        )
+
         prompt_text_before = tokenizer.apply_chat_template(
             messages,
             tools=tools or None,
@@ -1199,8 +1208,15 @@ def _log_tokenization_mismatch(
     actual_next = completion_tokens[mismatch_at:mismatch_at + 8]
 
     logger.warning(
-        "retok_mismatch: common_txt=`...%r` retok_next=`%r...` actual_next=`%r...`",
+        "retok_mismatch: common_txt=...%r retok_next=%r... actual_next=%r...",
         tokenizer.decode(common_ids, skip_special_tokens=False),
         tokenizer.decode(retok_next, skip_special_tokens=False),
         tokenizer.decode(actual_next, skip_special_tokens=False),
     )
+
+def _preview_literal(value: Any, limit: int = 8) -> str:
+    if value is None:
+        return "None"
+    if not isinstance(value, str):
+        value = repr(value)
+    return repr(value[:limit])
