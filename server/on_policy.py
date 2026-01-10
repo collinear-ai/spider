@@ -730,6 +730,25 @@ def _tool_rollout_stream(
 
         return list(prompt_tokens_after[len(prompt_tokens_before):])
 
+    def _match_retokenized(
+        *,
+        tokenizer: Any,
+        retokenized: List[int],
+        completion_tokens: List[int],
+    ) -> bool:
+        if retokenized == completion_tokens:
+            return True
+        
+        decoded = tokenizer.decode(retokenized, skip_special_tokens=False)
+        if not decoded.endswith("\n"):
+            return False
+        
+        trimmed = decoded.rstrip("\n")
+        trimmed_ids = _model_input_tokens(trimmed, tokenizer=tokenizer)
+        if trimmed_ids == completion_tokens:
+            return True
+        return False
+
     def _get_thread_tokenizer() -> Any:
         tokenizer = getattr(thread_state, "tokenizer", None)
         if tokenizer is None:
@@ -829,7 +848,12 @@ def _tool_rollout_stream(
                     assistant_snapshot=snapshot,
                 )
                 completion_tokens = token_ids[assistant_message.get("prompt_token_count", 0):]
-                match = retokenized == completion_tokens
+                
+                match = _match_retokenized(
+                    tokenizer=tokenizer,
+                    retokenized=retokenized,
+                    completion_tokens=completion_tokens,
+                )
                 if not match:
                     _log_tokenization_mismatch(
                         tokenizer=tokenizer, 
