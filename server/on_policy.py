@@ -700,14 +700,6 @@ def _tool_rollout_stream(
         tools: List[Dict[str, Any]],
         assistant_snapshot: Dict[str, Any],
     ) -> List[int]:
-        content = assistant_snapshot.get("content") or ""
-        tool_calls = assistant_snapshot.get("tool_calls")
-        logger.info(
-            "retok_last_turn: content=%s tool_calls=%s",
-            _preview_literal(content),
-            _preview_literal(tool_calls),
-        )
-
         prompt_text_before = tokenizer.apply_chat_template(
             messages,
             tools=tools or None,
@@ -1199,7 +1191,19 @@ def _log_tokenization_mismatch(
             mismatch_at = idx
             break
     if mismatch_at is None:
-        logger.warning("Match returns False while token-wise check returns True up to shorter length. Mismatch is in truncated part.")
+        longer= "retokenized" if len(retokenized) > len(completion_tokens) else "actual"
+        common_ids = retokenized[:limit]
+        extra_ids = (
+            retokenized[limit:limit + 8]
+            if longer == "retokenized" 
+            else completion_tokens[limit:limit + 8]
+        )
+        logger.warning(
+            "retok_mismatch: longer=%s common_tail=%r extra_next=%r",
+            longer,
+            tokenizer.decode(common_ids[-8:], skip_special_tokens=False),
+            tokenizer.decode(extra_ids, skip_special_tokens=False),
+        )
         return
     
     common_start = max(0, mismatch_at - 8)
