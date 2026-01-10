@@ -566,7 +566,6 @@ def _run_tool_on_policy_stream(
 
         logger.info(
             "tool rollout batch=%d training step complete. loss=%s",
-            job_id,
             batch_index,
             loss_value,
         )
@@ -762,8 +761,7 @@ def _tool_rollout_stream(
                 except Exception as exc:
                     if _is_context_window_error(exc):
                         logger.warning(
-                            "Job %s: prompt=`%s...` turn=%d exceeded context window; ending trajectory.",
-                            job_id,
+                            "Prompt=`%s...` turn=%d exceeded context window; ending trajectory.",
                             prompt[:20],
                             turn_idx,
                         )
@@ -829,7 +827,14 @@ def _tool_rollout_stream(
                     tools=tool_defs,
                     assistant_snapshot=snapshot,
                 )
-                match = retokenized == token_ids[assistant_message.get("prompt_token_count", 0):]
+                completion_tokens = token_ids[assistant_message.get("prompt_token_count", 0):]
+                match = retokenized == completion_tokens
+                if not match:
+                    _log_tokenization_mismatch(
+                        tokenizer=tokenizer, 
+                        retokenized=retokenized, 
+                        completion_tokens=completion_tokens
+                    )
 
                 logger.info(
                     "prompt=`%s...` turn=%d tool_returned=%s retokenized_matched=%s",
@@ -1170,4 +1175,32 @@ def _is_context_window_error(exc: Exception) -> bool:
     return (
         "context window" in text
         or "max_tokens" in text
+    )
+
+def _log_tokenization_mismatch(
+    *,
+    tokenizer: Any,
+    retokenized: List[int],
+    completion_tokens: List[int],
+) -> None:
+    mismatch_at = None
+    limit = min(len(retokenized), len(completion_tokens))
+    for idx in range(limit):
+        if retokenized[idx] != completion_tokens[idx]:
+            mismatch_at = idx
+            break
+    if mismatch_at is None:
+        logger.warning("Match returns False while token-wise check returns True up to shorter length. Mismatch is in truncated part.")
+        return
+    
+    common_start = max(0, mismatch_at - 8)
+    common_ids = retokenized[common_start:mismatch_at]
+    retok_next = retokenized[mismatch_at:mismatch_at + 8]
+    actual_next = completion_tokens[mismatch_at:mismatch_at + 8]
+
+    logger.warning(
+        "retok_mismatch: common_txt=`...%r` retok_next=`%r...` actual_next=`%r...`",
+        tokenizer.decode(common_ids, skip_special_tokens=False),
+        tokenizer.decode(retok_next, skip_special_tokens=False),
+        tokenizer.decode(actual_next, skip_special_tokens=False),
     )
