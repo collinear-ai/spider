@@ -42,7 +42,7 @@ class OpenAIBackend:
             bool(tools),
         )
 
-        response = self._client.chat.responses.create(**payload)
+        response = self._client.responses.create(**payload)
         content = response.output_text
         tool_calls = _response_tool_calls(response)
 
