@@ -371,6 +371,7 @@ def _build_batch_worker(
                 prompts=prompts,
                 backend=backend,
                 job=job,
+                tool_registry=tool_registry,
             ),
             dict(backend.metrics() or {})
         )
@@ -711,6 +712,7 @@ def _multi_turn_batch_worker(
     prompts: List[Dict[str, Any]],
     backend: Any,
     job: JobConfig,
+    tool_registry: Dict[str,Callable[..., Any]],
 ) -> Future[List[Dict[str, Any]]]:
     turn_limit = max(1, job.generation.max_turns or 4)
     max_concurrency = max(1, job.generation.max_batch_size or 4)
@@ -722,14 +724,25 @@ def _multi_turn_batch_worker(
         prompt = row["prompt"]
         system_prompt = row.get("system_prompt")
         try:
-            transcript = _run_prompt_with_user_simulation(
-                backend=backend,
-                job=job,
-                prompt=prompt,
-                turn_limit=turn_limit,
-                job_id=job_id,
-                system_prompt=system_prompt,
-            )
+            if tool_registry:
+                transcript = _run_prompt_with_tools_and_user_simulation(
+                    backend=backend,
+                    job=job,
+                    prompt=prompt,
+                    tool_registry=tool_registry,
+                    turn_limit=turn_limit,
+                    job_id=job_id,
+                    system_prompt=system_prompt,
+                )
+            else:
+                transcript = _run_prompt_with_user_simulation(
+                    backend=backend,
+                    job=job,
+                    prompt=prompt,
+                    turn_limit=turn_limit,
+                    job_id=job_id,
+                    system_prompt=system_prompt,
+                )
         except JobExecutionError as exc:
             if _is_vllm_parse_error(exc):
                 logger.warning("Skipping prompt due to vLLM parse error: %s", exc)
@@ -845,6 +858,72 @@ def _run_prompt_with_user_simulation(
 
     return history
 
+def _run_tool_turn(
+    *,
+    backend: Any,
+    job: JobConfig,
+    history: List[Dict[str, Any]],
+    tool_defs: List[Dict[str, Any]],
+    tool_registry: Dict[str, Callable[..., Any]],
+    turn_idx: int,
+    prompt: str,
+) -> bool:
+    logger.info(
+        "Starting turn %d for prompt `%s...`",
+        turn_idx,
+        prompt[:16]
+    )
+    try:
+        assistant_message = _call_backend_chat(
+            backend=backend,
+            messages=history,
+            tools=tool_defs,
+            parameters=job.generation.parameters,
+            include_logprobs=False,
+            model_name=job.model.name
+        )
+    except JobExecutionError as exc:
+        msg = str(exc).lower()
+        if "max_tokens" in msg: # hit max token limit
+            logger.warning(
+                "Max token reached during tool chat at turn %d; returning partial transcript.",
+                turn_idx,
+            )
+            return True
+        raise
+
+    logger.info(
+        "Assistant turn %d for prompt `%s...` returned keys=%s tool_calls=%s",
+        turn_idx,
+        prompt[:16],
+        sorted(list(assistant_message.keys())),
+        bool(assistant_message.get("tool_calls")) 
+    )
+    reasoning = assistant_message.get("reasoning")
+    snapshot = {
+        "role": "assistant",
+        "content": assistant_message.get("content", ""),
+        "tool_calls": assistant_message.get("tool_calls"),
+    }
+    if reasoning:
+        snapshot["reasoning"] = reasoning
+
+    history.append(snapshot)
+    tool_calls = assistant_message.get("tool_calls") or []
+    if not tool_calls:
+        logger.info(
+            "Trajectory finished for prompt `%s...'",
+            prompt[:16],
+        )
+        return True
+    
+    _execute_tool_calls(
+        tool_calls=tool_calls,
+        tool_registry=tool_registry,
+        history=history,
+    )
+    return False
+
 def _run_prompt_with_tools(
     *,
     backend: Any,
@@ -867,65 +946,70 @@ def _run_prompt_with_tools(
     logger.info("Tool-runner invoked for prompt `%s...`", prompt[:16])
 
     for turn_idx in range(turn_limit):
-        logger.info(
-            "Starting turn %d for prompt `%s...`",
-            turn_idx,
-            prompt[:16]
-        )
-        try:
-            assistant_message = _call_backend_chat(
-                backend=backend,
-                messages=history,
-                tools=tool_defs,
-                parameters=job.generation.parameters,
-                include_logprobs=False,
-                model_name=job.model.name
-            )
-        except JobExecutionError as exc:
-            msg = str(exc).lower()
-            if "max_tokens" in msg: # hit max token limit
-                logger.warning(
-                    "Max token reached during tool chat at turn %d; returning partial transcript.",
-                    turn_idx,
-                )
-                return history
-            raise
-
-        logger.info(
-            "Assistant turn %d for prompt `%s...` returned keys=%s tool_calls=%s",
-            turn_idx,
-            prompt[:16],
-            sorted(list(assistant_message.keys())),
-            bool(assistant_message.get("tool_calls")) 
-        )
-        reasoning = assistant_message.get("reasoning")
-        snapshot = {
-            "role": "assistant",
-            "content": assistant_message.get("content", ""),
-            "tool_calls": assistant_message.get("tool_calls"),
-        }
-        if reasoning:
-            snapshot["reasoning"] = reasoning
-
-        history.append(snapshot)
-        tool_calls = assistant_message.get("tool_calls") or []
-        if not tool_calls:
-            logger.info(
-                "Trajectory finished for prompt `%s...'",
-                prompt[:16],
-            )
-            return history
-        
-        _execute_tool_calls(
-            tool_calls=tool_calls,
-            tool_registry=tool_registry,
+        finished = _run_tool_turn(
+            backend=backend,
+            job=job,
             history=history,
+            tool_defs=tool_defs,
+            tool_registry=tool_registry,
+            turn_idx=turn_idx,
+            prompt=prompt,
         )
+        if finished:
+            return history
 
     logger.warning(
         "Tool-enabled generation exceeded %d turns without reaching a final response.",
         turn_limit,
     )
+    return history
+
+def _run_prompt_with_tools_and_user_simulation(
+    *,
+    backend: Any,
+    job: JobConfig,
+    prompt: str,
+    tool_registry: Dict[str, Callable[..., Any]],
+    turn_limit: int,
+    job_id: str,
+    system_prompt: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if not job.source.user_simulation_prompt or not job.source.user_model:
+        raise JobExecutionError(
+            "User simulation requires `source.user_simulation_prompt` and `source.user_model`."
+        )
+    
+    tool_defs = tool_descriptors(job.tools)
+    history = _initial_chat_history(prompt, system_prompt=system_prompt)
+
+    logger.info("Tool+user-sim runner invoked for prompt `%s...`", prompt[:16])
+
+    for turn_idx in range(turn_limit):
+        _run_tool_turn(
+            backend=backend,
+            job=job,
+            history=history,
+            tool_defs=tool_defs,
+            tool_registry=tool_registry,
+            turn_idx=turn_idx,
+            prompt=prompt,
+        )
+        if turn_idx >= turn_limit - 1:
+            break
+    
+        logger.info(
+            "Simulating user turn %d for prompt `%s...`",
+            turn_idx,
+            prompt[:16],
+        )
+        user_content = _call_user_simulation(
+            history=history,
+            user_simulation_prompt=job.source.user_simulation_prompt,
+            model_config=job.source.user_model,
+            job_id=job_id,
+        )
+        history.append({"role": "user", "content": user_content})
+
     return history
 
 def _execute_tool_calls(

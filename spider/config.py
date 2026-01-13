@@ -264,12 +264,6 @@ class JobConfig(BaseModel):
             raise ValueError("`output.hf.repo_id` is required when `generation.on_policy` is true")
         return self
 
-    @model_validator(mode="after")
-    def validate_multi_turn_tools(self) -> "JobConfig":
-        if self.source.multi_turn and self.tools:
-            raise ValueError("`tools` cannot be used when `source.multi_turn` is true")
-        return self
-
 class ServerConfig(BaseModel):
     base_url: AnyHttpUrl
     api_key: Optional[str] = Field(
