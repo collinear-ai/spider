@@ -1,10 +1,11 @@
 from __future__ import annotations
+from dataclasses import field
 from itertools import filterfalse
 import json, yaml
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Literal
-from pydantic import AnyHttpUrl, BaseModel, Field, model_validator
+from pydantic import AnyHttpUrl, BaseModel, Field, model_validator, field_validator
 
 class SourceType(str, Enum):
     HF_DATASET = "hf_dataset"
@@ -106,9 +107,9 @@ class GenerationConfig(BaseModel):
         default_factory=dict,
         description="Sampler parameters forwarded to the remote backend"
     )
-    system_prompt: Optional[str] = Field(
+    system_prompt: Optional[List[str]] = Field(
         default=None,
-        description="System prompt prepended to each chat history",
+        description="System prompt(s) prepended to each chat history",
     )
     on_policy: bool = Field(
         default=False,
@@ -118,6 +119,21 @@ class GenerationConfig(BaseModel):
         default=None,
         description="Config for on-policy distillation workflow"
     )
+
+    @field_validator("system_prompt", mode="before")
+    @classmethod
+    def normalize_system_prompt(cls, value: Any) -> Optional[List[str]]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            if not value:
+                return None
+            if not all(isinstance(item, str) for item in value):
+                raise ValueError("`system_prompt` must be a list of strings")
+            return value
+        raise ValueError("`system_prompt` must be a string or a list of strings")
 
     @model_validator(mode="after")
     def validate_on_policy(self) -> "GenerationConfig":

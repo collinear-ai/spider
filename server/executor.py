@@ -611,7 +611,12 @@ def _text_batch_worker(
     post_processor: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]],
 ) -> List[Dict[str, Any]]:
     prompt_texts = [row["prompt"] for row in prompts]
-    generations = backend.chat_batch(prompt_texts, parameters=job.generation.parameters)
+    system_prompts = [row.get("system_prompt") for row in prompts]
+    generations = backend.chat_batch(
+        prompt_texts, 
+        parameters=job.generation.parameters,
+        system_prompts=system_prompts,
+    )
 
     if len(generations) != len(prompts):
         raise JobExecutionError(
@@ -645,6 +650,7 @@ def _tool_batch_worker(
 
     def run_prompt(row):
         prompt = row["prompt"]
+        system_prompt = row.get("system_prompt")
         try:
             transcript, token_ids, logprobs, reward_mask = _run_prompt_with_tools(
                 backend=backend,
@@ -655,6 +661,7 @@ def _tool_batch_worker(
                 turn_limit=turn_limit,
                 job_id=job_id,
                 include_logprobs=include_logprobs,
+                system_prompt=system_prompt,
             )
         except JobExecutionError as exc:
             if _is_vllm_parse_error(exc):
@@ -713,6 +720,7 @@ def _multi_turn_batch_worker(
 
     def run_prompt(row):
         prompt = row["prompt"]
+        system_prompt = row.get("system_prompt")
         try:
             transcript = _run_prompt_with_user_simulation(
                 backend=backend,
@@ -720,6 +728,7 @@ def _multi_turn_batch_worker(
                 prompt=prompt,
                 turn_limit=turn_limit,
                 job_id=job_id,
+                system_prompt=system_prompt,
             )
         except JobExecutionError as exc:
             if _is_vllm_parse_error(exc):
@@ -780,13 +789,14 @@ def _run_prompt_with_user_simulation(
     prompt: str,
     turn_limit: int,
     job_id: str,
+    system_prompt: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     if not job.source.user_simulation_prompt or not job.source.user_model:
         raise JobExecutionError(
             "User simulation requires `source.user_simulation_prompt` and `source.user_model`."
         )
 
-    history = _initial_chat_history(prompt, job)
+    history = _initial_chat_history(prompt, system_prompt=system_prompt)
 
     logger.info("User-sim runner invoked for prompt `%s...`", prompt[:16])
 
@@ -844,8 +854,9 @@ def _run_prompt_with_tools(
     tool_registry: Dict[str, Callable[..., Any]],
     turn_limit: int,
     job_id: str,
+    system_prompt: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    history = _initial_chat_history(prompt, job)
+    history = _initial_chat_history(prompt, system_prompt=system_prompt)
 
     base_model = job.model.name
     renderer_name = None
@@ -1034,7 +1045,11 @@ def _prepare_processors_and_prompts(
 ) -> tuple[Optional[Callable[[Dict[str, Any]], Any]], List[Dict[str, Any]]]:
     pre_processor = _resolve_processor(job.pre_processor, runtime_env=runtime_env) if pre_processor else None
     post_processor = _resolve_processor(job.post_processor, runtime_env=runtime_env) if post_processor else None
-    prompts = collect_prompts(job.source, pre_processor=pre_processor)
+    prompts = collect_prompts(
+        job.source, 
+        pre_processor=pre_processor,
+        system_prompts=job.generation.system_prompt,
+    )
 
     return pre_processor, post_processor, prompts
 
@@ -1240,9 +1255,11 @@ def _model_input_tokens(text: Any, tokenizer: Any) -> List[int]:
         return tokens
     return []   
 
-def _initial_chat_history(prompt: str, job: JobConfig) -> List[Dict[str, Any]]:
+def _initial_chat_history(
+    prompt: str, 
+    system_prompt: Optional[str] = None
+) -> List[Dict[str, Any]]:
     history = []
-    system_prompt = job.generation.system_prompt
     if system_prompt:
         history.append({"role": "system", "content": system_prompt})
     history.append({"role": "user", "content": prompt})

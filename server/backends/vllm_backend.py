@@ -18,10 +18,9 @@ class VLLMBackend:
         self._server_host = "127.0.0.1"
         self._server_port = _reserve_port()
         self._client_timeout = 480.0 # 8 minutes
-        self._system_prompt = config.parameters.get("system_prompt")
         self._model_params = {
             k: v for k, v in config.parameters.items()
-            if k not in ("system_prompt")
+            if k not in ("system_prompt",)
         }
         self._base_url = f"http://{self._server_host}:{self._server_port}"
         self._client = None
@@ -107,6 +106,7 @@ class VLLMBackend:
         prompts: List[str],
         *,
         parameters: Dict[str, Any],
+        system_prompts: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         if not prompts:
             return []
@@ -114,8 +114,8 @@ class VLLMBackend:
         def run_one(args: Any) -> tuple[int, Dict[str, Any]]:
             idx, prompt = args
             messages = []
-            if self._system_prompt:
-                messages.append({"role": "system", "content": self._system_prompt})
+            if system_prompts and system_prompts[idx]:
+                messages.append({"role": "system", "content": system_prompts[idx]})
             messages.append({"role": "user", "content": prompt})
             return idx, self.chat(messages=messages, parameters=parameters)
 

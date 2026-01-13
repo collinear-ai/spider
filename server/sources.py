@@ -12,13 +12,19 @@ def collect_prompts(
     source: SourceConfig,
     *,
     pre_processor: Optional[PreProcessor] = None,
+    system_prompts: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    return _load_hf_dataset(source, pre_processor=pre_processor)
+    return _load_hf_dataset(
+        source, 
+        pre_processor=pre_processor,
+        system_prompts=system_prompts,
+    )
 
 def _load_hf_dataset(
     source: SourceConfig,
     *,
     pre_processor: Optional[PreProcessor] = None,
+    system_prompts: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     from datasets import load_dataset
 
@@ -64,6 +70,8 @@ def _load_hf_dataset(
         if field not in row:
             raise ValueError(f"`source.field` was set to `{field}` but the field is missing.")
         value = row[field]
+        if system_prompts:
+            row["system_prompt"] = random.choice(system_prompts)
         if not isinstance(value, str):
             raise ValueError(f"Value for field `{field}` should be a str, get {type(value)} instead.")
         row = _build_prompt_record(row, prompt=value, drop_field=field)
