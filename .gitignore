@@ -9,3 +9,5 @@ artifacts/
 .env
 
 **/tests/
+
+**/.DS_Store
