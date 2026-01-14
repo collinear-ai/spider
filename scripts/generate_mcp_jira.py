@@ -3,7 +3,7 @@ import os
 from spider.client import SpiderClient
 from spider.config import AppConfig, RuntimeDependencyConfig
 from workloads.mcp_support.launcher import (
-    start_mcp_support_server,
+    start_mcp_support_proxy,
     stop_mcp_support_servers,
 )
 from workloads.mcp_support.tool_schemas import tool_config_from_server
@@ -19,14 +19,13 @@ def main() -> None:
         "anyio",
     )
 
-    handle, _spec = start_mcp_support_server(
+    handle, _spec = start_mcp_support_proxy(
         name=MCP_NAME,
         port=8080,
-        args=["--transport", "streamable-http", "--port", "8080"],
     )
 
     try:
-        mcp_url = os.environ.get(MCP_URL_ENV)
+        mcp_url = "http://127.0.0.1:8080/mcp"
         config.job.tools = tool_config_from_server(
             mcp_url,
             mcp_url_env=MCP_URL_ENV,

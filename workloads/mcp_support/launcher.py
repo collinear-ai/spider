@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import sys
 import socket
 import subprocess
 import time
@@ -11,6 +12,8 @@ from typing import List, Dict, Optional, Sequence, Tuple
 
 DEFAULT_ZENDESK_COMMAND = ["mcp-zendesk"]
 DEFAULT_JIRA_COMMAND = ["atlassian-jira-mcp-server"]
+DEFAULT_PROXY_COMMAND = [sys.executable, "-m", "workloads.mcp_support.stdio_proxy"]
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 @dataclass
 class MCPServerSpec:
@@ -93,12 +96,14 @@ def _jira_env() -> Dict[str, str]:
     _require_env(env, ["JIRA_BASE_URL", "JIRA_USERNAME", "JIRA_API_TOKEN"], "Jira")
     return env
 
-def start_mcp_support_server(
+def start_mcp_support_proxy(
     *,
     name: str,
-    port: Optional[int] = None,
-    command: Optional[Sequence[str]] = None,
-    args: Optional[Sequence[str]] = None,
+    port: int, 
+    host: str = "127.0.0.1",
+    proxy_command: Optional[Sequence[str]] = None,
+    server_command: Optional[Sequence[str]] = None,
+    server_args: Optional[Sequence[str]] = None,
 ) -> Tuple[MCPServerHandle, MCPServerSpec]:
     normalized = name.lower().strip()
     if normalized == "zendesk":
@@ -109,11 +114,20 @@ def start_mcp_support_server(
         default_command = DEFAULT_JIRA_COMMAND
     else:
         raise ValueError(f"Unsupported MCP server name: {name}")
-    
+
+    proxy_command = list(proxy_command or DEFAULT_PROXY_COMMAND)
+    stdio_cmd = list(server_command or default_command) + list(server_args or [])
+    command = proxy_command + [
+        "--host", host,
+        "--port", str(port),
+        "--command",
+        *stdio_cmd,
+    ]
     spec = MCPServerSpec(
         name=normalized,
-        command=list(command or default_command) + list(args or []),
+        command=command,
         env=env,
+        cwd=_REPO_ROOT,
         port=port,
     )
     handle = _start_server(spec)
