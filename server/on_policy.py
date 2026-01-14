@@ -832,19 +832,13 @@ def _tool_rollout_stream(
                 tool_calls = assistant_message.get("tool_calls")
                 reasoning_content = assistant_message.get("reasoning")
                 
-                # For retokenization, use the raw text as content to avoid 
-                # double <think> tags. The chat template adds <think> wrapper
-                # around reasoning_content AND prefixes content with <think> if
-                # content doesn't contain it, causing duplicates.
-                # Using raw text preserves the exact model output format.
-                raw_text = assistant_message.get("assistant_raw_text", "")
                 snapshot = {
                     "role": "assistant",
-                    "content": raw_text if raw_text else content,
+                    "content": content,
                     "tool_calls": tool_calls,
                 }
-                # Don't add reasoning_content - it's already embedded in raw_text
-                # Adding it separately causes the chat template to duplicate <think> tags
+                if reasoning_content:
+                    snapshot["reasoning_content"] = reasoning_content
 
                 # tokenization consistency check
                 retokenized = _retokenize_last_turn_with_history(
