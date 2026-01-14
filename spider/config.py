@@ -227,6 +227,14 @@ class RuntimeDependencyConfig(BaseModel):
         default_factory=dict,
         description="Environment variables to expose the runetime sandbox when using dependencies"
     )
+
+    def add_packages(self, *packages: str) -> None:
+        existing = set(self.packages or [])
+        for pkg in packages:
+            if not pkg:
+                continue
+            existing.add(pkg)
+        self.packages = sorted(existing)
     
 class JobConfig(BaseModel):
     model: ModelConfig
@@ -253,6 +261,11 @@ class JobConfig(BaseModel):
         default=None,
         description="Optional runtime dependency requirements declared by the client"
     )
+
+    def ensure_runtime(self) -> RuntimeDependencyConfig:
+        if self.runtime is None:
+            self.runtime = RuntimeDependencyConfig()
+        return self.runtime
 
     @model_validator(mode="after")
     def validate_on_policy_output(self) -> "JobConfig":
