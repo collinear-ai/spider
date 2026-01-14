@@ -44,6 +44,9 @@ def tool_config_from_server(
     *,
     mcp_url_env: str,
 ) -> List[ToolConfig]:
+    if not server_url:
+        raise ValueError("server_url is required to query MCP tools.")
+        
     async def _run() -> List[ToolConfig]:
         async with httpx.AsyncClient() as http_client:
             async with streamable_http_client(server_url, http_client=http_client) as (

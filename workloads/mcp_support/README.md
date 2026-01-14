@@ -12,15 +12,12 @@ For jira, the following should be executed in the **client** environment:
 
 ```bash
 pip install mcp anyio httpx
-pip install atlassian-jira-mcp-server 
+npx -y mcp-remote https://mcp.atlassian.com/v1/mcp
+export JIRA_MCP_URL= # this should match what mcp-remote exposes
 
-export JIRA_BASE_URL="https://spider-mcp-tool-call.atlassian.net"
-export JIRA_USERNAME="muyu@collinear.ai"
-export JIRA_API_TOKEN="YOUR_NEW_TOKEN"
-export JIRA_DEFAULT_PROJECT="SCRUM"
-export JIRA_MCP_URL="http://127.0.0.1:8080/mcp" # this should match the port selection in the run script
+# JIRA_* env vars are handled by the OAuth flow
 ```
 
-Since the MCP server is hosted on the client machine, the whole workload currently only supports the spider server being on the same local machine as the client. 
+Since the MCP server is hosted on the cloud, the spider server can be remote as long as it can reach the local mcp-remote proxy JIRA_MCP_URL.
 
 Other MCP servers should follow the same pattern.
