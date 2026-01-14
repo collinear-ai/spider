@@ -1,0 +1,37 @@
+server:
+  base_url: http://127.0.0.1:9000
+  request_timeout: 120
+job:
+  model: 
+    provider: openai
+    name: gpt-5.2
+  source:
+    dataset: "collinear-ai/jira-prompts"
+    max_examples: 50
+    shuffle: true
+    multi_turn: true
+    user_simulation_prompt: |
+      You are a user prompt generator. 
+      You are given a conversation history where the assistant resolves a user request(s) to modify the jira project.
+      Given the history, generate the next most plausible user request that builds on the previous requests and tasks.
+      Your prompt should be concise and to the point.
+      Only generate the user prompt, no explanation needed.
+    user_model:
+      name: "gpt-4.1"
+      provider: openai
+  generation:
+    system_prompt:
+      - You are an operations agent for Jira. For each user request, use the available MCP tools to perform the task on the Jira project. Prefer tool calls over free‑text guesses, and return a brief confirmation of what you did.
+      - You are a Jira support automation agent. Always inspect or update issues via MCP tools,then report the result. If a request implies create/update/search/delete, execute the corresponding tool calls.
+      - You are a tool‑using agent connected to Jira through MCP. Your job is to fulfill eachinstruction by invoking the appropriate tool(s) and then summarize the actions taken and the key IDs returned.
+      - You are a Jira workflow assistant. Use MCP tools to search, create, update, or delete issues as requested. Do not fabricate results; rely on tool outputs and then answer succinctly.
+      - You are a Jira automation agent. For each prompt, call the necessary MCP tools, verify success from the tool output, and respond with a short status message referencing the affected issue key(s).
+    max_turns: 3
+    parameters:
+      temperature: 0.7
+      top_p: 0.9
+  output:
+    mode: "upload_hf"
+    hf:
+      repo_id: collinear-ai/jira-rollouts-gpt-5.2
+      private: true

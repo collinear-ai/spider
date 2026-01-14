@@ -12,7 +12,7 @@ MCP_URL_ENV = "JIRA_MCP_URL" # Change it to any MCP server URL
 MCP_NAME = "jira"
 
 def main() -> None:
-    config = AppConfig.load("config/generate_mcp_zendesk.yaml")
+    config = AppConfig.load("config/generate_mcp_jira.yaml")
     config.job.ensure_runtime().add_packages(
         "mcp",
         "httpx",
