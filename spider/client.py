@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional, Union, Callable, List, Tuple, Iterable
+from typing import Any, Dict, Optional, Union, Callable, List, Tuple, Iterable, Sequence
 import httpx, time, sys, json, shutil, textwrap, warnings
+import os
 
 from .config import AppConfig
 from .processor_bundle import bundle_processor_source, ProcessorBundlingError
@@ -13,7 +14,7 @@ class SpiderClient:
         config: AppConfig, 
         *, 
         client: Optional[httpx.Client] = None,
-        env: Optional[Dict[str, str]] = None,
+        env: Optional[Sequence[str]] = None,
         pre_processor: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
         pre_processor_kwargs: Optional[Dict[str, Any]] = None,
         post_processor: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
@@ -29,8 +30,12 @@ class SpiderClient:
         self._post_processor_kwargs = dict(post_processor_kwargs or {})
 
         self._tool_payloads: Dict[str, Dict[str, Any]] = {}
-        raw_env = dict(env or {})
-        self._job_env = {key: value for key, value in raw_env.items() if value is not None}
+        self._job_env = {}
+        for key in env:
+            value = os.environ.get(key)
+            if value is not None:
+                self._job_env[key] = value
+        
 
     def __enter__(self) -> "SpiderClient":
         self._ensure_client()
