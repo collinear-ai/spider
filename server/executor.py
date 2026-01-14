@@ -643,7 +643,7 @@ def _tool_batch_worker(
 ) -> List[Dict[str, Any]]:
     tool_defs = tool_descriptors(job.tools)
 
-    turn_limit = max(1, job.generation.max_turns or 16)
+    tool_turn_limit, user_turn_limit = _resolve_turn_limits(job)
     max_concurrency = max(1, job.generation.max_batch_size or 4)
     max_concurrency = min(max_concurrency, len(prompts))
 
@@ -659,7 +659,7 @@ def _tool_batch_worker(
                 prompt=prompt,
                 tool_defs=tool_defs,
                 tool_registry=tool_registry,
-                turn_limit=turn_limit,
+                turn_limit=tool_turn_limit,
                 job_id=job_id,
                 include_logprobs=include_logprobs,
                 system_prompt=system_prompt,
@@ -714,7 +714,7 @@ def _multi_turn_batch_worker(
     job: JobConfig,
     tool_registry: Dict[str,Callable[..., Any]],
 ) -> Future[List[Dict[str, Any]]]:
-    turn_limit = max(1, job.generation.max_turns or 4)
+    tool_turn_limit, user_turn_limit = _resolve_turn_limits(job)
     max_concurrency = max(1, job.generation.max_batch_size or 4)
     max_concurrency = min(max_concurrency, len(prompts))
 
@@ -730,7 +730,8 @@ def _multi_turn_batch_worker(
                     job=job,
                     prompt=prompt,
                     tool_registry=tool_registry,
-                    turn_limit=turn_limit,
+                    tool_turn_limit=tool_turn_limit,
+                    user_turn_limit=user_turn_limit,
                     job_id=job_id,
                     system_prompt=system_prompt,
                 )
@@ -739,7 +740,7 @@ def _multi_turn_batch_worker(
                     backend=backend,
                     job=job,
                     prompt=prompt,
-                    turn_limit=turn_limit,
+                    turn_limit=user_turn_limit,
                     job_id=job_id,
                     system_prompt=system_prompt,
                 )
@@ -970,7 +971,8 @@ def _run_prompt_with_tools_and_user_simulation(
     job: JobConfig,
     prompt: str,
     tool_registry: Dict[str, Callable[..., Any]],
-    turn_limit: int,
+    tool_turn_limit: int,
+    user_turn_limit: int,
     job_id: str,
     system_prompt: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
@@ -984,22 +986,34 @@ def _run_prompt_with_tools_and_user_simulation(
 
     logger.info("Tool+user-sim runner invoked for prompt `%s...`", prompt[:16])
 
-    for turn_idx in range(turn_limit):
-        _run_tool_turn(
-            backend=backend,
-            job=job,
-            history=history,
-            tool_defs=tool_defs,
-            tool_registry=tool_registry,
-            turn_idx=turn_idx,
-            prompt=prompt,
-        )
-        if turn_idx >= turn_limit - 1:
+    for user_turn_idx in range(user_turn_limit):
+        finished = False
+        for tool_turn_idx in range(tool_turn_limit):
+            finished = _run_tool_turn(
+                backend=backend,
+                job=job,
+                history=history,
+                tool_defs=tool_defs,
+                tool_registry=tool_registry,
+                turn_idx=tool_turn_idx,
+                prompt=prompt,
+            )
+            if finished:
+                break
+
+        if not finished:
+            logger.warning(
+                "Tool-enabled generation exceeded %d turns for user turn %d.",
+                tool_turn_limit,
+                user_turn_idx,
+            )
+
+        if user_turn_idx >= user_turn_limit - 1:
             break
     
         logger.info(
             "Simulating user turn %d for prompt `%s...`",
-            turn_idx,
+            user_turn_idx,
             prompt[:16],
         )
         user_content = _call_user_simulation(
@@ -1011,6 +1025,19 @@ def _run_prompt_with_tools_and_user_simulation(
         history.append({"role": "user", "content": user_content})
 
     return history
+
+def _resolve_turn_limits(job: JobConfig) -> Tuple[int, int]:
+    tool_turn_limit = max(
+        1,
+        job.generation.max_tool_turns
+        or 16
+    )
+    user_turn_limit = max(
+        1,
+        job.generation.max_user_turns
+        or 4
+    )
+    return tool_turn_limit, user_turn_limit
 
 def _execute_tool_calls(
     *,

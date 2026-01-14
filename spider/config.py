@@ -97,10 +97,15 @@ class OnPolicyConfig(BaseModel):
 class GenerationConfig(BaseModel):
     duplications: int = Field(default=1, ge=1)
     max_batch_size: Optional[int] = Field(default=None, ge=1)
-    max_turns: Optional[int] = Field(
-        default=8,
+    max_tool_turns: Optional[int] = Field(
+        default=None,
         ge=1,
-        description="Maximum number of turns allowed for multi-turn generation (tool calls or user simulation)"
+        description="Maximum number of assistant/tool turns allowed per user request"
+    )
+    max_user_turns: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Maximum number of user turns in user simulation"
     )
     seed: Optional[int] = Field(default=None)
     parameters: Dict[str, Any] = Field(

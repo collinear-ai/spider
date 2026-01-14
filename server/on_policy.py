@@ -688,7 +688,7 @@ def _tool_rollout_stream(
     )
 
     tool_defs = tool_descriptors(job.tools)
-    turn_limit = max(1, job.generation.max_turns or 16)
+    turn_limit = max(1, job.generation.max_tool_turns or 16)
     thread_state = threading.local()
 
     batch_size, total_batches = _compute_batch_stats(prompts, job.generation.on_policy_options)
