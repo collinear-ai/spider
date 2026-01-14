@@ -758,7 +758,7 @@ def _tool_rollout_stream(
 
     def _run_prompt(row: Dict[str, Any]) -> List[Dict[str, Any]]:
         prompt = row["prompt"]
-        history = _initial_chat_history(prompt, job)
+        history = _initial_chat_history(prompt, row.get("system_prompt"))
         turn_items = []
         runtime = None
         tokenizer = _get_thread_tokenizer()
@@ -830,15 +830,21 @@ def _tool_rollout_stream(
 
                 content = assistant_message.get("content", "")
                 tool_calls = assistant_message.get("tool_calls")
-
+                reasoning_content = assistant_message.get("reasoning")
+                
+                # For retokenization, use the raw text as content to avoid 
+                # double <think> tags. The chat template adds <think> wrapper
+                # around reasoning_content AND prefixes content with <think> if
+                # content doesn't contain it, causing duplicates.
+                # Using raw text preserves the exact model output format.
+                raw_text = assistant_message.get("assistant_raw_text", "")
                 snapshot = {
                     "role": "assistant",
-                    "content": content,
+                    "content": raw_text if raw_text else content,
                     "tool_calls": tool_calls,
                 }
-                reasoning_content = assistant_message.get("reasoning")
-                if reasoning_content:
-                    snapshot["reasoning_content"] = reasoning_content
+                # Don't add reasoning_content - it's already embedded in raw_text
+                # Adding it separately causes the chat template to duplicate <think> tags
 
                 # tokenization consistency check
                 retokenized = _retokenize_last_turn_with_history(
