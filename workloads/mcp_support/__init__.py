@@ -5,4 +5,4 @@ from .launcher import (
     stop_mcp_support_servers,
 )
 
-from .tool_schemas import tool_config_from_list_tools
+from .tool_schemas import tool_config_from_server
