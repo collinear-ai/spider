@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Any, Optional
 import os
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
@@ -125,14 +126,15 @@ def _to_response_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         for call in msg.get("tool_calls") or []:
             call = _as_dict(call)
             function = _as_dict(call.get("function") or {})
+
             items.append(
                 {
                     "type": "function_call",
                     "call_id": call.get("id"),
                     "name": function.get("name"),
-                    "arguments": function.get("arguments") or {},
+                    "arguments": function.get("arguments") or "",
                 }
-            ) # TODO: do we have deterministic guarantee for the type of each field so that we don't have to use fallbacks?
+            )
 
     return items
 
@@ -143,6 +145,7 @@ def _response_tool_calls(response: Any) -> Optional[List[Dict[str, Any]]]:
         item = _as_dict(item)
         if item.get("type") != "function_call":
             continue
+
         calls.append({
             "id": item.get("call_id"),
             "type": "function",
