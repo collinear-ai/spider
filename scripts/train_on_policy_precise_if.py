@@ -9,10 +9,8 @@ from spider.config import AppConfig
 
 def main():
     config = AppConfig.load("config/train_on_policy_precise_if.yaml")
-
-    env = {"TINKER_API_KEY": os.environ.get("TINKER_API_KEY")}
     
-    with SpiderClient(config=config, env=env) as client:
+    with SpiderClient(config=config, env=("TINKER_API_KEY")) as client:
         submission = client.submit_job()
         job_id = submission["job_id"]
         status = client.poll_job(

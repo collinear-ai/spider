@@ -17,10 +17,10 @@ def _preprocess_row(row):
 
 def main() -> None:
     config = AppConfig.load("config/generate_multiturn_hotpotqa.yaml")
-    env = {"HF_TOKEN": os.getenv("HF_TOKEN"), "HF_HOME": os.getenv("HF_HOME"), "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY")}
+
     with SpiderClient(
         config=config, 
-        env=env,
+        env=("OPENAI_API_KEY", "HF_TOKEN", "HF_HOME"),
         pre_processor=_preprocess_row,
     ) as client:
         submission = client.submit_job()

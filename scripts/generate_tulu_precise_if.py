@@ -10,10 +10,10 @@ from spider.config import AppConfig
 
 def main() -> None:
     config = AppConfig.load("config/generate_tulu_precise_if.yaml")
-    env = {"HF_TOKEN": "", "HF_HOME": ""}
+
     with SpiderClient(
         config=config, 
-        env=env,
+        env=("HF_TOKEN", "HF_HOME"),
     ) as client:
         submission = client.submit_job()
         job_id = submission["job_id"]

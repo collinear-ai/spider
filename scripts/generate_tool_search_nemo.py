@@ -143,19 +143,14 @@ def post_processor(row):
 
 def main():
     config = AppConfig.load("config/generate_tool_search_nemo.yaml")
-    runtime = config.job.runtime or RuntimeDependencyConfig()
-    runtime.packages = ["httpx", "beautifulsoup4"]
-    config.job.runtime = runtime
-
-    secrets = {
-        "TAVILY_API_KEY": os.environ["TAVILY_API_KEY"],
-        "HF_TOKEN": os.environ["HF_TOKEN"],
-        "HF_HOME": os.environ["HF_HOME"],
-    }
+    config.job.ensure_runtime().add_packages(
+        "httpx",
+        "beautifulsoup4",
+    )
 
     with SpiderClient(
         config=config, 
-        env=secrets, 
+        env=("TAVILY_API_KEY", "HF_TOKEN", "HF_HOME"), 
         pre_processor=pre_processor,
         post_processor=post_processor,
     ) as client:

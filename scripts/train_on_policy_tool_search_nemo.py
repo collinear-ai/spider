@@ -109,20 +109,14 @@ def pre_processor(row):
 
 def main():
     config = AppConfig.load("config/train_on_policy_tool_search_nemo.yaml")
-    runtime = config.job.runtime or RuntimeDependencyConfig()
-    runtime.packages = ["httpx", "beautifulsoup4"]
-    config.job.runtime = runtime
-
-    secrets = {
-        "TAVILY_API_KEY": os.environ["TAVILY_API_KEY"],
-        "HF_TOKEN": os.environ["HF_TOKEN"],
-        "TINKER_API_KEY": os.environ["TINKER_API_KEY"],
-        "WANDB_API_KEY": os.environ["WANDB_API_KEY"],
-    }
+    config.job.ensure_runtime().add_packages(
+        "httpx",
+        "beautifulsoup4",
+    )
 
     with SpiderClient(
         config=config, 
-        env=secrets, 
+        env=("TAVILY_API_KEY", "HF_TOKEN", "TINKER_API_KEY", "WANDB_API_KEY"), 
         pre_processor=pre_processor,
     ) as client:
         client.add_tool(
