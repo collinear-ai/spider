@@ -8,8 +8,8 @@ from workloads.mcp_support.launcher import (
 )
 from workloads.mcp_support.tool_schemas import tool_config_from_server
 
-MCP_URL_ENV = "ZENDESK_MCP_URL" # Change it to any MCP server URL
-MCP_NAME = "zendesk"
+MCP_URL_ENV = "JIRA_MCP_URL" # Change it to any MCP server URL
+MCP_NAME = "jira"
 
 def main() -> None:
     config = AppConfig.load("config/generate_mcp_zendesk.yaml")
