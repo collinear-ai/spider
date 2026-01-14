@@ -11,7 +11,7 @@ job:
     max_examples: 16
   generation:
     on_policy: true
-    max_turns: 4
+    max_tool_turns: 4
     parameters:
       top_p: 0.9
       max_tokens: 16384

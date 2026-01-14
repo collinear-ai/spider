@@ -12,7 +12,7 @@ job:
     dataset: nvidia/Nemotron-RL-knowledge-web_search-mcqa
     split: train[0:64]
   generation: 
-    max_turns: 18
+    max_tool_turns: 18
     parameters:
       temperature: 0.6
       top_p: 0.9
