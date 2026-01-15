@@ -691,7 +691,7 @@ def _tool_batch_worker(
             reasoning=None,
             trajectory=transcript
         )
-        record["tools"] = tool_defs
+        record["tools"] = json.dumps(tool_defs)
         if include_logprobs:
             record.update({
                 "token_ids": token_ids,
@@ -776,7 +776,7 @@ def _multi_turn_batch_worker(
             trajectory=transcript,
         )
         if tool_defs:
-            record["tools"] = tool_defs
+            record["tools"] = json.dumps(tool_defs)
 
         return record
 
