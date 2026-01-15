@@ -29,10 +29,9 @@ async def _serve(args: argparse.Namespace) -> None:
         raise SystemExit("Missing --command for stdio MCP server.")
 
     server = Server("mcp-stdio-proxy")
-    env = os.environ.copy()
     lock = anyio.Lock()
 
-    async with stdio_client(args.command, env=env) as (read_stream, write_stream):
+    async with stdio_client(args.command) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
 
@@ -51,7 +50,7 @@ async def _serve(args: argparse.Namespace) -> None:
                 server,
                 json_response=args.json_response,
             )
-            
+
             async def lifespan(app: Starlette):
                 async with session_manager.run():
                     yield
