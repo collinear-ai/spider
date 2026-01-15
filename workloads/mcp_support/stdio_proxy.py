@@ -6,7 +6,7 @@ from typing import List
 
 import anyio
 from mcp.client.session import ClientSession
-from mcp.client.stdio import stdio_client
+from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
@@ -31,7 +31,8 @@ async def _serve(args: argparse.Namespace) -> None:
     server = Server("mcp-stdio-proxy")
     lock = anyio.Lock()
 
-    async with stdio_client(args.command) as (read_stream, write_stream):
+    server_params = StdioServerParameters(command=args.command)
+    async with stdio_client(server_params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
 
