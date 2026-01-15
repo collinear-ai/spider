@@ -684,6 +684,7 @@ def _tool_batch_worker(
             reasoning=None,
             trajectory=transcript
         )
+        record["tools"] = tool_defs
         if include_logprobs:
             record.update({
                 "token_ids": token_ids,
@@ -715,6 +716,8 @@ def _multi_turn_batch_worker(
     tool_registry: Dict[str,Callable[..., Any]],
 ) -> Future[List[Dict[str, Any]]]:
     tool_turn_limit, user_turn_limit = _resolve_turn_limits(job)
+    tool_defs = tool_descriptors(job.tools) if tool_registry else None
+
     max_concurrency = max(1, job.generation.max_batch_size or 4)
     max_concurrency = min(max_concurrency, len(prompts))
 
@@ -762,6 +765,8 @@ def _multi_turn_batch_worker(
             reasoning=None,
             trajectory=transcript,
         )
+        if tool_defs:
+            record["tools"] = tool_defs
 
         return record
 
