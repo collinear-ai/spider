@@ -90,6 +90,11 @@ class OnPolicyConfig(BaseModel):
         default=False,
         description="Whether to compute post-kl metrics after each step"
     )
+    token_budget: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Stop on-policy training after accumulating this many generated tokens"
+    )
     save_every: int = Field(default=20, ge=0)
     wandb_project: Optional[str] = Field(default=None, description="Wandb project name for logging")
     wandb_name: Optional[str] = Field(default=None, description="Wandb run name")

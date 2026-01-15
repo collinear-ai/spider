@@ -399,6 +399,8 @@ def _run_tool_on_policy_stream(
     # Initialize wandb
     wandb_project = getattr(options, "wandb_project", None)
     wandb_name = getattr(options, "wandb_name", None) or f"tool-on-policy-{job_id[:8]}"
+    token_budget = getattr(options, "token_budget", None)
+
     wandb_run = None
     if wandb_project:
         wandb_run = wandb.init(
@@ -414,6 +416,7 @@ def _run_tool_on_policy_stream(
                 "kl_discount_factor": getattr(options, "kl_discount_factor", 0.0),
                 "loss_fn": getattr(options, "loss_fn", "importance_sampling"),
                 "total_batches": total_batches,
+                "token_budget": token_budget,
             },
         )
         logger.info("Job %s: wandb initialized. project=%s name=%s url=%s", job_id, wandb_project, wandb_name, wandb_run.url)
@@ -585,11 +588,27 @@ def _run_tool_on_policy_stream(
 
         last_checkpoint = None
         global_step = 0
+        token_cum = 0
+
         for batch_index, trajectories in enumerate(rollout_stream):
             batch_start = time.time()
             batch_items, batch_metrics = await _process_batch(batch_index, trajectories)
             batch_time = time.time() - batch_start
             global_step += 1
+
+            step_tokens = sum(
+                int(sum(turn.get("reward_mask") or []))
+                for turn in trajectories
+            )
+            token_cum += step_tokens
+
+            logger.info(
+                "tool rollout batch=%d token_step=%d token_cum=%d token_budget=%s",
+                batch_index,
+                step_tokens,
+                token_cum,
+                token_budget,
+            )
 
             # Log to wandb
             if wandb_run:
@@ -599,7 +618,12 @@ def _run_tool_on_policy_stream(
                     "rollouts": len(trajectories),
                     "time/total_seconds": batch_time,
                     "time/per_step_seconds": batch_time / len(trajectories),
+                    "token_step": step_tokens,
+                    "token_cum": token_cum,
                 }
+
+                if token_budget is not None:
+                    log_data["token_budget"] = token_budget
                 # Flatten log_data keys to not include folder/dir structure
                 if batch_metrics.get("loss") is not None:
                     log_data["loss"] = batch_metrics["loss"]
@@ -616,6 +640,19 @@ def _run_tool_on_policy_stream(
                     key = k.split("/")[-1] if "/" in k else k
                     flat_log_data[key] = v
                 wandb_run.log(flat_log_data, step=global_step)
+
+            if token_budget is not None and token_cum >= token_budget:
+                logger.info(
+                    "tool rollout token budget reached. stopping training. token_cum=%d budget=%d",
+                    token_cum,
+                    token_budget,
+                )
+                events.emit(
+                    "Tool rollout token budget reached.",
+                    code="tool_on_policy.token_budget_reached",
+                    data={"token_cum": token_cum, "token_budget": token_budget},
+                )
+                break
 
             if (batch_index + 1) % save_every == 0:
                 last_checkpoint = await checkpoint_utils.save_checkpoint_async(
