@@ -1,7 +1,7 @@
 from .launcher import (
     MCPServerHandle,
     MCPServerSpec,
-    start_mcp_support_proxy,
+    start_mcp_remote_proxy,
     stop_mcp_support_servers,
 )
 
