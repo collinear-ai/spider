@@ -10,7 +10,7 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
-from starlette.routing import Route
+from starlette.routing import Mount
 import uvicorn
 
 def _parse_args() -> argparse.Namespace:
@@ -52,17 +52,16 @@ async def _serve(args: argparse.Namespace) -> None:
                 json_response=args.json_response,
             )
 
+            async def mcp_app(scope, receive, send):
+                await session_manager.handle_request(scope, receive, send)
+
             async def lifespan(app: Starlette):
                 async with session_manager.run():
                     yield
 
             app = Starlette(
                 routes=[
-                    Route(
-                        "/mcp",
-                        session_manager.handle_request,
-                        methods=["GET", "POST", "DELETE"],
-                    ),
+                    Mount("/mcp", app=mcp_app),
                 ],
                 lifespan=lifespan,
             )
