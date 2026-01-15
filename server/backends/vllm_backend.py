@@ -267,20 +267,23 @@ def _default_tool_parser(model_name: str) -> Optional[str]:
 
 def _default_chat_template(model_name: str) -> Optional[Path]:
     lower = (model_name or "").lower()
-    supported_models = ["mistral"]
+    supported_models = ["mistral", "qwen3"]
     if not any(model in lower for model in supported_models):
         return None
 
-    import vllm
-    template_root = (
-        Path(vllm.__file__).resolve().parent 
-        / "examples"
-    )
+    template_root = Path(__file__).resolve().parent / "templates"
     if "mistral" in lower:
+        import vllm
+        template_root = Path(vllm.__file__).resolve().parent / "examples"
         template = template_root / "tool_chat_template_mistral_parallel.jinja"
         if template.exists():
             return template
         logger.warning("Could not find mistral chat template at %s", template)
+    if "qwen3" in lower:
+        template = template_root / "qwen3_no_dummy_think.jinja"
+        if template.exists():
+            return template
+        logger.warning("Could not find qwen3 chat template at %s", template)
     return None
 
 def _default_reasoning_parser(model_name: str) -> Optional[str]:
