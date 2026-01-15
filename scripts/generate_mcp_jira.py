@@ -35,7 +35,7 @@ def main() -> None:
 
         with SpiderClient(
             config=config, 
-            env=(MCP_URL_ENV, "HF_TOKEN"),
+            env=(MCP_URL_ENV, "HF_TOKEN", "OPENAI_API_KEY"),
         ) as client:
             submission = client.submit_job()
             status = client.poll_job(
@@ -44,7 +44,7 @@ def main() -> None:
             if status["status"] == "completed":
                 client.download_result(
                     submission["job_id"],
-                    destination="artifacts/generate_mcp_zendesk.json",
+                    destination="artifacts/generate_mcp_jira.json",
                 )
     finally:
         stop_mcp_support_servers([handle])
