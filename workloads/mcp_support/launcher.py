@@ -99,7 +99,7 @@ def start_mcp_remote_proxy(
         port=port,
     )
     handle = _start_server(spec)
-    mcp_url = f"http://{host}:{port}/mcp"
+    mcp_url = f"http://{host}:{port}/mcp/"
     os.environ[mcp_url_env] = mcp_url
     return handle, mcp_url
 
