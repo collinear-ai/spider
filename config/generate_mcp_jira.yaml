@@ -15,9 +15,11 @@ job:
       You are given a conversation history where the assistant resolves a user request(s) to modify the jira project.
       Given the history, generate the next most plausible user request that builds on the previous requests and tasks.
       Your prompt should be concise and to the point.
+      The jira project is built up for demo purposes only, so do not assume it is populated with real people's information. 
+      Therefore, ask reasonable questions that are feasible, and before that you can always ask the assistant to explore the project first.
       Only generate the user prompt, no explanation needed.
     user_model:
-      name: "gpt-4.1"
+      name: "gpt-5-mini"
       provider: openai
   generation:
     system_prompt:
