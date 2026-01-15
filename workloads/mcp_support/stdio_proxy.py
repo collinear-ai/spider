@@ -31,7 +31,7 @@ async def _serve(args: argparse.Namespace) -> None:
     server = Server("mcp-stdio-proxy")
     lock = anyio.Lock()
 
-    server_params = StdioServerParameters(command=args.command)
+    server_params = StdioServerParameters(command=args.command[0], args=args.command[1:])
     async with stdio_client(server_params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
