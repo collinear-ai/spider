@@ -8,7 +8,10 @@ import anyio
 from mcp.client.session import ClientSession
 from mcp.client.stdio import stdio_client
 from mcp.server import Server
-from mcp.server.streamable_http import streamable_http_server
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from starlette.applications import Starlette
+from starlette.routing import Route
+import uvicorn
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -17,6 +20,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--command", nargs=argparse.REMAINDER, required=True, help="Stdio MCP command")
+    parser.add_argument("--json-response", action="store_true", help="Use JSON responses over SSE.")
 
     return parser.parse_args()
 
@@ -43,8 +47,31 @@ async def _serve(args: argparse.Namespace) -> None:
                 async with lock:
                     return await session.call_tool(name, arguments)
             
-            async with streamable_http_server(server, host=args.host, port=args.port) as http_server:
-                await http_server.serve()
+            session_manager = StreamableHTTPSessionManager(
+                server,
+                json_response=args.json_response,
+            )
+            
+            async def lifespan(app: Starlette):
+                async with session_manager.run():
+                    yield
+
+            app = Starlette(
+                routes=[
+                    Route(
+                        "/mcp",
+                        session_manager.handle_request,
+                        methods=["GET", "POST", "DELETE"],
+                    ),
+                ],
+                lifespan=lifespan,
+            )
+            config = uvicorn.Config(
+                app, host=args.host, port=args.port, log_level="info"
+            )
+            
+            uvicorn_server = uvicorn.Server(config)
+            await uvicorn_server.serve()
 
 def main() -> None:
     args = _parse_args()

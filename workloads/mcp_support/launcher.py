@@ -71,30 +71,6 @@ def _require_env(env: Dict[str, str], required: Sequence[str], name: str) -> Non
     if missing:
         raise ValueError(f"{name} missing env vars: {', '.join(missing)}")
 
-def _zendesk_env() -> Dict[str, str]:
-    env = {
-        "ZENDESK_BASE_URL": os.environ.get("ZENDESK_BASE_URL", ""),
-        "ZENDESK_EMAIL": os.environ.get("ZENDESK_EMAIL", ""),
-        "ZENDESK_API_TOKEN": os.environ.get("ZENDESK_API_TOKEN", ""),
-    }
-
-    _require_env(env, ["ZENDESK_BASE_URL", "ZENDESK_EMAIL", "ZENDESK_API_TOKEN"], "Zendesk")
-    return env
-
-def _jira_env() -> Dict[str, str]:
-    env = {
-        "JIRA_BASE_URL": os.environ.get("JIRA_BASE_URL", ""),
-        "JIRA_USERNAME": os.environ.get("JIRA_USERNAME", ""),
-        "JIRA_API_TOKEN": os.environ.get("JIRA_API_TOKEN", ""),
-    }
-
-    default_project = os.environ.get("JIRA_DEFAULT_PROJECT")
-    if default_project:
-        env["JIRA_DEFAULT_PROJECT"] = default_project
-
-    _require_env(env, ["JIRA_BASE_URL", "JIRA_USERNAME", "JIRA_API_TOKEN"], "Jira")
-    return env
-
 def start_mcp_remote_proxy(
     *,
     port: int, 

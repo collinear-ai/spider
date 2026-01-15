@@ -11,7 +11,7 @@ For each MCP server, two things need to be set up: the MCP server dependency and
 For jira, the following should be executed in the **client** environment:
 
 ```bash
-pip install mcp anyio httpx
+pip install mcp anyio httpx starlette uvicorn sse-starlette
 npx -y mcp-remote https://mcp.atlassian.com/v1/mcp # auth
 ```
 
