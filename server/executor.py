@@ -568,6 +568,10 @@ def _is_vllm_parse_error(exc: Exception) -> bool:
         and "unexpected tokens remaining" in msg
     )
 
+def _is_permission_error(exc: JobExecutionError) -> bool:
+    message = str(exc)
+    return "PermissionDeniedError" in message or "Error code: 403" in message
+
 def _collect_ordered_results(
     futures: List[Future[Dict[str, Any]]],
     executor: ThreadPoolExecutor,
@@ -668,6 +672,9 @@ def _tool_batch_worker(
             if _is_vllm_parse_error(exc):
                 logger.warning("Skipping prompt due to vLLM parse error: %s", exc)
                 return {}
+            if _is_permission_error(exc):
+                logger.warning("Skipping prompt due to permission error: %s", exc)
+                return {}
             raise
         except Exception as exc:
             logger.exception("Prompt worker crashed while handling `%s`.", prompt[:20])
@@ -750,6 +757,9 @@ def _multi_turn_batch_worker(
         except JobExecutionError as exc:
             if _is_vllm_parse_error(exc):
                 logger.warning("Skipping prompt due to vLLM parse error: %s", exc)
+                return {}
+            if _is_permission_error(exc):
+                logger.warning("Skipping prompt due to permission error: %s", exc)
                 return {}
             raise
         except Exception:
