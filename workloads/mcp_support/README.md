@@ -13,10 +13,6 @@ For jira, the following should be executed in the **client** environment:
 ```bash
 pip install mcp anyio httpx
 npx -y mcp-remote https://mcp.atlassian.com/v1/mcp # auth
-
-# JIRA_* env vars are handled by the OAuth flow
 ```
-
-Since the MCP server is hosted on the cloud, the spider server can be remote as long as it can reach the local mcp-remote proxy JIRA_MCP_URL.
 
 Other MCP servers should follow the same pattern.
