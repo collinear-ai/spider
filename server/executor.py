@@ -668,17 +668,9 @@ def _tool_batch_worker(
                 include_logprobs=include_logprobs,
                 system_prompt=system_prompt,
             )
-        except JobExecutionError as exc:
-            if _is_vllm_parse_error(exc):
-                logger.warning("Skipping prompt due to vLLM parse error: %s", exc)
-                return {}
-            if _is_permission_error(exc):
-                logger.warning("Skipping prompt due to permission error: %s", exc)
-                return {}
-            raise
         except Exception as exc:
             logger.exception("Prompt worker crashed while handling `%s`.", prompt[:20])
-            raise
+            return {}
 
         if transcript and transcript[-1].get("role") == "assistant":
             final_content = transcript[-1].get("content", "")
@@ -754,20 +746,12 @@ def _multi_turn_batch_worker(
                     job_id=job_id,
                     system_prompt=system_prompt,
                 )
-        except JobExecutionError as exc:
-            if _is_vllm_parse_error(exc):
-                logger.warning("Skipping prompt due to vLLM parse error: %s", exc)
-                return {}
-            if _is_permission_error(exc):
-                logger.warning("Skipping prompt due to permission error: %s", exc)
-                return {}
-            raise
         except Exception:
             logger.exception(
                 "User-sim worker crashed while handling `%s`.",
                 prompt[:20],
             )
-            raise
+            return {}
 
         record = _build_generation_record(
             row,
