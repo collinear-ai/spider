@@ -26,6 +26,7 @@ async def _serve(args: argparse.Namespace) -> None:
 
     server = Server("mcp-stdio-proxy")
     env = os.environ.copy()
+    lock = anyio.Lock()
 
     async with stdio_client(args.command, env=env) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
@@ -33,12 +34,14 @@ async def _serve(args: argparse.Namespace) -> None:
 
             @server.list_tools()
             async def _list_tools():
-                result = await session.list_tools()
-                return result.tools
+                async with lock:
+                    result = await session.list_tools()
+                    return result.tools
 
             @server.call_tool()
             async def _call_tool(name: str, arguments: dict):
-                return await session.call_tool(name, arguments)
+                async with lock:
+                    return await session.call_tool(name, arguments)
             
             async with streamable_http_server(server, host=args.host, port=args.port) as http_server:
                 await http_server.serve()

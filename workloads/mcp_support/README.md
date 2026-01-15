@@ -12,8 +12,7 @@ For jira, the following should be executed in the **client** environment:
 
 ```bash
 pip install mcp anyio httpx
-npx -y mcp-remote https://mcp.atlassian.com/v1/mcp
-export JIRA_MCP_URL= # this should match what mcp-remote exposes
+npx -y mcp-remote https://mcp.atlassian.com/v1/mcp # auth
 
 # JIRA_* env vars are handled by the OAuth flow
 ```

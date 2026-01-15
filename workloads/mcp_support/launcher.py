@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
 import sys
 import socket
@@ -96,42 +95,37 @@ def _jira_env() -> Dict[str, str]:
     _require_env(env, ["JIRA_BASE_URL", "JIRA_USERNAME", "JIRA_API_TOKEN"], "Jira")
     return env
 
-def start_mcp_support_proxy(
+def start_mcp_remote_proxy(
     *,
-    name: str,
     port: int, 
     host: str = "127.0.0.1",
+    mcp_url_env: str,
+    remote_url: str,
     proxy_command: Optional[Sequence[str]] = None,
-    server_command: Optional[Sequence[str]] = None,
-    server_args: Optional[Sequence[str]] = None,
-) -> Tuple[MCPServerHandle, MCPServerSpec]:
-    normalized = name.lower().strip()
-    if normalized == "zendesk":
-        env = _zendesk_env()
-        default_command = DEFAULT_ZENDESK_COMMAND
-    elif normalized == "jira":
-        env = _jira_env()
-        default_command = DEFAULT_JIRA_COMMAND
-    else:
-        raise ValueError(f"Unsupported MCP server name: {name}")
-
+    mcp_remote_command: Optional[Sequence[str]] = None,
+) -> Tuple[MCPServerHandle, str]:
     proxy_command = list(proxy_command or DEFAULT_PROXY_COMMAND)
-    stdio_cmd = list(server_command or default_command) + list(server_args or [])
+    mcp_cmd = list(
+        mcp_remote_command
+        or ["npx", "-y", "mcp-remote", remote_url]
+    )
     command = proxy_command + [
         "--host", host,
         "--port", str(port),
         "--command",
-        *stdio_cmd,
+        *mcp_cmd,
     ]
     spec = MCPServerSpec(
-        name=normalized,
+        name="mcp-remote-proxy",
         command=command,
-        env=env,
+        env={},
         cwd=_REPO_ROOT,
         port=port,
     )
     handle = _start_server(spec)
-    return handle, spec
+    mcp_url = f"http://{host}:{port}/mcp"
+    os.environ[mcp_url_env] = mcp_url
+    return handle, mcp_url
 
 def stop_mcp_support_servers(handles: Sequence[MCPServerHandle]) -> None:
     for handle in handles:
