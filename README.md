@@ -54,8 +54,8 @@ def tool_call(arg): # custom tool that will execute in sandbox
 
 TOOL_SCHEMA = {}
 
-config = AppConfig.load("config/test-remote-processor.yaml") # define rollout hyperparams
-env = {"HF_TOKEN": "", "OPENAI_API_KEY":""} # define env variables (can also fetch from local env)
+config = AppConfig.load("config/generate_tool_calls.yaml") # define rollout hyperparams
+env = ("HF_TOKEN", "OPENAI_API_KEY") # register env variables (auto fetched from the os environment)
 
 with SpiderClient(
   config=config, 
