@@ -389,7 +389,12 @@ def _run_tool_on_policy_stream(
     from tinker_cookbook.rl.metrics import discounted_future_sum_vectorized
 
     tool_defs = tool_descriptors(job.tools)
+
     verbose_turns = bool(job.generation.verbose)
+    tinker_logger = logging.getLogger("tinker_cookbook.distillation.train_on_policy")
+    prev_tinker_level = tinker_logger.level
+    if not verbose_turns:
+        tinker_logger.setLevel(logging.WARNING)
 
     service_client = tinker.ServiceClient()
     teacher_client = service_client.create_sampling_client(base_model=options.teacher)
@@ -701,6 +706,9 @@ def _run_tool_on_policy_stream(
             "training_dir": training_dir,
         }
     finally:
+        if tinker_logger.level != prev_tinker_level:
+            tinker_logger.setLevel(prev_tinker_level)
+            
         if wandb_run:
             wandb_run.finish()
 
