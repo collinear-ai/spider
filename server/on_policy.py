@@ -394,8 +394,11 @@ def _run_tool_on_policy_stream(
     verbose_turns = bool(job.generation.verbose)
     tinker_logger = logging.getLogger("tinker_cookbook.distillation.train_on_policy")
     prev_tinker_level = tinker_logger.level
+    executor_logger = logging.getLogger("server.executor")
+    prev_executor_level = executor_logger.level
     if not verbose_turns:
         tinker_logger.setLevel(logging.WARNING)
+        executor_logger.setLevel(logging.WARNING)
 
     service_client = tinker.ServiceClient()
     teacher_client = service_client.create_sampling_client(base_model=options.teacher)
@@ -714,6 +717,8 @@ def _run_tool_on_policy_stream(
     finally:
         if tinker_logger.level != prev_tinker_level:
             tinker_logger.setLevel(prev_tinker_level)
+        if executor_logger.level != prev_executor_level:
+            executor_logger.setLevel(prev_executor_level)
 
         if wandb_run:
             wandb_run.finish()
