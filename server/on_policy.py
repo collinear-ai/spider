@@ -464,17 +464,90 @@ def _run_tool_on_policy_stream(
 
             student_logprobs = torch.tensor(logprobs, dtype=torch.float32)
             
-            teacher_alignment = await compute_teacher_alignment_for_rewards(
-                sampling_client=teacher_client,
-                messages=messages,
-                tools=tool_defs,
-                teacher_model=options.teacher,
-                student_model=job.model.name,
-                student_token_ids=token_ids,
-                student_logprobs=student_logprobs,
-                reward_mask=reward_mask,
-                assistant_raw_text=turn.get("assistant_raw_text"),
-            )
+            # Check if this is a combined multi-turn item
+            combined_turns = turn.get("_combined_turns")
+            if combined_turns:
+                # Compute teacher alignment for each turn separately and combine
+                kl_adjustments_combined = [0.0] * len(token_ids)
+                kl_mask_combined = [0.0] * len(token_ids)
+                teacher_logprobs_list = []
+                teacher_token_ids_list = []
+                
+                for turn_info in combined_turns:
+                    turn_messages = turn_info["messages"]
+                    turn_assistant_raw_text = turn_info.get("assistant_raw_text")
+                    completion_start = turn_info["completion_start"]
+                    completion_end = turn_info["completion_end"]
+                    
+                    if not turn_assistant_raw_text:
+                        continue
+                    
+                    # Create a reward mask for just this turn's completion
+                    turn_reward_mask = [0] * len(token_ids)
+                    for idx in range(completion_start, completion_end):
+                        if idx < len(turn_reward_mask):
+                            turn_reward_mask[idx] = 1
+                    
+                    # Compute teacher alignment for this turn
+                    turn_alignment = await compute_teacher_alignment_for_rewards(
+                        sampling_client=teacher_client,
+                        messages=turn_messages,
+                        tools=tool_defs,
+                        teacher_model=options.teacher,
+                        student_model=job.model.name,
+                        student_token_ids=token_ids,
+                        student_logprobs=student_logprobs,
+                        reward_mask=turn_reward_mask,
+                        assistant_raw_text=turn_assistant_raw_text,
+                    )
+                    
+                    # Extract KL adjustments and mask for this turn's region
+                    turn_kl_adj = turn_alignment.get("kl_adjustments") or [0.0] * len(token_ids)
+                    turn_kl_mask = turn_alignment.get("kl_mask") or [0.0] * len(token_ids)
+                    
+                    # Combine into the full sequence
+                    for idx in range(completion_start, completion_end):
+                        if idx < len(kl_adjustments_combined):
+                            kl_adjustments_combined[idx] = turn_kl_adj[idx]
+                            # Copy KL mask value from this turn
+                            if idx < len(turn_kl_mask):
+                                kl_mask_combined[idx] = turn_kl_mask[idx]
+                    
+                    # Collect teacher logprobs and token_ids (use last turn's for metadata)
+                    if turn_alignment.get("teacher_logprobs"):
+                        teacher_logprobs_list = turn_alignment.get("teacher_logprobs")
+                    if turn_alignment.get("teacher_token_ids"):
+                        teacher_token_ids_list = turn_alignment.get("teacher_token_ids")
+                
+                # Ensure KL mask matches reward mask exactly
+                # The reward_mask has 1s for all completion regions across all turns
+                # The kl_mask_combined should match this exactly
+                for idx in range(len(token_ids)):
+                    if idx < len(reward_mask):
+                        # Set KL mask to match reward mask: 1 where reward_mask is 1, 0 otherwise
+                        kl_mask_combined[idx] = 1.0 if reward_mask[idx] > 0 else 0.0
+                    elif idx < len(kl_mask_combined):
+                        kl_mask_combined[idx] = 0.0
+                
+                teacher_alignment = {
+                    "kl_adjustments": kl_adjustments_combined,
+                    "kl_mask": kl_mask_combined,
+                    "teacher_logprobs": teacher_logprobs_list,
+                    "teacher_token_ids": teacher_token_ids_list,
+                }
+            else:
+                # Single turn - compute teacher alignment normally
+                teacher_alignment = await compute_teacher_alignment_for_rewards(
+                    sampling_client=teacher_client,
+                    messages=messages,
+                    tools=tool_defs,
+                    teacher_model=options.teacher,
+                    student_model=job.model.name,
+                    student_token_ids=token_ids,
+                    student_logprobs=student_logprobs,
+                    reward_mask=reward_mask,
+                    assistant_raw_text=turn.get("assistant_raw_text"),
+                )
 
             item = dict(turn)
             item.update({
@@ -955,13 +1028,100 @@ def _tool_rollout_stream(
                     history=history,
                 )
 
-            all_turns_match = all(item.get("retokenize_match") for item in turn_items)
+            all_turns_match = all(item.get("retokenize_match", False) for item in turn_items)
 
         finally:
             if runtime is not None:
                 runtime.cleanup()
 
-        return turn_items
+        # Combine all turns into a single item for batch training
+        if len(turn_items) == 0:
+            return []
+        
+        if len(turn_items) == 1:
+            return turn_items
+        
+        # Use the last turn's full sequence (it contains everything)
+        last_turn = turn_items[-1]
+        combined_token_ids = list(last_turn["token_ids"])
+        combined_logprobs = list(last_turn["logprobs"])
+        
+        # Initialize reward_mask (all masked)
+        combined_reward_mask = [0] * len(combined_token_ids)
+        
+        # For each turn, unmask its completion region
+        # Since each turn's token_ids is cumulative (prefix of next turn),
+        # the completion positions in each turn's sequence correspond to
+        # the same positions in the final combined sequence
+        for turn_item in turn_items:
+            prompt_count = turn_item["prompt_token_count"]
+            turn_token_count = len(turn_item["token_ids"])
+            
+            # The completion region for this turn is from prompt_count to end of turn's tokens
+            # In the final sequence, these positions are the same (since it's cumulative)
+            completion_start = prompt_count
+            completion_end = turn_token_count
+            
+            # Unmask this completion region
+            for idx in range(completion_start, completion_end):
+                if idx < len(combined_reward_mask):
+                    combined_reward_mask[idx] = 1
+        
+        # Combine metadata - use last turn's values for most fields
+        # but collect all tool calls and assistant content
+        all_tool_calls = []
+        all_assistant_contents = []
+        all_assistant_reasoning = []
+        all_assistant_raw_texts = []
+        
+        for turn_item in turn_items:
+            if turn_item.get("assistant_tool_calls"):
+                all_tool_calls.extend(turn_item["assistant_tool_calls"])
+            if turn_item.get("assistant_content"):
+                all_assistant_contents.append(turn_item["assistant_content"])
+            if turn_item.get("assistant_reasoning_content"):
+                all_assistant_reasoning.append(turn_item["assistant_reasoning_content"])
+            if turn_item.get("assistant_raw_text"):
+                all_assistant_raw_texts.append(turn_item["assistant_raw_text"])
+        
+        # Store turn information for teacher alignment computation
+        # Each entry contains: messages (history up to that turn), assistant_raw_text, completion region
+        turn_info_for_alignment = []
+        for turn_item in turn_items:
+            turn_info_for_alignment.append({
+                "messages": turn_item["messages"],
+                "assistant_raw_text": turn_item.get("assistant_raw_text"),
+                "completion_start": turn_item["prompt_token_count"],
+                "completion_end": len(turn_item["token_ids"]),
+            })
+        
+        # Create combined item
+        combined_item = {
+            "prompt": turn_items[0]["prompt"],
+            "messages": last_turn["messages"],  # Last turn has full conversation history
+            "token_ids": combined_token_ids,
+            "logprobs": combined_logprobs,
+            "reward_mask": combined_reward_mask,
+            "assistant_content": all_assistant_contents[-1] if all_assistant_contents else "",
+            "assistant_reasoning_content": all_assistant_reasoning[-1] if all_assistant_reasoning else None,
+            "assistant_tool_calls": all_tool_calls if all_tool_calls else None,
+            "assistant_raw_text": all_assistant_raw_texts[-1] if all_assistant_raw_texts else None,
+            "prompt_token_count": turn_items[0]["prompt_token_count"],  # Initial prompt length
+            "parser_fallback": last_turn.get("parser_fallback", False),
+            "turn_index": len(turn_items) - 1,  # Last turn index
+            "retokenize_match": all_turns_match,
+            "_combined_turns": turn_info_for_alignment,  # Internal field for teacher alignment
+        }
+        
+        logger.info(
+            "prompt=`%s...` combined %d turns into single item: total_tokens=%d reward_tokens=%d",
+            prompt[:8],
+            len(turn_items),
+            len(combined_token_ids),
+            sum(combined_reward_mask),
+        )
+        
+        return [combined_item]
 
     for batch_index, start in enumerate(range(0, len(prompts), batch_size)):
         if on_batch_start and on_batch_start_lookahead > 0:

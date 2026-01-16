@@ -59,13 +59,15 @@ def parse_assistant_turn(
             try:
                 parser_cls = ToolParserManager.get_tool_parser(tool_parser_name)
                 parser = parser_cls(tokenizer)
-                try:
+                # Only pass token_ids to parsers that support it (like "openai")
+                # Other parsers (like "hermes") don't accept this argument
+                if tool_parser_name == "openai" and token_ids is not None:
                     info = parser.extract_tool_calls(
                         content,
                         request=request,
                         token_ids=token_ids,
                     )
-                except TypeError:
+                else:
                     info = parser.extract_tool_calls(content, request=request)
                 tool_calls = list(info.tool_calls) if info.tool_calls else None
                 if info.content is not None:
