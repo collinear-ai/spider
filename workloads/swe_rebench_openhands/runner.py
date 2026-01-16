@@ -309,7 +309,7 @@ def run_server_only(
 
     system_prompt_path = Path(__file__).parent / "prompts" / "system.txt"
     if system_prompt_path.exists():
-        job.generation.system_prompt = system_prompt_path.read_text(encoding="utf-8")
+        job.generation.system_prompt = [system_prompt_path.read_text(encoding="utf-8")]
 
     _cleanup_existing_containers()
 
