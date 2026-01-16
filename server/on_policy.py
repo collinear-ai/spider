@@ -519,16 +519,6 @@ def _run_tool_on_policy_stream(
                     if turn_alignment.get("teacher_token_ids"):
                         teacher_token_ids_list = turn_alignment.get("teacher_token_ids")
                 
-                # Ensure KL mask matches reward mask exactly
-                # The reward_mask has 1s for all completion regions across all turns
-                # The kl_mask_combined should match this exactly
-                for idx in range(len(token_ids)):
-                    if idx < len(reward_mask):
-                        # Set KL mask to match reward mask: 1 where reward_mask is 1, 0 otherwise
-                        kl_mask_combined[idx] = 1.0 if reward_mask[idx] > 0 else 0.0
-                    elif idx < len(kl_mask_combined):
-                        kl_mask_combined[idx] = 0.0
-                
                 teacher_alignment = {
                     "kl_adjustments": kl_adjustments_combined,
                     "kl_mask": kl_mask_combined,
