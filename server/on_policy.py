@@ -551,6 +551,11 @@ def _run_tool_on_policy_stream(
             data_D.append(datum)
             for k in batch_metrics:
                 batch_metrics[k] += turn_metrics[k]
+
+        loss_token_count = sum(
+            int(sum((turn.get("reward_mask") or [])[1:]))
+            for turn in trajectories
+        )
         
         # train!
         fwd_bwd_future = await training_client.forward_backward_async(
@@ -572,6 +577,7 @@ def _run_tool_on_policy_stream(
         loss_value = _importance_sampling_loss_value(
             fwd_bwd_result=fwd_bwd_result,
             data_D=data_D,
+            loss_token_count=loss_token_count,
         )
         batch_metrics["loss"] = loss_value
         logger.info("fwd_bwd_result type=%s, loss=%s", type(fwd_bwd_result).__name__, loss_value)
@@ -1300,13 +1306,18 @@ def _importance_sampling_loss_value(
     *,
     fwd_bwd_result: Any,
     data_D: List[tinker.Datum],
+    loss_token_count: int,
 ) -> float | None:
     loss_fn_outputs = fwd_bwd_result.loss_fn_outputs
-    per_datum_losses = []
+    total_loss = torch.tensor(0.0)
     for output, datum in zip(loss_fn_outputs, data_D, strict=True):
         target_logprobs = output["logprobs"].to_torch()
         sampling_logprobs = datum.loss_fn_inputs["logprobs"].to_torch()
         advantages = datum.loss_fn_inputs["advantages"].to_torch()
         loss = -(torch.exp(target_logprobs - sampling_logprobs) * advantages).sum()
-        per_datum_losses.append(loss)
-    return torch.stack(per_datum_losses).sum().item()
+        
+        total_loss = total_loss + loss
+
+    if loss_token_count <= 0:
+        return None
+    return (total_loss / loss_token_count).item()
