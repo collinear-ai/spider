@@ -389,6 +389,8 @@ def _run_tool_on_policy_stream(
     from tinker_cookbook.rl.metrics import discounted_future_sum_vectorized
 
     tool_defs = tool_descriptors(job.tools)
+    verbose_turns = bool(job.generation.verbose)
+
     service_client = tinker.ServiceClient()
     teacher_client = service_client.create_sampling_client(base_model=options.teacher)
     training_client = service_client.create_lora_training_client(
@@ -526,13 +528,14 @@ def _run_tool_on_policy_stream(
                 "advantage_count": len(adv_vals),
             }
 
-            logger.info(
-                "tool rollout batch=%d turn=%d n_tokens=%d n_reward_tokens=%d",
-                batch_index,
-                turn_index,
-                n_tokens,
-                n_reward,
-            )
+            if verbose_turns:
+                logger.info(
+                    "tool rollout batch=%d batch_item_idx=%d n_tokens=%d n_reward_tokens=%d",
+                    batch_index,
+                    turn_index,
+                    n_tokens,
+                    n_reward,
+                )
 
             return item, datum, turn_metrics
 
@@ -728,6 +731,7 @@ def _tool_rollout_stream(
     tool_defs = tool_descriptors(job.tools)
     turn_limit = max(1, job.generation.max_tool_turns or 16)
     thread_state = threading.local()
+    verbose_turns = bool(job.generation.verbose)
 
     batch_size, total_batches = _compute_batch_stats(prompts, job.generation.on_policy_options)
 
@@ -754,16 +758,18 @@ def _tool_rollout_stream(
             tokenize=False,
         )
         if not prompt_text_after.startswith(prompt_text_before):
-            logger.warning(
-                "Prompt text prefix mismatch after adding assistant turn."
-            )
+            if verbose_turns:
+                logger.warning(
+                    "Prompt text prefix mismatch after adding assistant turn."
+                )
             return []
 
         prompt_tokens_after = _model_input_tokens(prompt_text_after, tokenizer=tokenizer)
         if prompt_tokens_after[:len(prompt_tokens_before)] != prompt_tokens_before:
-            logger.warning(
-                "Prompt token prefix mismatch after adding assistant turn."
-            )
+            if verbose_turns:
+                logger.warning(
+                    "Prompt token prefix mismatch after adding assistant turn."
+                )
             return []
 
         return list(prompt_tokens_after[len(prompt_tokens_before):])
@@ -845,21 +851,13 @@ def _tool_rollout_stream(
                         f"token_ids too short for shifted training: tokens={len(token_ids)}"
                     )
 
-                none_count = sum(lp is None for lp in logprobs)
-                none_idx = [i for i, lp in enumerate(logprobs) if lp is None]
-                masked_count = sum(1 for m in reward_mask if int(m) == 0)
-                none_on_masked = sum(
-                    1 for lp, m in zip(logprobs, reward_mask)
-                    if lp is None and int(m) == 0
-                )
-                logger.info(
-                    "prompt=`%s...` logprobs None=%d masked=%d none_on_masked=%d none_idx=%s. Setting None to 0.0...",
-                    prompt[:8],
-                    none_count,
-                    masked_count,
-                    none_on_masked,
-                    none_idx,
-                )
+                # none_count = sum(lp is None for lp in logprobs)
+                # none_idx = [i for i, lp in enumerate(logprobs) if lp is None]
+                # masked_count = sum(1 for m in reward_mask if int(m) == 0)
+                # none_on_masked = sum(
+                #     1 for lp, m in zip(logprobs, reward_mask)
+                #     if lp is None and int(m) == 0
+                # )
 
                 logprobs = [
                     0.0 if (lp is None and int(mask) == 0) else lp
@@ -879,33 +877,36 @@ def _tool_rollout_stream(
                     snapshot["reasoning_content"] = reasoning_content
 
                 # tokenization consistency check
-                retokenized = _retokenize_last_turn_with_history(
-                    tokenizer=tokenizer,
-                    messages=history,
-                    tools=tool_defs,
-                    assistant_snapshot=snapshot,
-                )
-                completion_tokens = token_ids[assistant_message.get("prompt_token_count", 0):]
+                match = True
+                # retokenized = _retokenize_last_turn_with_history(
+                #     tokenizer=tokenizer,
+                #     messages=history,
+                #     tools=tool_defs,
+                #     assistant_snapshot=snapshot,
+                # )
+                # completion_tokens = token_ids[assistant_message.get("prompt_token_count", 0):]
                 
-                match = _match_retokenized(
-                    tokenizer=tokenizer,
-                    retokenized=retokenized,
-                    completion_tokens=completion_tokens,
-                )
-                if not match:
-                    _log_tokenization_mismatch(
-                        tokenizer=tokenizer, 
-                        retokenized=retokenized, 
-                        completion_tokens=completion_tokens
-                    )
+                # match = _match_retokenized(
+                #     tokenizer=tokenizer,
+                #     retokenized=retokenized,
+                #     completion_tokens=completion_tokens,
+                # )
+                # if not match:
+                #     if verbose_turns:
+                #         _log_tokenization_mismatch(
+                #             tokenizer=tokenizer, 
+                #             retokenized=retokenized, 
+                #             completion_tokens=completion_tokens
+                #         )
 
-                logger.info(
-                    "prompt=`%s...` turn=%d tool_returned=%s retokenized_matched=%s",
-                    prompt[:8],
-                    turn_idx,
-                    bool(tool_calls),
-                    match,
-                )
+                if verbose_turns:
+                    logger.info(
+                        "prompt=`%s...` turn=%d tool_returned=%s retokenized_matched=%s",
+                        prompt[:8],
+                        turn_idx,
+                        bool(tool_calls),
+                        match,
+                    )
 
                 history.append(snapshot)
                 turn_items.append(

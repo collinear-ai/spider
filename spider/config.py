@@ -117,6 +117,10 @@ class GenerationConfig(BaseModel):
         default_factory=dict,
         description="Sampler parameters forwarded to the remote backend"
     )
+    verbose: bool = Field(
+        default=False,
+        description="Enable verbose per-turn logging for generation"
+    )
     system_prompt: Optional[List[str]] = Field(
         default=None,
         description="System prompt(s) prepended to each chat history",
