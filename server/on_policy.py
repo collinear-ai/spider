@@ -603,8 +603,9 @@ def _run_tool_on_policy_stream(
             token_cum += step_tokens
 
             logger.info(
-                "tool rollout batch=%d token_step=%d token_cum=%d token_budget=%s",
+                "tool rollout batch=%d step_time=%.3fs token_step=%d token_cum=%d token_budget=%s",
                 batch_index,
+                batch_time,
                 step_tokens,
                 token_cum,
                 token_budget,
@@ -616,8 +617,8 @@ def _run_tool_on_policy_stream(
                     "progress/done_frac": (batch_index + 1) / total_batches if total_batches > 0 else 1.0,
                     "optim/lr": options.learning_rate,
                     "rollouts": len(trajectories),
-                    "time/total_seconds": batch_time,
-                    "time/per_step_seconds": batch_time / len(trajectories),
+                    "time / total_seconds": batch_time,
+                    "time / per_turn_seconds": batch_time / len(trajectories),
                     "token_step": step_tokens,
                     "token_cum": token_cum,
                 }
