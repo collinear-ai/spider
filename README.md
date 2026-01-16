@@ -4,14 +4,14 @@ Lightweight on/off-policy distillation engine with a single client interface. Ru
 
 `spider` supports two types of jobs:
 
-- **Off-policy distillation**, which is to create a dataset with rollouts from a good teacher model. 
+- **Off-policy distillation**, which is to create a dataset with model rollouts to conduct SFT. 
   - [This script](scripts/generate_tulu_precise_if.py) demonstrates how to generate a single-turn instruction dataset with custom processors to create prompt variations. 
-  - [This script](scripts/generate_tool_search_nemo.py) demonstrates how to generate a **multi-turn tool-enabled trajectory dataset**, with runnable sandbox, dependencies, and tools.
   - [This script](scripts/generate_multiturn_hotpotqa.py) demonstrates how to generate a **multi-turn user-simulated trajectory dataset**, where an LLM is configured to play the role of a user to ask follow-up questions.
+  - [This script](scripts/generate_mcp_jira.py) demonstrates how to generated a **tool-enabled** trajectory dataset calling tools automatically parsed from real-world MCP servers, where the agent can directly update external databases in a sandbox with a user-simulation model in the loop.
 
-- **On-policy distillation**, which is to create a training run with online supervision from a good teacher model. 
+- **On-policy distillation**, which is to create a training run with online supervision from a teacher model. 
   - [This script](scripts/train_on_policy_precise_if.py) demonstrates how to train on-policy **with any teacher model with a different tokenizer**, ensuring the correct chat template is used by both models. 
-  - [This script](scripts/train_on_policy_tool_search_nemo.py) demonstrates how to train on-policy with a specified set of tools so that the teacher can supervise the student's **multi-turn tool-execution trajectories**. 
+  - [This script](scripts/train_on_policy_tool_search_nemo.py) demonstrates how to train on-policy with a specified set of tools so that the teacher can supervise the student's **tool executions** for multiple turns directly in a sandbox. 
   - [This script](scripts/train_on_policy_swe.py) demonstrates how to train on-policy for **SWE-agent** tasks, executing tool trajectories in **concurrent docker environments** following standard agent scaffolds.
 
 Highlighted features of the engine includes:
@@ -54,8 +54,8 @@ def tool_call(arg): # custom tool that will execute in sandbox
 
 TOOL_SCHEMA = {}
 
-config = AppConfig.load("config/test-remote-processor.yaml") # define rollout hyperparams
-env = {"HF_TOKEN": "", "OPENAI_API_KEY":""} # define env variables (can also fetch from local env)
+config = AppConfig.load("config/generate_tool_calls.yaml") # define rollout hyperparams
+env = ("HF_TOKEN", "OPENAI_API_KEY") # register env variables (auto fetched from the os environment)
 
 with SpiderClient(
   config=config, 

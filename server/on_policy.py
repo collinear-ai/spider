@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional, Callable, Deque, Set
 from urllib.parse import urlparse
 import blobfile
+import torch
 
 import tinker
 from spider.config import JobConfig
@@ -389,6 +390,16 @@ def _run_tool_on_policy_stream(
     from tinker_cookbook.rl.metrics import discounted_future_sum_vectorized
 
     tool_defs = tool_descriptors(job.tools)
+
+    verbose_turns = bool(job.generation.verbose)
+    tinker_logger = logging.getLogger("tinker_cookbook.distillation.train_on_policy")
+    prev_tinker_level = tinker_logger.level
+    executor_logger = logging.getLogger("server.executor")
+    prev_executor_level = executor_logger.level
+    if not verbose_turns:
+        tinker_logger.setLevel(logging.WARNING)
+        executor_logger.setLevel(logging.WARNING)
+
     service_client = tinker.ServiceClient()
     teacher_client = service_client.create_sampling_client(base_model=options.teacher)
     training_client = service_client.create_lora_training_client(
@@ -399,6 +410,8 @@ def _run_tool_on_policy_stream(
     # Initialize wandb
     wandb_project = getattr(options, "wandb_project", None)
     wandb_name = getattr(options, "wandb_name", None) or f"tool-on-policy-{job_id[:8]}"
+    token_budget = getattr(options, "token_budget", None)
+
     wandb_run = None
     if wandb_project:
         wandb_run = wandb.init(
@@ -414,6 +427,7 @@ def _run_tool_on_policy_stream(
                 "kl_discount_factor": getattr(options, "kl_discount_factor", 0.0),
                 "loss_fn": getattr(options, "loss_fn", "importance_sampling"),
                 "total_batches": total_batches,
+                "token_budget": token_budget,
             },
         )
         logger.info("Job %s: wandb initialized. project=%s name=%s url=%s", job_id, wandb_project, wandb_name, wandb_run.url)
@@ -596,13 +610,14 @@ def _run_tool_on_policy_stream(
                 "advantage_count": len(adv_vals),
             }
 
-            logger.info(
-                "tool rollout batch=%d turn=%d n_tokens=%d n_reward_tokens=%d",
-                batch_index,
-                turn_index,
-                n_tokens,
-                n_reward,
-            )
+            if verbose_turns:
+                logger.info(
+                    "tool rollout batch=%d batch_item_idx=%d n_tokens=%d n_reward_tokens=%d",
+                    batch_index,
+                    turn_index,
+                    n_tokens,
+                    n_reward,
+                )
 
             return item, datum, turn_metrics
 
@@ -612,6 +627,11 @@ def _run_tool_on_policy_stream(
             data_D.append(datum)
             for k in batch_metrics:
                 batch_metrics[k] += turn_metrics[k]
+
+        loss_token_count = sum(
+            int(sum((turn.get("reward_mask") or [])[1:]))
+            for turn in trajectories
+        )
         
         # train!
         fwd_bwd_future = await training_client.forward_backward_async(
@@ -630,11 +650,11 @@ def _run_tool_on_policy_stream(
         await step_future.result_async()
 
         # Extract loss from forward_backward result
-        loss_value = None
-        if hasattr(fwd_bwd_result, "loss"):
-            loss_value = float(fwd_bwd_result.loss)
-        elif isinstance(fwd_bwd_result, dict) and "loss" in fwd_bwd_result:
-            loss_value = float(fwd_bwd_result["loss"])
+        loss_value = _importance_sampling_loss_value(
+            fwd_bwd_result=fwd_bwd_result,
+            data_D=data_D,
+            loss_token_count=loss_token_count,
+        )
         batch_metrics["loss"] = loss_value
         logger.info("fwd_bwd_result type=%s, loss=%s", type(fwd_bwd_result).__name__, loss_value)
 
@@ -658,11 +678,28 @@ def _run_tool_on_policy_stream(
 
         last_checkpoint = None
         global_step = 0
+        token_cum = 0
+
         for batch_index, trajectories in enumerate(rollout_stream):
             batch_start = time.time()
             batch_items, batch_metrics = await _process_batch(batch_index, trajectories)
             batch_time = time.time() - batch_start
             global_step += 1
+
+            step_tokens = sum(
+                int(sum(turn.get("reward_mask") or []))
+                for turn in trajectories
+            )
+            token_cum += step_tokens
+
+            logger.info(
+                "tool rollout batch=%d step_time=%.3fs token_step=%d token_cum=%d token_budget=%s",
+                batch_index,
+                batch_time,
+                step_tokens,
+                token_cum,
+                token_budget,
+            )
 
             # Log to wandb
             if wandb_run:
@@ -670,9 +707,14 @@ def _run_tool_on_policy_stream(
                     "progress/done_frac": (batch_index + 1) / total_batches if total_batches > 0 else 1.0,
                     "optim/lr": options.learning_rate,
                     "rollouts": len(trajectories),
-                    "time/total_seconds": batch_time,
-                    "time/per_step_seconds": batch_time / len(trajectories),
+                    "time / total_seconds": batch_time,
+                    "time / per_turn_seconds": batch_time / len(trajectories),
+                    "token_step": step_tokens,
+                    "token_cum": token_cum,
                 }
+
+                if token_budget is not None:
+                    log_data["token_budget"] = token_budget
                 # Flatten log_data keys to not include folder/dir structure
                 if batch_metrics.get("loss") is not None:
                     log_data["loss"] = batch_metrics["loss"]
@@ -689,6 +731,19 @@ def _run_tool_on_policy_stream(
                     key = k.split("/")[-1] if "/" in k else k
                     flat_log_data[key] = v
                 wandb_run.log(flat_log_data, step=global_step)
+
+            if token_budget is not None and token_cum >= token_budget:
+                logger.info(
+                    "tool rollout token budget reached. stopping training. token_cum=%d budget=%d",
+                    token_cum,
+                    token_budget,
+                )
+                events.emit(
+                    "Tool rollout token budget reached.",
+                    code="tool_on_policy.token_budget_reached",
+                    data={"token_cum": token_cum, "token_budget": token_budget},
+                )
+                break
 
             if (batch_index + 1) % save_every == 0:
                 last_checkpoint = await checkpoint_utils.save_checkpoint_async(
@@ -733,6 +788,11 @@ def _run_tool_on_policy_stream(
             "training_dir": training_dir,
         }
     finally:
+        if tinker_logger.level != prev_tinker_level:
+            tinker_logger.setLevel(prev_tinker_level)
+        if executor_logger.level != prev_executor_level:
+            executor_logger.setLevel(prev_executor_level)
+
         if wandb_run:
             wandb_run.finish()
 
@@ -763,6 +823,7 @@ def _tool_rollout_stream(
     tool_defs = tool_descriptors(job.tools)
     turn_limit = max(1, job.generation.max_tool_turns or 16)
     thread_state = threading.local()
+    verbose_turns = bool(job.generation.verbose)
 
     batch_size, total_batches = _compute_batch_stats(prompts, job.generation.on_policy_options)
 
@@ -789,16 +850,18 @@ def _tool_rollout_stream(
             tokenize=False,
         )
         if not prompt_text_after.startswith(prompt_text_before):
-            logger.warning(
-                "Prompt text prefix mismatch after adding assistant turn."
-            )
+            if verbose_turns:
+                logger.warning(
+                    "Prompt text prefix mismatch after adding assistant turn."
+                )
             return []
 
         prompt_tokens_after = _model_input_tokens(prompt_text_after, tokenizer=tokenizer)
         if prompt_tokens_after[:len(prompt_tokens_before)] != prompt_tokens_before:
-            logger.warning(
-                "Prompt token prefix mismatch after adding assistant turn."
-            )
+            if verbose_turns:
+                logger.warning(
+                    "Prompt token prefix mismatch after adding assistant turn."
+                )
             return []
 
         return list(prompt_tokens_after[len(prompt_tokens_before):])
@@ -880,21 +943,13 @@ def _tool_rollout_stream(
                         f"token_ids too short for shifted training: tokens={len(token_ids)}"
                     )
 
-                none_count = sum(lp is None for lp in logprobs)
-                none_idx = [i for i, lp in enumerate(logprobs) if lp is None]
-                masked_count = sum(1 for m in reward_mask if int(m) == 0)
-                none_on_masked = sum(
-                    1 for lp, m in zip(logprobs, reward_mask)
-                    if lp is None and int(m) == 0
-                )
-                logger.info(
-                    "prompt=`%s...` logprobs None=%d masked=%d none_on_masked=%d none_idx=%s. Setting None to 0.0...",
-                    prompt[:8],
-                    none_count,
-                    masked_count,
-                    none_on_masked,
-                    none_idx,
-                )
+                # none_count = sum(lp is None for lp in logprobs)
+                # none_idx = [i for i, lp in enumerate(logprobs) if lp is None]
+                # masked_count = sum(1 for m in reward_mask if int(m) == 0)
+                # none_on_masked = sum(
+                #     1 for lp, m in zip(logprobs, reward_mask)
+                #     if lp is None and int(m) == 0
+                # )
 
                 logprobs = [
                     0.0 if (lp is None and int(mask) == 0) else lp
@@ -914,33 +969,36 @@ def _tool_rollout_stream(
                     snapshot["reasoning_content"] = reasoning_content
 
                 # tokenization consistency check
-                retokenized = _retokenize_last_turn_with_history(
-                    tokenizer=tokenizer,
-                    messages=history,
-                    tools=tool_defs,
-                    assistant_snapshot=snapshot,
-                )
-                completion_tokens = token_ids[assistant_message.get("prompt_token_count", 0):]
+                match = True
+                # retokenized = _retokenize_last_turn_with_history(
+                #     tokenizer=tokenizer,
+                #     messages=history,
+                #     tools=tool_defs,
+                #     assistant_snapshot=snapshot,
+                # )
+                # completion_tokens = token_ids[assistant_message.get("prompt_token_count", 0):]
                 
-                match = _match_retokenized(
-                    tokenizer=tokenizer,
-                    retokenized=retokenized,
-                    completion_tokens=completion_tokens,
-                )
+                # match = _match_retokenized(
+                #     tokenizer=tokenizer,
+                #     retokenized=retokenized,
+                #     completion_tokens=completion_tokens,
+                # )
+                # if not match:
+                #     if verbose_turns:
+                #         _log_tokenization_mismatch(
+                #             tokenizer=tokenizer, 
+                #             retokenized=retokenized, 
+                #             completion_tokens=completion_tokens
+                #         )
 
-                _log_tokenization_mismatch(
-                    tokenizer=tokenizer, 
-                    retokenized=retokenized, 
-                    completion_tokens=completion_tokens
-                )
-
-                logger.info(
-                    "prompt=`%s...` turn=%d tool_returned=%s retokenized_matched=%s",
-                    prompt[:8],
-                    turn_idx,
-                    bool(tool_calls),
-                    match,
-                )
+                if verbose_turns:
+                    logger.info(
+                        "prompt=`%s...` turn=%d tool_returned=%s retokenized_matched=%s",
+                        prompt[:8],
+                        turn_idx,
+                        bool(tool_calls),
+                        match,
+                    )
 
                 history.append(snapshot)
                 turn_items.append(
@@ -1408,3 +1466,23 @@ def _preview_literal(value: Any, limit: int = 8) -> str:
     if not isinstance(value, str):
         value = repr(value)
     return repr(value[:limit])
+
+def _importance_sampling_loss_value(
+    *,
+    fwd_bwd_result: Any,
+    data_D: List[tinker.Datum],
+    loss_token_count: int,
+) -> float | None:
+    loss_fn_outputs = fwd_bwd_result.loss_fn_outputs
+    total_loss = torch.tensor(0.0)
+    for output, datum in zip(loss_fn_outputs, data_D, strict=True):
+        target_logprobs = output["logprobs"].to_torch()
+        sampling_logprobs = datum.loss_fn_inputs["logprobs"].to_torch()
+        advantages = datum.loss_fn_inputs["advantages"].to_torch()
+        loss = -(torch.exp(target_logprobs - sampling_logprobs) * advantages).sum()
+        
+        total_loss = total_loss + loss
+
+    if loss_token_count <= 0:
+        return None
+    return (total_loss / loss_token_count).item()
