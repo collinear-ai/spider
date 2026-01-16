@@ -928,35 +928,11 @@ def _tool_rollout_stream(
                     completion_tokens=completion_tokens,
                 )
 
-                # Add debug dump for tokenization mismatch
-                if not match:
-                    import pickle
-                    import os
-                    from datetime import datetime
-                    debug_dir = "/home/ubuntu/spider/tokenization_mismatch_logs"
-                    os.makedirs(debug_dir, exist_ok=True)
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                    fname = f"tokenization_mismatch_{timestamp}.pkl"
-                    out_path = os.path.join(debug_dir, fname)
-                    debug_dump = {
-                        "retokenized": retokenized,
-                        "completion_tokens": completion_tokens,
-                        "assistant_message": assistant_message,
-                        "history": list(history),
-                        "tool_defs": tool_defs,
-                    }
-                    try:
-                        with open(out_path, "wb") as f:
-                            pickle.dump(debug_dump, f)
-                        logger.warning(f"Saved tokenization mismatch debug info to {out_path}")
-                    except Exception as e:
-                        logger.error(f"Could not save tokenization mismatch debug info: {e}")
-
-                    _log_tokenization_mismatch(
-                        tokenizer=tokenizer, 
-                        retokenized=retokenized, 
-                        completion_tokens=completion_tokens
-                    )
+                _log_tokenization_mismatch(
+                    tokenizer=tokenizer, 
+                    retokenized=retokenized, 
+                    completion_tokens=completion_tokens
+                )
 
                 logger.info(
                     "prompt=`%s...` turn=%d tool_returned=%s retokenized_matched=%s",
