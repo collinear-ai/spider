@@ -227,5 +227,13 @@ class ContainerManager:
         if install_cmd:
             self.exec_bash(str(install_cmd))
         pip_packages = cfg.get("pip_packages") or []
+
         if pip_packages:
-            self.exec_bash(f"pip install {' '.join(map(shlex.quote, pip_packages))}")
+            # Handle both list and string formats
+            if isinstance(pip_packages, str):
+                # If it's a string, split it into a list
+                pip_packages = pip_packages.split()
+            # Join packages with spaces - pip install expects them as separate arguments
+            # Package names are safe, so no need to quote them
+            packages_str = ' '.join(str(pkg) for pkg in pip_packages)
+            self.exec_bash(f"pip install {packages_str}")
