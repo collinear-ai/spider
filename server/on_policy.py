@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Mapping, Tuple, Any, Iterable, Optional, Callable, Deque, Set
 from urllib.parse import urlparse
 import blobfile
+import torch
 
 import tinker
 from spider.config import JobConfig
@@ -568,11 +569,10 @@ def _run_tool_on_policy_stream(
         await step_future.result_async()
 
         # Extract loss from forward_backward result
-        loss_value = None
-        if hasattr(fwd_bwd_result, "loss"):
-            loss_value = float(fwd_bwd_result.loss)
-        elif isinstance(fwd_bwd_result, dict) and "loss" in fwd_bwd_result:
-            loss_value = float(fwd_bwd_result["loss"])
+        loss_value = _importance_sampling_loss_value(
+            fwd_bwd_result=fwd_bwd_result,
+            data_D=data_D,
+        )
         batch_metrics["loss"] = loss_value
         logger.info("fwd_bwd_result type=%s, loss=%s", type(fwd_bwd_result).__name__, loss_value)
 
@@ -708,7 +708,7 @@ def _run_tool_on_policy_stream(
     finally:
         if tinker_logger.level != prev_tinker_level:
             tinker_logger.setLevel(prev_tinker_level)
-            
+
         if wandb_run:
             wandb_run.finish()
 
@@ -1295,3 +1295,18 @@ def _preview_literal(value: Any, limit: int = 8) -> str:
     if not isinstance(value, str):
         value = repr(value)
     return repr(value[:limit])
+
+def _importance_sampling_loss_value(
+    *,
+    fwd_bwd_result: Any,
+    data_D: List[tinker.Datum],
+) -> float | None:
+    loss_fn_outputs = fwd_bwd_result.loss_fn_outputs
+    per_datum_losses = []
+    for output, datum in zip(loss_fn_outputs, data_D, strict=True):
+        target_logprobs = output["logprobs"].to_torch()
+        sampling_logprobs = datum.loss_fn_inputs["logprobs"].to_torch()
+        advantages = datum.loss_fn_inputs["advantages"].to_torch()
+        loss = -(torch.exp(target_logprobs - sampling_logprobs) * advantages).sum()
+        per_datum_losses.append(loss)
+    return torch.stack(per_datum_losses).sum().item()
