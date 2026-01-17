@@ -11,3 +11,5 @@ artifacts/
 **/tests/
 
 **/.DS_Store
+
+CLAUDE.md
