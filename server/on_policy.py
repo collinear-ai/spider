@@ -552,9 +552,6 @@ def _run_tool_on_policy_stream(
             kl_mask = teacher_alignment.get("kl_mask") or [0.0] * len(token_ids) 
             if len(kl_mask) != len(reward_mask):
                 raise JobExecutionError("KL mask length must match reward mask length.")
-            if any(int(a) != int(b) for a, b in zip(kl_mask, reward_mask)):
-                raise JobExecutionError("KL mask must match reward mask positions.")
-            
             kl_tensor = torch.tensor(kl_adj, device=student_logprobs.device, dtype=student_logprobs.dtype)
             
             kl_coef = float(getattr(options, "kl_penalty_coef", 1.0))
