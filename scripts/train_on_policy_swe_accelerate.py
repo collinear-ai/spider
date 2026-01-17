@@ -29,12 +29,17 @@ def main():
         level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
     )
 
-    # Use the same config as tinker version
-    config_path = Path("config/train_on_policy_swe.yaml")
+    # Use accelerate-specific config
+    config_path = Path("config/train_on_policy_swe_accelerate.yaml")
+    if not config_path.exists():
+        # Fallback to original config
+        config_path = Path("config/train_on_policy_swe.yaml")
     if not config_path.exists():
         print(f"Config file not found: {config_path}")
-        print("Please ensure config/train_on_policy_swe.yaml exists.")
+        print("Please ensure config/train_on_policy_swe_accelerate.yaml exists.")
         sys.exit(1)
+
+    print(f"Using config: {config_path}")
 
     job = _load_job_config(config_path)
 

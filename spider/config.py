@@ -74,7 +74,12 @@ class SourceConfig(BaseModel):
         return self
 
 class OnPolicyConfig(BaseModel):
-    teacher: str = Field(..., description="Teacher model to compute KL")
+    teacher: str = Field(..., description="Teacher model to compute KL (HF model name for tokenizer)")
+    fireworks_model: Optional[str] = Field(
+        default=None,
+        description="Fireworks model ID for teacher logprobs (e.g. 'accounts/fireworks/models/qwen3-235b-a22b'). "
+                    "If set, uses Fireworks API instead of loading teacher locally."
+    )
     learning_rate: float = Field(default=1e-4, gt=0.0)
     groups_per_batch: int = Field(default=512, ge=1)
     group_size: int = Field(default=4, ge=1)

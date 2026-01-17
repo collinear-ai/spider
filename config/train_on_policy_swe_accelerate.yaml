@@ -1,0 +1,43 @@
+job:
+  model:
+    provider: tinker
+    name: "Qwen/Qwen3-8B"
+  source:
+    dataset: nebius/SWE-rebench
+    split: filtered
+    max_examples: 8
+  generation:
+    on_policy: true
+    max_tool_turns: 4
+    parameters:
+      temperature: 0.7
+      top_p: 0.95
+      max_tokens: 16384
+      tool_choice: auto
+    on_policy_options:
+      # Teacher model - HF name for tokenizer
+      teacher: Qwen/Qwen3-235B-A22B
+      # Fireworks model ID - set this to use Fireworks API instead of loading locally
+      # Find models at: https://fireworks.ai/models
+      # Examples:
+      #   - accounts/fireworks/models/qwen3-235b-a22b
+      #   - accounts/fireworks/models/llama-v3p1-70b-instruct
+      #   - accounts/fireworks/models/deepseek-v3
+      fireworks_model: accounts/fireworks/models/qwen3-235b-a22b
+      learning_rate: 1e-7
+      groups_per_batch: 8
+      group_size: 1
+      lora_rank: 16
+      save_every: 1
+      kl_penalty_coef: 1.0
+      kl_discount_factor: 0.0
+      # Optional: wandb logging
+      # wandb_project: your-wandb-project
+      # wandb_name: qwen3-8b-swe-accelerate
+      # Optional: stop after N tokens trained
+      # token_budget: 1000000
+  output:
+    mode: upload_hf
+    hf:
+      repo_id: collinear-ai/qwen3-8b-swe-rebench-accelerate
+      repo_type: model

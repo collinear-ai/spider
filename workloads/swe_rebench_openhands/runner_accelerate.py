@@ -111,6 +111,11 @@ def _build_tool_registry() -> Dict[str, Callable[..., Any]]:
 
 
 def _cleanup_existing_containers(prefix: str = "swe-rebench-") -> None:
+    import shutil
+    if not shutil.which("docker"):
+        logger.warning("Docker not found, skipping container cleanup")
+        return
+
     proc = subprocess.run(
         ["docker", "ps", "-aq", "--filter", f"name={prefix}"],
         check=False,
