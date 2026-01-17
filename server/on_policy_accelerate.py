@@ -33,6 +33,7 @@ from tinker_cookbook.tokenizer_utils import get_tokenizer
 
 from .on_policy_accelerate_utils import (
     AccelerateTeacherContext,
+    FireworksTeacherContext,
     TransformersSamplerContext,
     compute_teacher_alignment_for_rewards_direct,
     importance_sampling_loss,
@@ -349,11 +350,19 @@ def _run_tool_on_policy_stream_accelerate(
     # Prepare with accelerator
     model, optimizer = accelerator.prepare(model, optimizer)
 
-    # Load teacher model
-    teacher_ctx = AccelerateTeacherContext(
-        model_name=options.teacher,
-        torch_dtype=torch.bfloat16,
-    )
+    # Load teacher model (use Fireworks API if fireworks_model is specified)
+    fireworks_model = getattr(options, "fireworks_model", None)
+    if fireworks_model:
+        teacher_ctx = FireworksTeacherContext(
+            model_name=options.teacher,
+            fireworks_model=fireworks_model,
+        )
+        logger.info("Using Fireworks API for teacher: %s", fireworks_model)
+    else:
+        teacher_ctx = AccelerateTeacherContext(
+            model_name=options.teacher,
+            torch_dtype=torch.bfloat16,
+        )
 
     training_dir = workspace / "training"
     training_dir.mkdir(parents=True, exist_ok=True)
@@ -398,6 +407,43 @@ def _run_tool_on_policy_stream_accelerate(
         logger.info("Job %s: wandb_project not set, skipping wandb logging.", job_id)
 
     device = accelerator.device
+
+    # Helper to call teacher alignment (handles both sync and async contexts)
+    def _compute_teacher_alignment(
+        messages,
+        tools,
+        student_token_ids,
+        student_logprobs,
+        reward_mask,
+        assistant_raw_text,
+    ):
+        if isinstance(teacher_ctx, FireworksTeacherContext):
+            # Fireworks is async, need to run in event loop
+            return asyncio.run(
+                teacher_ctx.compute_teacher_alignment(
+                    messages=messages,
+                    tools=tools,
+                    student_model=job.model.name,
+                    student_token_ids=student_token_ids,
+                    student_logprobs=student_logprobs,
+                    reward_mask=reward_mask,
+                    assistant_raw_text=assistant_raw_text,
+                )
+            )
+        else:
+            # AccelerateTeacherContext - use direct function call
+            return compute_teacher_alignment_for_rewards_direct(
+                model=teacher_ctx.model,
+                messages=messages,
+                tools=tools,
+                teacher_model=options.teacher,
+                student_model=job.model.name,
+                student_token_ids=student_token_ids,
+                student_logprobs=student_logprobs,
+                reward_mask=reward_mask,
+                assistant_raw_text=assistant_raw_text,
+                device=device,
+            )
 
     def _process_batch(
         batch_index: int, trajectories: List[Dict[str, Any]]
@@ -452,17 +498,13 @@ def _run_tool_on_policy_stream_accelerate(
                             turn_reward_mask[idx] = 1
 
                     # Compute teacher alignment for this turn
-                    turn_alignment = compute_teacher_alignment_for_rewards_direct(
-                        model=teacher_ctx.model,
+                    turn_alignment = _compute_teacher_alignment(
                         messages=turn_messages,
                         tools=tool_defs,
-                        teacher_model=options.teacher,
-                        student_model=job.model.name,
                         student_token_ids=token_ids,
                         student_logprobs=student_logprobs,
                         reward_mask=turn_reward_mask,
                         assistant_raw_text=turn_assistant_raw_text,
-                        device=device,
                     )
 
                     # Extract KL adjustments and mask for this turn's region
@@ -490,17 +532,13 @@ def _run_tool_on_policy_stream_accelerate(
                 }
             else:
                 # Single turn - compute teacher alignment normally
-                teacher_alignment = compute_teacher_alignment_for_rewards_direct(
-                    model=teacher_ctx.model,
+                teacher_alignment = _compute_teacher_alignment(
                     messages=messages,
                     tools=tool_defs,
-                    teacher_model=options.teacher,
-                    student_model=job.model.name,
                     student_token_ids=token_ids,
                     student_logprobs=student_logprobs,
                     reward_mask=reward_mask,
                     assistant_raw_text=turn.get("assistant_raw_text"),
-                    device=device,
                 )
 
             item = dict(turn)

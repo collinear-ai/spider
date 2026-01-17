@@ -548,3 +548,203 @@ class AccelerateTeacherContext:
             assistant_raw_text=assistant_raw_text,
             device=self._device,
         )
+
+
+class FireworksTeacherContext:
+    """Context for computing teacher logprobs using Fireworks API.
+
+    This avoids loading the teacher model locally, saving significant RAM.
+    Requires FIREWORKS_API_KEY environment variable.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        fireworks_model: str,
+        base_url: str = "https://api.fireworks.ai/inference/v1",
+        api_key: Optional[str] = None,
+    ) -> None:
+        """Initialize Fireworks teacher context.
+
+        Args:
+            model_name: HuggingFace model name (for tokenizer)
+            fireworks_model: Fireworks model ID (e.g. "accounts/fireworks/models/llama-v3p1-70b-instruct")
+            base_url: Fireworks API base URL
+            api_key: Fireworks API key (defaults to FIREWORKS_API_KEY env var)
+        """
+        import httpx
+
+        self.model_name = model_name
+        self.fireworks_model = fireworks_model
+        self.base_url = base_url
+        self.api_key = api_key or os.environ.get("FIREWORKS_API_KEY")
+
+        if not self.api_key:
+            raise ValueError(
+                "FIREWORKS_API_KEY environment variable must be set or api_key must be provided"
+            )
+
+        logger.info(
+            "Using Fireworks API for teacher model: %s (fireworks: %s)",
+            model_name,
+            fireworks_model,
+        )
+
+        # Load tokenizer locally (small memory footprint)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+        # Create async HTTP client
+        self._client = httpx.AsyncClient(
+            base_url=base_url,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=120.0,
+        )
+
+    async def compute_logprobs_async(self, text: str) -> Tuple[List[int], List[float]]:
+        """Compute logprobs for text using Fireworks completions API.
+
+        Args:
+            text: Full text to compute logprobs for
+
+        Returns:
+            Tuple of (token_ids, logprobs)
+        """
+        # Use completions API with echo=True to get logprobs for input tokens
+        payload = {
+            "model": self.fireworks_model,
+            "prompt": text,
+            "max_tokens": 1,
+            "echo": True,
+            "logprobs": 1,
+        }
+
+        response = await self._client.post("/completions", json=payload)
+        response.raise_for_status()
+        data = response.json()
+
+        choice = data["choices"][0]
+        logprobs_data = choice.get("logprobs", {})
+
+        token_logprobs = logprobs_data.get("token_logprobs", [])
+
+        # First token has no logprob
+        if token_logprobs and token_logprobs[0] is None:
+            token_logprobs[0] = 0.0
+
+        # Get token IDs using local tokenizer
+        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+
+        # Align lengths
+        if len(token_logprobs) != len(token_ids):
+            logger.warning(
+                "Token count mismatch: API returned %d, tokenizer has %d",
+                len(token_logprobs),
+                len(token_ids),
+            )
+            if len(token_logprobs) < len(token_ids):
+                token_logprobs.extend([0.0] * (len(token_ids) - len(token_logprobs)))
+            else:
+                token_logprobs = token_logprobs[: len(token_ids)]
+
+        return token_ids, [lp if lp is not None else 0.0 for lp in token_logprobs]
+
+    async def compute_teacher_alignment(
+        self,
+        messages: Sequence[Dict[str, object]],
+        tools: Sequence[Dict[str, object]] | None,
+        student_model: str,
+        student_token_ids: Sequence[int],
+        student_logprobs: torch.Tensor,
+        reward_mask: Sequence[int],
+        assistant_raw_text: str,
+    ) -> Dict[str, object]:
+        """Compute teacher alignment for rewards using Fireworks API."""
+        if not messages or messages[-1].get("role") != "assistant":
+            raise ValueError("Messages must end with an assistant turn.")
+
+        student_tokenizer = get_tokenizer(student_model)
+        teacher_tokenizer = self.tokenizer
+
+        prefix_msgs = list(messages[:-1])
+
+        prefix_text = teacher_tokenizer.apply_chat_template(
+            prefix_msgs,
+            tools=tools if tools else None,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        prefix_tokens = teacher_tokenizer.encode(prefix_text, add_special_tokens=False)
+
+        if assistant_raw_text is None:
+            raise ValueError("Assistant raw text is required for teacher alignment")
+
+        completion_tokens = teacher_tokenizer.encode(
+            assistant_raw_text,
+            add_special_tokens=False,
+        )
+
+        full_text = prefix_text + assistant_raw_text
+
+        # Get logprobs from Fireworks
+        _, full_logprobs = await self.compute_logprobs_async(full_text)
+
+        completion_lp = full_logprobs[len(prefix_tokens):]
+
+        if len(completion_lp) < len(completion_tokens):
+            completion_lp.extend([0.0] * (len(completion_tokens) - len(completion_lp)))
+        elif len(completion_lp) > len(completion_tokens):
+            completion_lp = completion_lp[:len(completion_tokens)]
+
+        try:
+            start = list(reward_mask).index(1)
+            end = len(reward_mask) - list(reversed(reward_mask)).index(1)
+        except ValueError:
+            return {
+                "kl_adjustments": [0.0] * len(student_token_ids),
+                "kl_mask": [0.0] * len(student_token_ids),
+                "teacher_token_ids": list(completion_tokens),
+                "teacher_logprobs": list(completion_lp),
+            }
+
+        student_ids = list(student_token_ids)[start:end]
+        student_lp_slice = student_logprobs[start:end]
+        student_mask = torch.tensor(
+            list(reward_mask)[start:end],
+            device=student_logprobs.device,
+            dtype=student_logprobs.dtype,
+        )
+
+        teacher_lp_tensor = torch.tensor(
+            completion_lp,
+            device=student_logprobs.device,
+            dtype=student_logprobs.dtype,
+        )
+
+        kl_slice, kl_mask_slice = _compute_groupwise_reverse_kl(
+            student_tokenizer,
+            student_ids,
+            student_lp_slice,
+            teacher_tokenizer,
+            completion_tokens,
+            teacher_lp_tensor,
+            student_mask,
+        )
+
+        kl_adjustments = torch.zeros_like(student_logprobs)
+        kl_mask = torch.zeros_like(student_logprobs)
+        kl_adjustments[start:end] = kl_slice
+        kl_mask[start:end] = kl_mask_slice
+
+        return {
+            "kl_adjustments": kl_adjustments.tolist(),
+            "kl_mask": kl_mask.tolist(),
+            "teacher_token_ids": list(completion_tokens),
+            "teacher_logprobs": list(completion_lp),
+        }
+
+    async def close(self) -> None:
+        """Close the HTTP client."""
+        await self._client.aclose()
