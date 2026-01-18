@@ -490,7 +490,6 @@ def _run_tool_on_policy_stream(
                     
                     # Compute teacher alignment for this turn
                     turn_alignment = await compute_teacher_alignment_for_rewards(
-                        sampling_client=teacher_client,
                         messages=turn_messages,
                         tools=tool_defs,
                         teacher_model=options.teacher,
@@ -528,7 +527,6 @@ def _run_tool_on_policy_stream(
             else:
                 # Single turn - compute teacher alignment normally
                 teacher_alignment = await compute_teacher_alignment_for_rewards(
-                    sampling_client=teacher_client,
                     messages=messages,
                     tools=tool_defs,
                     teacher_model=options.teacher,
