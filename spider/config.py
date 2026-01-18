@@ -104,6 +104,47 @@ class OnPolicyConfig(BaseModel):
     wandb_project: Optional[str] = Field(default=None, description="Wandb project name for logging")
     wandb_name: Optional[str] = Field(default=None, description="Wandb run name")
 
+    # Separated inference/training configuration
+    use_vllm_inference: bool = Field(
+        default=False,
+        description="Use vLLM server for inference instead of transformers generate()"
+    )
+    vllm_tensor_parallel_size: int = Field(
+        default=1,
+        ge=1,
+        description="Tensor parallel size for vLLM inference server"
+    )
+    vllm_gpu_memory_utilization: float = Field(
+        default=0.9,
+        gt=0.0,
+        le=1.0,
+        description="GPU memory utilization for vLLM server"
+    )
+    vllm_gpu_ids: List[int] = Field(
+        default_factory=lambda: [0],
+        description="GPU IDs for vLLM inference server (e.g. [0, 1] for TP=2)"
+    )
+    training_gpu_ids: List[int] = Field(
+        default_factory=lambda: [1],
+        description="GPU IDs for training (e.g. [2, 3] for multi-GPU training)"
+    )
+    rollout_workers: int = Field(
+        default=8,
+        ge=1,
+        description="Number of parallel workers for rollout collection"
+    )
+    weight_sync_steps: int = Field(
+        default=10,
+        ge=1,
+        description="Sync LoRA weights to vLLM server every N training steps"
+    )
+    importance_sampling_clip: float = Field(
+        default=0.2,
+        ge=0.0,
+        le=1.0,
+        description="PPO-style clipping ratio for importance sampling loss"
+    )
+
 class GenerationConfig(BaseModel):
     duplications: int = Field(default=1, ge=1)
     max_batch_size: Optional[int] = Field(default=None, ge=1)

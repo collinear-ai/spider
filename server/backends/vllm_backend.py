@@ -10,7 +10,15 @@ from spider.config import ModelConfig
 logger = logging.getLogger(__name__)
 
 class VLLMBackend:
-    def __init__(self, config: ModelConfig):
+    def __init__(
+        self,
+        config: ModelConfig,
+        *,
+        enable_lora: bool = False,
+        max_lora_rank: int = 64,
+        lora_modules: Optional[str] = None,
+        gpu_ids: Optional[List[int]] = None,
+    ):
         if not config.name:
             raise ValueError("`model.name` is required for vLLM backend.")
         self._config = config
@@ -25,18 +33,39 @@ class VLLMBackend:
         self._base_url = f"http://{self._server_host}:{self._server_port}"
         self._client = None
         self._server_proc = None
-    
+
         self._last_metrics: Dict[str, object] = {}
         self._metrics_lock = threading.Lock()
         self._tool_parser = config.parameters.get("tool_parser") or _default_tool_parser(config.name or "")
         self._chat_template = _default_chat_template(config.name or "")
         self._reasoning_parser = config.parameters.get("reasoning_parser") or _default_reasoning_parser(config.name or "")
 
+        # LoRA configuration
+        self._enable_lora = enable_lora
+        self._max_lora_rank = max_lora_rank
+        self._lora_modules = lora_modules
+        self._gpu_ids = gpu_ids
+
         try:
             self._start_server()
         except Exception:
             self.close()
             raise
+
+    @property
+    def base_url(self) -> str:
+        """Return the base URL of the vLLM server."""
+        return self._base_url
+
+    @property
+    def tool_parser(self) -> Optional[str]:
+        """Return the tool parser name for this model."""
+        return self._tool_parser
+
+    @property
+    def reasoning_parser(self) -> Optional[str]:
+        """Return the reasoning parser name for this model."""
+        return self._reasoning_parser
 
     def chat(
         self,
@@ -96,10 +125,197 @@ class VLLMBackend:
             bool(tool_calls),
         )
         return {
-            "content": content, 
-            "reasoning": reasoning or None, 
+            "content": content,
+            "reasoning": reasoning or None,
             "tool_calls": tool_calls
         }
+
+    def chat_with_logprobs(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        parameters: Dict[str, Any],
+        top_logprobs: int = 1,
+        lora_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Chat with logprobs returned for each token.
+
+        Args:
+            messages: Chat messages
+            tools: Optional tool definitions
+            parameters: Generation parameters
+            top_logprobs: Number of top logprobs to return per token
+            lora_name: Optional LoRA adapter name to use
+
+        Returns:
+            Dict with content, tool_calls, token_ids, logprobs
+        """
+        if not self._client:
+            raise RuntimeError("vLLM HTTP client is not initialized.")
+
+        model_name = self._config.name
+        if lora_name:
+            model_name = lora_name
+
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "logprobs": True,
+            "top_logprobs": top_logprobs,
+        }
+        if tools:
+            payload["tools"] = tools
+        payload.update(dict(parameters or {}))
+
+        logger.info(
+            "vLLM chat_with_logprobs called with %d messages(s), tools=%s, lora=%s",
+            len(messages),
+            bool(tools),
+            lora_name,
+        )
+
+        response = self._client.post("/v1/chat/completions", json=payload)
+
+        if response.status_code >= 400:
+            body = (response.text or "").strip()
+            payload_preview = json.dumps(payload)[:2048]
+            logger.error(
+                "vLLM chat request failed (status=%s) payload=%s body=%s",
+                response.status_code,
+                payload_preview,
+                body[:2048].replace("\n", "\\n"),
+            )
+            raise RuntimeError(
+                f"vLLM chat failed (status={response.status_code}): "
+                f"{body[:512]} | payload={payload_preview}"
+            )
+        response.raise_for_status()
+
+        data = response.json()
+        choices = data.get("choices") or []
+        if not choices:
+            raise RuntimeError("vLLM chat returned no candidate outputs.")
+
+        message = choices[0].get("message") or {}
+        content = _normalize_content(message.get("content")) or ""
+        reasoning = _normalize_content(
+            message.get("reasoning") or message.get("reasoning_content")
+        )
+        tool_calls = message.get("tool_calls")
+
+        # Extract logprobs from response
+        logprobs_data = choices[0].get("logprobs") or {}
+        logprobs_content = logprobs_data.get("content") or []
+
+        token_ids = []
+        logprobs = []
+        for lp_entry in logprobs_content:
+            token = lp_entry.get("token", "")
+            token_logprob = lp_entry.get("logprob", 0.0)
+            # Get token ID from top_logprobs
+            top_lps = lp_entry.get("top_logprobs") or []
+            token_id = None
+            for top_lp in top_lps:
+                if top_lp.get("token") == token:
+                    token_id = top_lp.get("token_id")
+                    break
+            if token_id is None:
+                # Fallback: try to get from the entry itself
+                token_id = lp_entry.get("token_id", 0)
+
+            token_ids.append(token_id)
+            logprobs.append(token_logprob)
+
+        self._update_metrics(data.get("usage"))
+        logger.info(
+            "vLLM chat_with_logprobs returned content length %d tokens=%d tool_calls=%s",
+            len(content),
+            len(token_ids),
+            bool(tool_calls),
+        )
+
+        return {
+            "content": content,
+            "reasoning": reasoning or None,
+            "tool_calls": tool_calls,
+            "token_ids": token_ids,
+            "logprobs": logprobs,
+        }
+
+    def load_lora_adapter(
+        self,
+        lora_name: str,
+        lora_path: str,
+    ) -> bool:
+        """Load a LoRA adapter dynamically.
+
+        Requires VLLM_ALLOW_RUNTIME_LORA_UPDATING=True environment variable.
+
+        Args:
+            lora_name: Name to assign to the adapter
+            lora_path: Path to the adapter checkpoint
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self._client:
+            raise RuntimeError("vLLM HTTP client is not initialized.")
+
+        payload = {
+            "lora_name": lora_name,
+            "lora_path": lora_path,
+        }
+
+        logger.info("Loading LoRA adapter: name=%s path=%s", lora_name, lora_path)
+
+        try:
+            response = self._client.post("/v1/load_lora_adapter", json=payload)
+            if response.status_code != 200:
+                logger.error(
+                    "Failed to load LoRA adapter (status=%s): %s",
+                    response.status_code,
+                    response.text[:512],
+                )
+                return False
+
+            logger.info("Successfully loaded LoRA adapter: %s", lora_name)
+            return True
+        except Exception as exc:
+            logger.error("Error loading LoRA adapter: %s", exc)
+            return False
+
+    def unload_lora_adapter(self, lora_name: str) -> bool:
+        """Unload a LoRA adapter dynamically.
+
+        Args:
+            lora_name: Name of the adapter to unload
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self._client:
+            raise RuntimeError("vLLM HTTP client is not initialized.")
+
+        payload = {"lora_name": lora_name}
+
+        logger.info("Unloading LoRA adapter: %s", lora_name)
+
+        try:
+            response = self._client.post("/v1/unload_lora_adapter", json=payload)
+            if response.status_code != 200:
+                logger.warning(
+                    "Failed to unload LoRA adapter (status=%s): %s",
+                    response.status_code,
+                    response.text[:512],
+                )
+                return False
+
+            logger.info("Successfully unloaded LoRA adapter: %s", lora_name)
+            return True
+        except Exception as exc:
+            logger.warning("Error unloading LoRA adapter: %s", exc)
+            return False
 
     def chat_batch(
         self,
@@ -164,6 +380,13 @@ class VLLMBackend:
         if self._reasoning_parser:
             command.extend(["--reasoning-parser", self._reasoning_parser])
 
+        # Add LoRA support flags
+        if self._enable_lora:
+            command.append("--enable-lora")
+            command.extend(["--max-lora-rank", str(self._max_lora_rank)])
+            if self._lora_modules:
+                command.extend(["--lora-modules", self._lora_modules])
+
         for key, value in self._model_params.items():
             if value is None: continue
             flag = f"--{key.replace('_', '-')}"
@@ -176,14 +399,22 @@ class VLLMBackend:
                     command.extend([flag, str(item)])
                 continue
             command.extend([flag, str(value)])
-        
+
         logger.info(
-            "Starting vLLM HTTP server for %s on %s",
+            "Starting vLLM HTTP server for %s on %s (enable_lora=%s, gpu_ids=%s)",
             self._config.name,
             self._base_url,
+            self._enable_lora,
+            self._gpu_ids,
         )
 
         env = os.environ.copy()
+        # Enable dynamic LoRA loading if LoRA is enabled
+        if self._enable_lora:
+            env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
+        # Set GPU visibility for vLLM server
+        if self._gpu_ids is not None:
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self._gpu_ids))
         self._server_proc = subprocess.Popen(command, env=env)
 
         self._client = httpx.Client(

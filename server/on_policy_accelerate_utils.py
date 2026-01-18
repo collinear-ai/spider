@@ -5,7 +5,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple, Any, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -196,6 +196,84 @@ def importance_sampling_loss(
     loss = loss_per_token.sum() / (loss_mask.sum() + 1e-8)
 
     return loss, current_logprobs
+
+
+def importance_sampling_loss_with_clip(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    target_ids: torch.Tensor,
+    sampling_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_mask: torch.Tensor,
+    clip_ratio: float = 0.2,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    """Compute importance sampling loss with PPO-style clipping.
+
+    This function implements PPO-style clipping to prevent large policy updates
+    that could destabilize training. The loss is computed as the pessimistic
+    (maximum) of the clipped and unclipped objectives.
+
+    Loss = max(-ratio * advantage, -clipped_ratio * advantage) where:
+    - ratio = exp(current_logprob - sampling_logprob)
+    - clipped_ratio = clamp(ratio, 1 - clip_ratio, 1 + clip_ratio)
+
+    Args:
+        model: Model to compute current logprobs
+        input_ids: Input token IDs [batch, seq_len]
+        target_ids: Target token IDs [batch, seq_len-1]
+        sampling_logprobs: Log probs from sampling [batch, seq_len-1]
+        advantages: Advantage values [batch, seq_len-1]
+        loss_mask: Mask for which tokens to include [batch, seq_len-1]
+        clip_ratio: PPO clipping ratio (default 0.2)
+
+    Returns:
+        Tuple of (loss, current_logprobs, metrics_dict)
+    """
+    outputs = model(input_ids=input_ids)
+    logits = outputs.logits[:, :-1, :]  # [batch, seq_len-1, vocab_size]
+    log_probs = F.log_softmax(logits, dim=-1)
+
+    # Gather logprobs for target tokens
+    current_logprobs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+
+    # Importance weight: exp(current - sampling)
+    ratio = torch.exp(current_logprobs - sampling_logprobs)
+
+    # Clip the ratio for stability
+    clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
+
+    # Pessimistic loss (take worse of clipped/unclipped)
+    # For positive advantages: we want to maximize ratio * advantage
+    # For negative advantages: we want to minimize ratio * (-advantage)
+    loss_unclipped = -ratio * advantages * loss_mask
+    loss_clipped = -clipped_ratio * advantages * loss_mask
+
+    # Take the maximum (pessimistic) loss
+    loss_per_token = torch.max(loss_unclipped, loss_clipped)
+    loss = loss_per_token.sum() / (loss_mask.sum() + 1e-8)
+
+    # Compute metrics for logging
+    with torch.no_grad():
+        mask_sum = loss_mask.sum().item()
+        if mask_sum > 0:
+            mean_ratio = (ratio * loss_mask).sum().item() / mask_sum
+            mean_clipped_ratio = (clipped_ratio * loss_mask).sum().item() / mask_sum
+            # Count how many tokens were clipped
+            clipped_low = ((ratio < 1.0 - clip_ratio) * loss_mask).sum().item()
+            clipped_high = ((ratio > 1.0 + clip_ratio) * loss_mask).sum().item()
+            clip_fraction = (clipped_low + clipped_high) / mask_sum
+        else:
+            mean_ratio = 1.0
+            mean_clipped_ratio = 1.0
+            clip_fraction = 0.0
+
+    metrics = {
+        "mean_ratio": mean_ratio,
+        "mean_clipped_ratio": mean_clipped_ratio,
+        "clip_fraction": clip_fraction,
+    }
+
+    return loss, current_logprobs, metrics
 
 
 def save_checkpoint_accelerate(
