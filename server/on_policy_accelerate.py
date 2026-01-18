@@ -876,7 +876,8 @@ def _run_tool_on_policy_vllm_accelerate(
         training_gpu_ids,
     )
 
-    # Start vLLM server with LoRA support on dedicated GPUs
+    # IMPORTANT: Start vLLM server BEFORE setting CUDA_VISIBLE_DEVICES for training
+    # vLLM subprocess will get its own CUDA_VISIBLE_DEVICES via its environment
     vllm_config = ModelConfig(
         provider="vllm",
         name=student_model,
@@ -892,6 +893,9 @@ def _run_tool_on_policy_vllm_accelerate(
         vllm_gpu_ids,
     )
 
+    # Save original CUDA_VISIBLE_DEVICES to restore if needed
+    original_cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+
     vllm_backend = VLLMBackend(
         config=vllm_config,
         enable_lora=True,
@@ -900,9 +904,13 @@ def _run_tool_on_policy_vllm_accelerate(
     )
 
     try:
-        # Set training GPUs via environment variable before initializing Accelerator
+        # NOW set training GPUs via environment variable after vLLM has started
         # This ensures the training model loads on the correct GPUs
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, training_gpu_ids))
+        logger.info(
+            "Set CUDA_VISIBLE_DEVICES=%s for training",
+            os.environ["CUDA_VISIBLE_DEVICES"],
+        )
 
         # Initialize Accelerator
         accelerator = Accelerator(mixed_precision="bf16")

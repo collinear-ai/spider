@@ -400,6 +400,18 @@ class VLLMBackend:
                 continue
             command.extend([flag, str(value)])
 
+        # Check if CUDA was already initialized - this can cause issues with vLLM subprocess
+        try:
+            import torch
+            if torch.cuda.is_initialized():
+                logger.warning(
+                    "CUDA was already initialized before starting vLLM server. "
+                    "This may cause issues with GPU allocation. Consider starting "
+                    "vLLM before any CUDA operations."
+                )
+        except ImportError:
+            pass
+
         logger.info(
             "Starting vLLM HTTP server for %s on %s (enable_lora=%s, gpu_ids=%s)",
             self._config.name,
@@ -415,6 +427,13 @@ class VLLMBackend:
         # Set GPU visibility for vLLM server
         if self._gpu_ids is not None:
             env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self._gpu_ids))
+        # Use spawn method for multiprocessing to avoid CUDA context issues
+        env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        # Use V0 engine for better stability with subprocess spawning
+        # V1 engine has known issues with CUDA initialization in multiprocessing
+        env["VLLM_USE_V1"] = "0"
+        # Ensure clean CUDA state in subprocess
+        env.pop("CUDA_DEVICE_ORDER", None)
         self._server_proc = subprocess.Popen(command, env=env)
 
         self._client = httpx.Client(
