@@ -31,7 +31,7 @@ def main():
     )
 
     # Use accelerate-specific config
-    config_path = Path("config/train_on_policy_swe_accelerate.yaml")
+    config_path = Path("config/train_on_policy_swe_vllm_accelerate.yaml")
     if not config_path.exists():
         # Fallback to original config
         config_path = Path("config/train_on_policy_swe.yaml")

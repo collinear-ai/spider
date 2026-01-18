@@ -1,9 +1,9 @@
 job:
   model:
     provider: tinker
-    name: "Qwen/Qwen3-8B"
+    name: "Qwen/Qwen3-30B-A3B-Instruct-2507"
   source:
-    dataset: nebius/SWE-rebench
+    dataset: collinear-ai/SWE-rebench-split
     split: filtered
     max_examples: 8
   generation:
@@ -38,8 +38,8 @@ job:
       #   2 GPU:  vllm_gpu_ids: [0], training_gpu_ids: [1]
       #   4 GPU:  vllm_gpu_ids: [0, 1], training_gpu_ids: [2, 3]  (TP=2 for vLLM)
       #   8 GPU:  vllm_gpu_ids: [0, 1, 2, 3], training_gpu_ids: [4, 5, 6, 7]
-      vllm_gpu_ids: [0]
-      training_gpu_ids: [1]
+      vllm_gpu_ids: [0,1,2,3]
+      training_gpu_ids: [4,5,6,7]
 
       # vLLM server configuration
       vllm_tensor_parallel_size: 1  # Should match len(vllm_gpu_ids) for multi-GPU inference
@@ -64,5 +64,5 @@ job:
   output:
     mode: upload_hf
     hf:
-      repo_id: collinear-ai/qwen3-8b-swe-rebench-vllm-accelerate
+      repo_id: collinear-ai/qwen3-30b-swe-rebench-split-vllm-accelerate
       repo_type: model

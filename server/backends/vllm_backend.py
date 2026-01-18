@@ -427,6 +427,8 @@ class VLLMBackend:
         # Enable dynamic LoRA loading if LoRA is enabled
         if self._enable_lora:
             env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
+            # Disable fused MoE LoRA to work around Triton compilation issues on B200
+            env["VLLM_MOE_LORA_USE_FUSED_KERNEL"] = "0"
         # Set GPU visibility for vLLM server
         if self._gpu_ids is not None:
             env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self._gpu_ids))

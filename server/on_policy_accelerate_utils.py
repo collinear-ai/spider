@@ -172,17 +172,17 @@ def importance_sampling_loss(
 
     Args:
         model: Model to compute current logprobs
-        input_ids: Input token IDs [batch, seq_len]
-        target_ids: Target token IDs [batch, seq_len-1]
-        sampling_logprobs: Log probs from sampling [batch, seq_len-1]
-        advantages: Advantage values [batch, seq_len-1]
-        loss_mask: Mask for which tokens to include [batch, seq_len-1]
+        input_ids: Input token IDs [batch, seq_len] (already shifted, excludes last token)
+        target_ids: Target token IDs [batch, seq_len] (predictions for input_ids)
+        sampling_logprobs: Log probs from sampling [batch, seq_len]
+        advantages: Advantage values [batch, seq_len]
+        loss_mask: Mask for which tokens to include [batch, seq_len]
 
     Returns:
         Tuple of (loss, current_logprobs)
     """
     outputs = model(input_ids=input_ids)
-    logits = outputs.logits[:, :-1, :]  # [batch, seq_len-1, vocab_size]
+    logits = outputs.logits  # [batch, seq_len, vocab_size] - no slicing needed, input is already aligned
     log_probs = F.log_softmax(logits, dim=-1)
 
     # Gather logprobs for target tokens
@@ -219,18 +219,18 @@ def importance_sampling_loss_with_clip(
 
     Args:
         model: Model to compute current logprobs
-        input_ids: Input token IDs [batch, seq_len]
-        target_ids: Target token IDs [batch, seq_len-1]
-        sampling_logprobs: Log probs from sampling [batch, seq_len-1]
-        advantages: Advantage values [batch, seq_len-1]
-        loss_mask: Mask for which tokens to include [batch, seq_len-1]
+        input_ids: Input token IDs [batch, seq_len] (already shifted, excludes last token)
+        target_ids: Target token IDs [batch, seq_len] (predictions for input_ids)
+        sampling_logprobs: Log probs from sampling [batch, seq_len]
+        advantages: Advantage values [batch, seq_len]
+        loss_mask: Mask for which tokens to include [batch, seq_len]
         clip_ratio: PPO clipping ratio (default 0.2)
 
     Returns:
         Tuple of (loss, current_logprobs, metrics_dict)
     """
     outputs = model(input_ids=input_ids)
-    logits = outputs.logits[:, :-1, :]  # [batch, seq_len-1, vocab_size]
+    logits = outputs.logits  # [batch, seq_len, vocab_size] - no slicing needed, input is already aligned
     log_probs = F.log_softmax(logits, dim=-1)
 
     # Gather logprobs for target tokens
@@ -680,6 +680,20 @@ class FireworksTeacherContext:
             },
             timeout=120.0,
         )
+
+    async def close(self) -> None:
+        """Close the HTTP client."""
+        if self._client is not None:
+            await self._client.aclose()
+
+    async def __aenter__(self):
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        await self.close()
+        return False
 
     async def compute_logprobs_async(self, text: str) -> Tuple[List[int], List[float]]:
         """Compute logprobs for text using Fireworks completions API.

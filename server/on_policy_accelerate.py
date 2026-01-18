@@ -461,17 +461,39 @@ def _run_tool_on_policy_stream_accelerate(
     ):
         if isinstance(teacher_ctx, FireworksTeacherContext):
             # Fireworks is async, need to run in event loop
-            return asyncio.run(
-                teacher_ctx.compute_teacher_alignment(
-                    messages=messages,
-                    tools=tools,
-                    student_model=job.model.name,
-                    student_token_ids=student_token_ids,
-                    student_logprobs=student_logprobs,
-                    reward_mask=reward_mask,
-                    assistant_raw_text=assistant_raw_text,
+            import asyncio
+            
+            async def _run_async():
+                # Recreate client for this event loop to avoid lifecycle issues
+                import httpx
+                client = httpx.AsyncClient(
+                    base_url=teacher_ctx.base_url,
+                    headers={
+                        "Authorization": f"Bearer {teacher_ctx.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=120.0,
                 )
-            )
+                # Temporarily replace the client
+                old_client = teacher_ctx._client
+                teacher_ctx._client = client
+                try:
+                    return await teacher_ctx.compute_teacher_alignment(
+                        messages=messages,
+                        tools=tools,
+                        student_model=job.model.name,
+                        student_token_ids=student_token_ids,
+                        student_logprobs=student_logprobs,
+                        reward_mask=reward_mask,
+                        assistant_raw_text=assistant_raw_text,
+                    )
+                finally:
+                    # Close the temporary client before event loop closes
+                    await client.aclose()
+                    # Restore original client
+                    teacher_ctx._client = old_client
+            
+            return asyncio.run(_run_async())
         else:
             # AccelerateTeacherContext - use direct function call
             return compute_teacher_alignment_for_rewards_direct(
@@ -1047,17 +1069,38 @@ def _run_tool_on_policy_vllm_accelerate(
         ):
             if isinstance(teacher_ctx, FireworksTeacherContext):
                 import asyncio
-                return asyncio.run(
-                    teacher_ctx.compute_teacher_alignment(
-                        messages=messages,
-                        tools=tools,
-                        student_model=student_model,
-                        student_token_ids=student_token_ids,
-                        student_logprobs=student_logprobs,
-                        reward_mask=reward_mask,
-                        assistant_raw_text=assistant_raw_text,
+                
+                async def _run_async():
+                    # Recreate client for this event loop to avoid lifecycle issues
+                    import httpx
+                    client = httpx.AsyncClient(
+                        base_url=teacher_ctx.base_url,
+                        headers={
+                            "Authorization": f"Bearer {teacher_ctx.api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        timeout=120.0,
                     )
-                )
+                    # Temporarily replace the client
+                    old_client = teacher_ctx._client
+                    teacher_ctx._client = client
+                    try:
+                        return await teacher_ctx.compute_teacher_alignment(
+                            messages=messages,
+                            tools=tools,
+                            student_model=student_model,
+                            student_token_ids=student_token_ids,
+                            student_logprobs=student_logprobs,
+                            reward_mask=reward_mask,
+                            assistant_raw_text=assistant_raw_text,
+                        )
+                    finally:
+                        # Close the temporary client before event loop closes
+                        await client.aclose()
+                        # Restore original client
+                        teacher_ctx._client = old_client
+                
+                return asyncio.run(_run_async())
             else:
                 return compute_teacher_alignment_for_rewards_direct(
                     model=teacher_ctx.model,
