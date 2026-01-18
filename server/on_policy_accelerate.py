@@ -896,6 +896,16 @@ def _run_tool_on_policy_vllm_accelerate(
     # Save original CUDA_VISIBLE_DEVICES to restore if needed
     original_cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
 
+    # CRITICAL: Ensure CUDA is not initialized before starting vLLM subprocess.
+    # vLLM workers need a clean CUDA context. If torch has already initialized
+    # CUDA, the subprocess workers may inherit corrupted state.
+    if torch.cuda.is_initialized():
+        logger.warning(
+            "CUDA was already initialized before starting vLLM. "
+            "This may cause issues with vLLM worker processes. "
+            "Consider setting CUDA_VISIBLE_DEVICES='' before imports."
+        )
+
     vllm_backend = VLLMBackend(
         config=vllm_config,
         enable_lora=True,

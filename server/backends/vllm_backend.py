@@ -387,6 +387,9 @@ class VLLMBackend:
             if self._lora_modules:
                 command.extend(["--lora-modules", self._lora_modules])
 
+        # Add --enforce-eager to prevent CUDA graph issues with multiprocessing
+        command.append("--enforce-eager")
+
         for key, value in self._model_params.items():
             if value is None: continue
             flag = f"--{key.replace('_', '-')}"
@@ -432,9 +435,23 @@ class VLLMBackend:
         # Use V0 engine for better stability with subprocess spawning
         # V1 engine has known issues with CUDA initialization in multiprocessing
         env["VLLM_USE_V1"] = "0"
+        # Also set the multiprocessing start method to spawn to avoid fork issues
+        env["VLLM_MULTIPROC_METHOD"] = "spawn"
+        # Disable async output processing which can cause issues with multiprocessing
+        env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         # Ensure clean CUDA state in subprocess
         env.pop("CUDA_DEVICE_ORDER", None)
-        self._server_proc = subprocess.Popen(command, env=env)
+        # Clear any CUDA initialization flags that might interfere
+        env.pop("CUDA_CACHE_PATH", None)
+
+        logger.info("vLLM subprocess env: VLLM_USE_V1=%s, CUDA_VISIBLE_DEVICES=%s",
+                    env.get("VLLM_USE_V1"), env.get("CUDA_VISIBLE_DEVICES"))
+        # Start in new session to fully isolate from parent process CUDA context
+        self._server_proc = subprocess.Popen(
+            command,
+            env=env,
+            start_new_session=True,
+        )
 
         self._client = httpx.Client(
             base_url=self._base_url,
