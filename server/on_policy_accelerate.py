@@ -6,30 +6,20 @@ Accelerate and PEFT instead of Tinker for training.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 import shutil
-import tarfile
 import time
-import urllib.request
-import zipfile
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Set, Tuple
-from urllib.parse import urlparse
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
-import blobfile
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from spider.config import JobConfig
-from tinker_cookbook import checkpoint_utils, model_info
-from tinker_cookbook.rl.metrics import discounted_future_sum_vectorized
-from tinker_cookbook.tokenizer_utils import get_tokenizer
 
 from .on_policy_accelerate_utils import (
     AccelerateTeacherContext,
@@ -47,6 +37,9 @@ from .writers import JSONLBatchWriter
 from .on_policy_vllm_rollouts import VLLMRolloutCollector, rollout_results_to_dicts
 from .weight_synchronizer import WeightSynchronizer
 from .backends.vllm_backend import VLLMBackend
+from .vllm_parsers import parse_assistant_turn
+from .backends.vllm_backend import _default_tool_parser, _default_reasoning_parser
+from .metrics import discounted_future_sum_vectorized
 
 RolloutBatch = List[Dict[str, Any]]
 
@@ -1832,6 +1825,55 @@ def _parse_assistant_response(
         content = re.sub(reasoning_pattern, "", content, flags=re.DOTALL).strip()
 
     return content, tool_calls if tool_calls else None, reasoning_content
+
+def _parse_assistant_response_new(
+    generated_text: str,
+    tool_defs: List[Dict[str, Any]],
+    tokenizer: Any,
+    messages: List[Dict[str, Any]],
+    token_ids: List[int],
+    model_name: str,
+    tool_parser_name: Optional[str] = None,
+    reasoning_parser_name: Optional[str] = None,
+) -> Tuple[str, List[Dict[str, Any]] | None, str | None]:
+    """Parse assistant response using vLLM parsers.
+
+    This function uses the same vLLM parsers as parse_assistant_turn to extract
+    content, tool calls, and reasoning from the generated text.
+
+    Args:
+        generated_text: The raw generated text from the model
+        tool_defs: List of tool definitions
+        tokenizer: The tokenizer instance
+        messages: The conversation history (messages)
+        token_ids: The generated token IDs
+        model_name: The model name (used to determine default parsers)
+        tool_parser_name: Optional tool parser name (if None, will be inferred from model_name)
+        reasoning_parser_name: Optional reasoning parser name (if None, will be inferred from model_name)
+
+    Returns:
+        Tuple of (content, tool_calls, reasoning_content)
+    """
+    # Determine parser names if not provided
+    if tool_parser_name is None:
+        tool_parser_name = _default_tool_parser(model_name)
+    if reasoning_parser_name is None:
+        reasoning_parser_name = _default_reasoning_parser(model_name)
+
+    # Use vLLM parsers to parse the assistant turn
+    parsed = parse_assistant_turn(
+        messages=messages,
+        assistant_text=generated_text,
+        tools=tool_defs if tool_defs else None,
+        tool_choice="auto" if tool_defs else None,
+        tool_parser_name=tool_parser_name,
+        reasoning_parser_name=reasoning_parser_name,
+        tokenizer=tokenizer,
+        token_ids=token_ids,
+        chat_template_kwargs=None,
+    )
+
+    return parsed.content, parsed.tool_calls, parsed.reasoning
 
 
 def _prepare_hf_payload(
