@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
-from huggingface_hub import HfApi, HfFolder, upload_file, upload_folder
+from typing import Mapping, Tuple, Dict
+from huggingface_hub import HfApi, upload_file, upload_folder
 from huggingface_hub.utils import HfHubHTTPError
+import shutil
+import logging
 
 from spider.config import HFUploadConfig
+
+logger = logging.getLogger(__name__)
+
 
 class HFUploadError(RuntimeError):
     pass
@@ -79,3 +84,46 @@ def _wrap_hf_error(prefix: str, exc: Exception) -> HFUploadError:
         detail = getattr(exc, "message", None) or str(exc)
         return HFUploadError(f"{prefix} (status {status}): {detail}")
     return HFUploadError(f"{prefix}: {exc}")
+
+
+def _prepare_hf_payload(
+    *,
+    training_dir: Path,
+    checkpoint: Mapping[str, object],
+    workspace: Path,
+) -> Tuple[Path, Dict[str, str], str | None]:
+    """Prepare HuggingFace upload payload from checkpoint."""
+    payload_dir = workspace / "hf_upload"
+    if payload_dir.exists():
+        shutil.rmtree(payload_dir)
+    payload_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = {}
+    sampler_path = checkpoint.get("sampler_path")
+
+    if sampler_path and Path(sampler_path).exists():
+        # Copy LoRA adapter files
+        adapter_path = Path(sampler_path)
+        if adapter_path.is_dir():
+            # Copy safetensors weights
+            for sf_file in adapter_path.glob("*.safetensors"):
+                dest = payload_dir / sf_file.name
+                shutil.copy2(sf_file, dest)
+                manifest["weights"] = sf_file.name
+
+            # Copy adapter config
+            config_file = adapter_path / "adapter_config.json"
+            if config_file.exists():
+                dest = payload_dir / "adapter_config.json"
+                shutil.copy2(config_file, dest)
+                manifest["adapter_config"] = "adapter_config.json"
+
+    checkpoints_index = training_dir / "checkpoints.jsonl"
+    checkpoints_index_text = None
+    if checkpoints_index.exists():
+        try:
+            checkpoints_index_text = checkpoints_index.read_text(encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Failed to read checkpoints index %s: %s", checkpoints_index, exc)
+
+    return payload_dir, manifest, checkpoints_index_text

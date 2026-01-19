@@ -6,30 +6,18 @@ Accelerate and PEFT instead of Tinker for training.
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import os
-import shutil
-import tarfile
 import time
-import urllib.request
-import zipfile
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Set, Tuple
-from urllib.parse import urlparse
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-import blobfile
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from spider.config import JobConfig
-from tinker_cookbook import checkpoint_utils, model_info
-from tinker_cookbook.rl.metrics import discounted_future_sum_vectorized
-from tinker_cookbook.tokenizer_utils import get_tokenizer
 
 from .on_policy_accelerate_utils import (
     AccelerateTeacherContext,
@@ -41,12 +29,16 @@ from .on_policy_accelerate_utils import (
     load_model_with_lora,
     save_checkpoint_accelerate,
 )
+from .hf_upload import _prepare_hf_payload
 from .sources import collect_prompts
 from . import events
 from .writers import JSONLBatchWriter
 from .on_policy_vllm_rollouts import VLLMRolloutCollector, rollout_results_to_dicts
 from .weight_synchronizer import WeightSynchronizer
 from .backends.vllm_backend import VLLMBackend
+from .vllm_parsers import parse_assistant_turn
+from .backends.vllm_backend import _default_tool_parser, _default_reasoning_parser
+from .metrics import discounted_future_sum_vectorized
 
 RolloutBatch = List[Dict[str, Any]]
 
@@ -460,40 +452,16 @@ def _run_tool_on_policy_stream_accelerate(
         assistant_raw_text,
     ):
         if isinstance(teacher_ctx, FireworksTeacherContext):
-            # Fireworks is async, need to run in event loop
-            import asyncio
-            
-            async def _run_async():
-                # Recreate client for this event loop to avoid lifecycle issues
-                import httpx
-                client = httpx.AsyncClient(
-                    base_url=teacher_ctx.base_url,
-                    headers={
-                        "Authorization": f"Bearer {teacher_ctx.api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    timeout=120.0,
-                )
-                # Temporarily replace the client
-                old_client = teacher_ctx._client
-                teacher_ctx._client = client
-                try:
-                    return await teacher_ctx.compute_teacher_alignment(
-                        messages=messages,
-                        tools=tools,
-                        student_model=job.model.name,
-                        student_token_ids=student_token_ids,
-                        student_logprobs=student_logprobs,
-                        reward_mask=reward_mask,
-                        assistant_raw_text=assistant_raw_text,
-                    )
-                finally:
-                    # Close the temporary client before event loop closes
-                    await client.aclose()
-                    # Restore original client
-                    teacher_ctx._client = old_client
-            
-            return asyncio.run(_run_async())
+            # Fireworks uses synchronous requests
+            return teacher_ctx.compute_teacher_alignment(
+                messages=messages,
+                tools=tools,
+                student_model=job.model.name,
+                student_token_ids=student_token_ids,
+                student_logprobs=student_logprobs,
+                reward_mask=reward_mask,
+                assistant_raw_text=assistant_raw_text,
+            )
         else:
             # AccelerateTeacherContext - use direct function call
             return compute_teacher_alignment_for_rewards_direct(
@@ -1068,39 +1036,16 @@ def _run_tool_on_policy_vllm_accelerate(
             assistant_raw_text,
         ):
             if isinstance(teacher_ctx, FireworksTeacherContext):
-                import asyncio
-                
-                async def _run_async():
-                    # Recreate client for this event loop to avoid lifecycle issues
-                    import httpx
-                    client = httpx.AsyncClient(
-                        base_url=teacher_ctx.base_url,
-                        headers={
-                            "Authorization": f"Bearer {teacher_ctx.api_key}",
-                            "Content-Type": "application/json",
-                        },
-                        timeout=120.0,
-                    )
-                    # Temporarily replace the client
-                    old_client = teacher_ctx._client
-                    teacher_ctx._client = client
-                    try:
-                        return await teacher_ctx.compute_teacher_alignment(
-                            messages=messages,
-                            tools=tools,
-                            student_model=student_model,
-                            student_token_ids=student_token_ids,
-                            student_logprobs=student_logprobs,
-                            reward_mask=reward_mask,
-                            assistant_raw_text=assistant_raw_text,
-                        )
-                    finally:
-                        # Close the temporary client before event loop closes
-                        await client.aclose()
-                        # Restore original client
-                        teacher_ctx._client = old_client
-                
-                return asyncio.run(_run_async())
+                # Fireworks uses synchronous requests
+                return teacher_ctx.compute_teacher_alignment(
+                    messages=messages,
+                    tools=tools,
+                    student_model=student_model,
+                    student_token_ids=student_token_ids,
+                    student_logprobs=student_logprobs,
+                    reward_mask=reward_mask,
+                    assistant_raw_text=assistant_raw_text,
+                )
             else:
                 return compute_teacher_alignment_for_rewards_direct(
                     model=teacher_ctx.model,
@@ -1570,10 +1515,23 @@ def _tool_rollout_stream(
                     # Decode generated text
                     generated_text = tokenizer.decode(generated_ids, skip_special_tokens=False)
 
-                    # Parse response for tool calls
-                    content, tool_calls, reasoning_content = _parse_assistant_response(
-                        generated_text, tool_defs, tokenizer
+                    # Parse response for tool calls using vLLM parsers
+                    tool_parser_name = _default_tool_parser(model_name)
+                    reasoning_parser_name = _default_reasoning_parser(model_name)
+                    parsed = parse_assistant_turn(
+                        messages=messages,
+                        assistant_text=generated_text,
+                        tools=tool_defs if tool_defs else None,
+                        tool_choice="auto" if tool_defs else None,
+                        tool_parser_name=tool_parser_name,
+                        reasoning_parser_name=reasoning_parser_name,
+                        tokenizer=tokenizer,
+                        token_ids=generated_ids,
+                        chat_template_kwargs=None,
                     )
+                    content = parsed.content
+                    tool_calls = parsed.tool_calls
+                    reasoning_content = parsed.reasoning
 
                     # Build reward mask (1 for generated tokens, 0 for prompt)
                     reward_mask = [0] * prompt_token_count + [1] * len(generated_ids)
@@ -1756,126 +1714,6 @@ def _tool_rollout_stream(
         )
         if turns:
             yield turns
-
-
-def _parse_assistant_response(
-    generated_text: str,
-    tool_defs: List[Dict[str, Any]],
-    tokenizer: Any,
-) -> Tuple[str, List[Dict[str, Any]] | None, str | None]:
-    """Parse assistant response for content and tool calls.
-
-    This is a simplified parser that handles common chat formats.
-    For production use, you may want to use a more robust parser.
-    """
-    import re
-
-    content = generated_text
-    tool_calls = None
-    reasoning_content = None
-
-    # Try to extract tool calls from common formats
-    # Format 1: JSON tool calls
-    tool_call_pattern = r'<tool_call>\s*(\{.*?\})\s*</tool_call>'
-    matches = re.findall(tool_call_pattern, generated_text, re.DOTALL)
-
-    if matches:
-        tool_calls = []
-        for i, match in enumerate(matches):
-            try:
-                call_data = json.loads(match)
-                tool_calls.append(
-                    {
-                        "id": f"call_{i}",
-                        "type": "function",
-                        "function": {
-                            "name": call_data.get("name", ""),
-                            "arguments": json.dumps(call_data.get("arguments", {})),
-                        },
-                    }
-                )
-            except json.JSONDecodeError:
-                continue
-
-        # Remove tool call tags from content
-        content = re.sub(tool_call_pattern, "", generated_text, flags=re.DOTALL).strip()
-
-    # Format 2: Function call format (for models like Qwen)
-    func_call_pattern = r'<\|function_call\|>\s*(\{.*?\})\s*'
-    func_matches = re.findall(func_call_pattern, generated_text, re.DOTALL)
-
-    if func_matches and not tool_calls:
-        tool_calls = []
-        for i, match in enumerate(func_matches):
-            try:
-                call_data = json.loads(match)
-                tool_calls.append(
-                    {
-                        "id": f"call_{i}",
-                        "type": "function",
-                        "function": {
-                            "name": call_data.get("name", ""),
-                            "arguments": json.dumps(call_data.get("arguments", {})),
-                        },
-                    }
-                )
-            except json.JSONDecodeError:
-                continue
-
-        content = re.sub(func_call_pattern, "", generated_text, flags=re.DOTALL).strip()
-
-    # Extract reasoning content if present
-    reasoning_pattern = r'<thinking>(.*?)</thinking>'
-    reasoning_match = re.search(reasoning_pattern, generated_text, re.DOTALL)
-    if reasoning_match:
-        reasoning_content = reasoning_match.group(1).strip()
-        content = re.sub(reasoning_pattern, "", content, flags=re.DOTALL).strip()
-
-    return content, tool_calls if tool_calls else None, reasoning_content
-
-
-def _prepare_hf_payload(
-    *,
-    training_dir: Path,
-    checkpoint: Mapping[str, object],
-    workspace: Path,
-) -> Tuple[Path, Dict[str, str], str | None]:
-    """Prepare HuggingFace upload payload from checkpoint."""
-    payload_dir = workspace / "hf_upload"
-    if payload_dir.exists():
-        shutil.rmtree(payload_dir)
-    payload_dir.mkdir(parents=True, exist_ok=True)
-
-    manifest = {}
-    sampler_path = checkpoint.get("sampler_path")
-
-    if sampler_path and Path(sampler_path).exists():
-        # Copy LoRA adapter files
-        adapter_path = Path(sampler_path)
-        if adapter_path.is_dir():
-            # Copy safetensors weights
-            for sf_file in adapter_path.glob("*.safetensors"):
-                dest = payload_dir / sf_file.name
-                shutil.copy2(sf_file, dest)
-                manifest["weights"] = sf_file.name
-
-            # Copy adapter config
-            config_file = adapter_path / "adapter_config.json"
-            if config_file.exists():
-                dest = payload_dir / "adapter_config.json"
-                shutil.copy2(config_file, dest)
-                manifest["adapter_config"] = "adapter_config.json"
-
-    checkpoints_index = training_dir / "checkpoints.jsonl"
-    checkpoints_index_text = None
-    if checkpoints_index.exists():
-        try:
-            checkpoints_index_text = checkpoints_index.read_text(encoding="utf-8")
-        except Exception as exc:
-            logger.warning("Failed to read checkpoints index %s: %s", checkpoints_index, exc)
-
-    return payload_dir, manifest, checkpoints_index_text
-
 
 def _compute_batch_stats(prompts: List[Any], options: Any) -> Tuple[int, int]:
     """Compute batch size and total batches."""
