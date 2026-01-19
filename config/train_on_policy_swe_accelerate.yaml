@@ -28,6 +28,7 @@ job:
       groups_per_batch: 8
       group_size: 1
       lora_rank: 16
+      token_budget: 13100000000
       save_every: 1
       kl_penalty_coef: 1.0
       kl_discount_factor: 0.0
