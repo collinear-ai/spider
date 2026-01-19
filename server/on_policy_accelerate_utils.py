@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import requests
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -13,7 +14,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenize
 from peft import LoraConfig, get_peft_model, PeftModel, TaskType
 from accelerate import Accelerator
 
-from tinker_cookbook.tokenizer_utils import get_tokenizer
 from tinker_cookbook.distillation.train_on_policy import _compute_groupwise_reverse_kl
 
 logger = logging.getLogger(__name__)
@@ -336,7 +336,7 @@ def render_chat_tokens(
     add_generation_prompt: bool = False,
 ) -> Tuple[List[int], int]:
     """Render chat messages to tokens using the model's chat template."""
-    tokenizer = get_tokenizer(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
     prompt_text = tokenizer.apply_chat_template(
         messages,
         tools=tools or None,
@@ -419,8 +419,8 @@ def compute_teacher_alignment_for_rewards_direct(
     if not messages or messages[-1].get("role") != "assistant":
         raise ValueError("Messages must end with an assistant turn.")
 
-    student_tokenizer = get_tokenizer(student_model)
-    teacher_tokenizer = get_tokenizer(teacher_model)
+    student_tokenizer = AutoTokenizer.from_pretrained(student_model, use_fast=True, trust_remote_code=True)
+    teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model, use_fast=True, trust_remote_code=True)
 
     prefix_msgs = messages[:-1]
 
@@ -650,7 +650,6 @@ class FireworksTeacherContext:
             base_url: Fireworks API base URL
             api_key: Fireworks API key (defaults to FIREWORKS_API_KEY env var)
         """
-        import httpx
 
         self.model_name = model_name
         self.fireworks_model = fireworks_model
@@ -671,31 +670,7 @@ class FireworksTeacherContext:
         # Load tokenizer locally (small memory footprint)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 
-        # Create async HTTP client
-        self._client = httpx.AsyncClient(
-            base_url=base_url,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=120.0,
-        )
-
-    async def close(self) -> None:
-        """Close the HTTP client."""
-        if self._client is not None:
-            await self._client.aclose()
-
-    async def __aenter__(self):
-        """Async context manager entry."""
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit."""
-        await self.close()
-        return False
-
-    async def compute_logprobs_async(self, text: str) -> Tuple[List[int], List[float]]:
+    def compute_logprobs(self, text: str) -> Tuple[List[int], List[float]]:
         """Compute logprobs for text using Fireworks completions API.
 
         Args:
@@ -704,46 +679,56 @@ class FireworksTeacherContext:
         Returns:
             Tuple of (token_ids, logprobs)
         """
-        # Use completions API with echo=True to get logprobs for input tokens
+
+        fireworks_url = f"{self.base_url}/completions"
         payload = {
             "model": self.fireworks_model,
-            "prompt": text,
             "max_tokens": 1,
             "echo": True,
-            "logprobs": 1,
+            "logprobs": True,
+            "prompt": text,
+        }
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
         }
 
-        response = await self._client.post("/completions", json=payload)
+        response = requests.post(fireworks_url, headers=headers, json=payload)
         response.raise_for_status()
-        data = response.json()
+        response_json = response.json()
 
-        choice = data["choices"][0]
-        logprobs_data = choice.get("logprobs", {})
-
-        token_logprobs = logprobs_data.get("token_logprobs", [])
-
-        # First token has no logprob
-        if token_logprobs and token_logprobs[0] is None:
-            token_logprobs[0] = 0.0
+        # Extract logprobs from response
+        lp_list = [
+            item["logprob"]
+            for item in response_json["choices"][0]["logprobs"]["content"]
+        ]
 
         # Get token IDs using local tokenizer
         token_ids = self.tokenizer.encode(text, add_special_tokens=False)
 
-        # Align lengths
-        if len(token_logprobs) != len(token_ids):
+        # Align lengths - use prompt_tokens from usage to slice logprobs
+        prompt_tokens = response_json["usage"]["prompt_tokens"]
+        # Fireworks returns the prefix/completion tokens + 2 extra completion tokens.
+        # So we will just consider the prompt tokens (prefix/completion).
+        # Extract completion logprobs starting after prefix_tokens
+        logprobs = lp_list[:prompt_tokens]
+
+        # Align with tokenizer output
+        if len(logprobs) != len(token_ids):
             logger.warning(
                 "Token count mismatch: API returned %d, tokenizer has %d",
-                len(token_logprobs),
+                len(logprobs),
                 len(token_ids),
             )
-            if len(token_logprobs) < len(token_ids):
-                token_logprobs.extend([0.0] * (len(token_ids) - len(token_logprobs)))
+            if len(logprobs) < len(token_ids):
+                logprobs.extend([0.0] * (len(token_ids) - len(logprobs)))
             else:
-                token_logprobs = token_logprobs[: len(token_ids)]
+                logprobs = logprobs[: len(token_ids)]
 
-        return token_ids, [lp if lp is not None else 0.0 for lp in token_logprobs]
+        return token_ids, [lp if lp is not None else 0.0 for lp in logprobs]
 
-    async def compute_teacher_alignment(
+    def compute_teacher_alignment(
         self,
         messages: Sequence[Dict[str, object]],
         tools: Sequence[Dict[str, object]] | None,
@@ -757,7 +742,7 @@ class FireworksTeacherContext:
         if not messages or messages[-1].get("role") != "assistant":
             raise ValueError("Messages must end with an assistant turn.")
 
-        student_tokenizer = get_tokenizer(student_model)
+        student_tokenizer = AutoTokenizer.from_pretrained(student_model, use_fast=True, trust_remote_code=True)
         teacher_tokenizer = self.tokenizer
 
         prefix_msgs = list(messages[:-1])
@@ -781,7 +766,8 @@ class FireworksTeacherContext:
         full_text = prefix_text + assistant_raw_text
 
         # Get logprobs from Fireworks
-        _, full_logprobs = await self.compute_logprobs_async(full_text)
+        _, full_logprobs = self.compute_logprobs(full_text)
+
 
         completion_lp = full_logprobs[len(prefix_tokens):]
 
@@ -836,7 +822,3 @@ class FireworksTeacherContext:
             "teacher_token_ids": list(completion_tokens),
             "teacher_logprobs": list(completion_lp),
         }
-
-    async def close(self) -> None:
-        """Close the HTTP client."""
-        await self._client.aclose()
