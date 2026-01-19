@@ -6,7 +6,6 @@ Accelerate and PEFT instead of Tinker for training.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shutil
@@ -1563,10 +1562,23 @@ def _tool_rollout_stream(
                     # Decode generated text
                     generated_text = tokenizer.decode(generated_ids, skip_special_tokens=False)
 
-                    # Parse response for tool calls
-                    content, tool_calls, reasoning_content = _parse_assistant_response(
-                        generated_text, tool_defs, tokenizer
+                    # Parse response for tool calls using vLLM parsers
+                    tool_parser_name = _default_tool_parser(model_name)
+                    reasoning_parser_name = _default_reasoning_parser(model_name)
+                    parsed = parse_assistant_turn(
+                        messages=messages,
+                        assistant_text=generated_text,
+                        tools=tool_defs if tool_defs else None,
+                        tool_choice="auto" if tool_defs else None,
+                        tool_parser_name=tool_parser_name,
+                        reasoning_parser_name=reasoning_parser_name,
+                        tokenizer=tokenizer,
+                        token_ids=generated_ids,
+                        chat_template_kwargs=None,
                     )
+                    content = parsed.content
+                    tool_calls = parsed.tool_calls
+                    reasoning_content = parsed.reasoning
 
                     # Build reward mask (1 for generated tokens, 0 for prompt)
                     reward_mask = [0] * prompt_token_count + [1] * len(generated_ids)
@@ -1749,132 +1761,6 @@ def _tool_rollout_stream(
         )
         if turns:
             yield turns
-
-
-def _parse_assistant_response(
-    generated_text: str,
-    tool_defs: List[Dict[str, Any]],
-    tokenizer: Any,
-) -> Tuple[str, List[Dict[str, Any]] | None, str | None]:
-    """Parse assistant response for content and tool calls.
-
-    This is a simplified parser that handles common chat formats.
-    For production use, you may want to use a more robust parser.
-    """
-    import re
-
-    content = generated_text
-    tool_calls = None
-    reasoning_content = None
-
-    # Try to extract tool calls from common formats
-    # Format 1: JSON tool calls
-    tool_call_pattern = r'<tool_call>\s*(\{.*?\})\s*</tool_call>'
-    matches = re.findall(tool_call_pattern, generated_text, re.DOTALL)
-
-    if matches:
-        tool_calls = []
-        for i, match in enumerate(matches):
-            try:
-                call_data = json.loads(match)
-                tool_calls.append(
-                    {
-                        "id": f"call_{i}",
-                        "type": "function",
-                        "function": {
-                            "name": call_data.get("name", ""),
-                            "arguments": json.dumps(call_data.get("arguments", {})),
-                        },
-                    }
-                )
-            except json.JSONDecodeError:
-                continue
-
-        # Remove tool call tags from content
-        content = re.sub(tool_call_pattern, "", generated_text, flags=re.DOTALL).strip()
-
-    # Format 2: Function call format (for models like Qwen)
-    func_call_pattern = r'<\|function_call\|>\s*(\{.*?\})\s*'
-    func_matches = re.findall(func_call_pattern, generated_text, re.DOTALL)
-
-    if func_matches and not tool_calls:
-        tool_calls = []
-        for i, match in enumerate(func_matches):
-            try:
-                call_data = json.loads(match)
-                tool_calls.append(
-                    {
-                        "id": f"call_{i}",
-                        "type": "function",
-                        "function": {
-                            "name": call_data.get("name", ""),
-                            "arguments": json.dumps(call_data.get("arguments", {})),
-                        },
-                    }
-                )
-            except json.JSONDecodeError:
-                continue
-
-        content = re.sub(func_call_pattern, "", generated_text, flags=re.DOTALL).strip()
-
-    # Extract reasoning content if present
-    reasoning_pattern = r'<thinking>(.*?)</thinking>'
-    reasoning_match = re.search(reasoning_pattern, generated_text, re.DOTALL)
-    if reasoning_match:
-        reasoning_content = reasoning_match.group(1).strip()
-        content = re.sub(reasoning_pattern, "", content, flags=re.DOTALL).strip()
-
-    return content, tool_calls if tool_calls else None, reasoning_content
-
-def _parse_assistant_response_new(
-    generated_text: str,
-    tool_defs: List[Dict[str, Any]],
-    tokenizer: Any,
-    messages: List[Dict[str, Any]],
-    token_ids: List[int],
-    model_name: str,
-    tool_parser_name: Optional[str] = None,
-    reasoning_parser_name: Optional[str] = None,
-) -> Tuple[str, List[Dict[str, Any]] | None, str | None]:
-    """Parse assistant response using vLLM parsers.
-
-    This function uses the same vLLM parsers as parse_assistant_turn to extract
-    content, tool calls, and reasoning from the generated text.
-
-    Args:
-        generated_text: The raw generated text from the model
-        tool_defs: List of tool definitions
-        tokenizer: The tokenizer instance
-        messages: The conversation history (messages)
-        token_ids: The generated token IDs
-        model_name: The model name (used to determine default parsers)
-        tool_parser_name: Optional tool parser name (if None, will be inferred from model_name)
-        reasoning_parser_name: Optional reasoning parser name (if None, will be inferred from model_name)
-
-    Returns:
-        Tuple of (content, tool_calls, reasoning_content)
-    """
-    # Determine parser names if not provided
-    if tool_parser_name is None:
-        tool_parser_name = _default_tool_parser(model_name)
-    if reasoning_parser_name is None:
-        reasoning_parser_name = _default_reasoning_parser(model_name)
-
-    # Use vLLM parsers to parse the assistant turn
-    parsed = parse_assistant_turn(
-        messages=messages,
-        assistant_text=generated_text,
-        tools=tool_defs if tool_defs else None,
-        tool_choice="auto" if tool_defs else None,
-        tool_parser_name=tool_parser_name,
-        reasoning_parser_name=reasoning_parser_name,
-        tokenizer=tokenizer,
-        token_ids=token_ids,
-        chat_template_kwargs=None,
-    )
-
-    return parsed.content, parsed.tool_calls, parsed.reasoning
-
 
 def _prepare_hf_payload(
     *,
