@@ -5,14 +5,13 @@ job:
   source:
     dataset: collinear-ai/SWE-rebench-split
     split: filtered
-    max_examples: 8
   generation:
     on_policy: true
-    max_tool_turns: 4
+    max_tool_turns: 100
     parameters:
       temperature: 0.7
       top_p: 0.95
-      max_tokens: 16384
+      max_tokens: 65536
       tool_choice: auto
     on_policy_options:
       # Teacher model - HF name for tokenizer
@@ -21,11 +20,10 @@ job:
       fireworks_model: accounts/fireworks/models/qwen3-235b-a22b
 
       # Training hyperparameters
-      learning_rate: 1e-7
-      groups_per_batch: 8
-      group_size: 1
-      lora_rank: 16
-      save_every: 1
+      learning_rate: 1e-4
+      groups_per_batch: 1024
+      lora_rank: 64
+      save_every: 50
       kl_penalty_coef: 1.0
       kl_discount_factor: 0.0
 
