@@ -8,10 +8,9 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -30,6 +29,7 @@ from .on_policy_accelerate_utils import (
     load_model_with_lora,
     save_checkpoint_accelerate,
 )
+from .hf_upload import _prepare_hf_payload
 from .sources import collect_prompts
 from . import events
 from .writers import JSONLBatchWriter
@@ -1761,49 +1761,6 @@ def _tool_rollout_stream(
         )
         if turns:
             yield turns
-
-def _prepare_hf_payload(
-    *,
-    training_dir: Path,
-    checkpoint: Mapping[str, object],
-    workspace: Path,
-) -> Tuple[Path, Dict[str, str], str | None]:
-    """Prepare HuggingFace upload payload from checkpoint."""
-    payload_dir = workspace / "hf_upload"
-    if payload_dir.exists():
-        shutil.rmtree(payload_dir)
-    payload_dir.mkdir(parents=True, exist_ok=True)
-
-    manifest = {}
-    sampler_path = checkpoint.get("sampler_path")
-
-    if sampler_path and Path(sampler_path).exists():
-        # Copy LoRA adapter files
-        adapter_path = Path(sampler_path)
-        if adapter_path.is_dir():
-            # Copy safetensors weights
-            for sf_file in adapter_path.glob("*.safetensors"):
-                dest = payload_dir / sf_file.name
-                shutil.copy2(sf_file, dest)
-                manifest["weights"] = sf_file.name
-
-            # Copy adapter config
-            config_file = adapter_path / "adapter_config.json"
-            if config_file.exists():
-                dest = payload_dir / "adapter_config.json"
-                shutil.copy2(config_file, dest)
-                manifest["adapter_config"] = "adapter_config.json"
-
-    checkpoints_index = training_dir / "checkpoints.jsonl"
-    checkpoints_index_text = None
-    if checkpoints_index.exists():
-        try:
-            checkpoints_index_text = checkpoints_index.read_text(encoding="utf-8")
-        except Exception as exc:
-            logger.warning("Failed to read checkpoints index %s: %s", checkpoints_index, exc)
-
-    return payload_dir, manifest, checkpoints_index_text
-
 
 def _compute_batch_stats(prompts: List[Any], options: Any) -> Tuple[int, int]:
     """Compute batch size and total batches."""
