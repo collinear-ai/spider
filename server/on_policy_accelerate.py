@@ -903,6 +903,9 @@ def _run_tool_on_policy_vllm_accelerate(
         gpu_ids=vllm_gpu_ids,
     )
 
+    # Initialize wandb_run before try block so it's always defined in finally
+    wandb_run = None
+
     try:
         # NOW set training GPUs via environment variable after vLLM has started
         # This ensures the training model loads on the correct GPUs
@@ -987,7 +990,6 @@ def _run_tool_on_policy_vllm_accelerate(
         token_budget = getattr(options, "token_budget", None)
         clip_ratio = getattr(options, "importance_sampling_clip", 0.2)
 
-        wandb_run = None
         if wandb_project:
             wandb_run = wandb.init(
                 project=wandb_project,

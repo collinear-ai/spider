@@ -40,7 +40,7 @@ job:
       training_gpu_ids: [4,5,6,7]
 
       # vLLM server configuration
-      vllm_tensor_parallel_size: 1  # Should match len(vllm_gpu_ids) for multi-GPU inference
+      vllm_tensor_parallel_size: 4 # Should match len(vllm_gpu_ids) for multi-GPU inference
       vllm_gpu_memory_utilization: 0.9
 
       # Parallel rollout collection
@@ -53,8 +53,8 @@ job:
       importance_sampling_clip: 0.2
 
       # Optional: wandb logging
-      # wandb_project: your-wandb-project
-      # wandb_name: qwen3-8b-swe-vllm-accelerate
+      wandb_project: icml26
+      wandb_name: qwen3-30b3a-opd
 
       # Optional: stop after N tokens trained
       # token_budget: 1000000
