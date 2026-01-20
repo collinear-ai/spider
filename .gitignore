@@ -13,3 +13,6 @@ artifacts/
 **/.DS_Store
 
 CLAUDE.md
+
+wandb/
+workspace*/
