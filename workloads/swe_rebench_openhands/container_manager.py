@@ -12,6 +12,12 @@ from typing import Any, Dict, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
+# Pre-built swerebench images have conda environment already configured
+SWEREBENCH_IMAGE_PREFIX = "swerebench/"
+
+# Conda activation commands to prefix before each command
+CONDA_ACTIVATE_PREFIX = "source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed && "
+
 def _run(cmd: Sequence[str], *, check: bool = True, text: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, check=check, text=text, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
@@ -45,15 +51,25 @@ class ContainerSpec:
     image_name: Optional[str] = None
     install_config: Optional[Dict[str, Any]] = None
 
+def _is_prebuilt_swerebench_image(image: str) -> bool:
+    """Check if the image is a pre-built swerebench image.
+
+    Pre-built images have the conda environment and dependencies already installed,
+    so we don't need to run install_config commands.
+    """
+    return image.startswith(SWEREBENCH_IMAGE_PREFIX)
+
+
 class ContainerManager:
     def __init__(
-        self, 
-        spec: ContainerSpec, 
-        *, 
-        workdir: str = "/testbed", 
+        self,
+        spec: ContainerSpec,
+        *,
+        workdir: str = "/testbed",
     ) -> None:
         self.spec = spec
         self.workdir = workdir
+        self._is_prebuilt = _is_prebuilt_swerebench_image(spec.docker_image)
 
         run_id = str(time.time_ns())
         image_short = _short_image_name(spec.docker_image)
@@ -77,15 +93,25 @@ class ContainerManager:
             _run(["docker", "pull", image])
         else:
             logger.info("Using cached Docker image: %s", image)
-            
+
         proc = _run([
-            "docker", "run", "-d", 
+            "docker", "run", "-d",
             "--name", self.container_name,
             "-w", self.workdir,
             image,
             "sleep", "infinity",
         ])
-        self._apply_install_config()
+
+        # Pre-built swerebench images already have the environment configured
+        # Running install_config on them is unnecessary and may cause errors
+        # due to Python version mismatches (e.g., packages requiring Python < 3.12)
+        if self._is_prebuilt:
+            logger.info(
+                "Skipping install_config for pre-built swerebench image: %s",
+                image,
+            )
+        else:
+            self._apply_install_config()
 
     def cleanup(self) -> None:
         _run(["docker", "rm", "-f", self.container_name], check=False)
@@ -95,12 +121,28 @@ class ContainerManager:
         command: str,
         *,
         timeout: Optional[float] = None,
+        activate_conda: Optional[bool] = None,
     ) -> str:
+        """Execute a bash command in the container.
+
+        Args:
+            command: The bash command to execute.
+            timeout: Optional timeout in seconds.
+            activate_conda: Whether to activate the testbed conda environment before
+                running the command. If None (default), activates for pre-built
+                swerebench images automatically.
+        """
+        # For pre-built swerebench images, ensure conda environment is activated
+        # The images have .bashrc configured, but bash -lc doesn't always source it
+        should_activate = activate_conda if activate_conda is not None else self._is_prebuilt
+        if should_activate:
+            command = CONDA_ACTIVATE_PREFIX + command
+
         cmd = [
-            "docker", "exec", 
-            "-w", self.workdir, 
-            self.container_name, 
-            "bash", "-lc", command
+            "docker", "exec",
+            "-w", self.workdir,
+            self.container_name,
+            "bash", "-c", command
         ]
         proc = subprocess.run(
             cmd,
