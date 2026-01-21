@@ -17,7 +17,7 @@ job:
       # Teacher model - HF name for tokenizer
       teacher: Qwen/Qwen3-235B-A22B
       # Fireworks model ID - set this to use Fireworks API instead of loading locally
-      fireworks_model: accounts/fireworks/models/qwen3-235b-a22b
+      fireworks_model: accounts/keith-7ff28a/deployments/zmzelu33
 
       # Training hyperparameters
       learning_rate: 1e-4
@@ -26,6 +26,14 @@ job:
       save_every: 50
       kl_penalty_coef: 1.0
       kl_discount_factor: 0.0
+
+      # DeepSpeed configuration (optional - for memory efficiency and multi-GPU scaling)
+      use_deepspeed: true  # Set to true to enable DeepSpeed ZeRO
+      deepspeed_config_path: "config/deepspeed_config_zer2.json"  # Path to config file (uses ZeRO-2, no CPU offload for speed)
+      # Note: The config file settings override the programmatic options below
+      deepspeed_zero_stage: 2  # 1, 2, or 3 (2 recommended for LoRA - only used if config_path is None)
+      deepspeed_offload_optimizer: false  # Only used if config_path is None
+      deepspeed_offload_param: false  # Only used if config_path is None (ZeRO-3 only)
 
       # === Separated vLLM Inference + Training Architecture ===
       # Enable vLLM-based inference (parallel rollouts, proper tool parsing)
@@ -42,9 +50,12 @@ job:
       # vLLM server configuration
       vllm_tensor_parallel_size: 4 # Should match len(vllm_gpu_ids) for multi-GPU inference
       vllm_gpu_memory_utilization: 0.9
+      # vLLM batch size optimizations (for better throughput)
+      vllm_max_num_batched_tokens: 16384  # Default: 4096, increase for larger batches
+      vllm_max_num_seqs: 512  # Default: 256, more concurrent sequences
 
       # Parallel rollout collection
-      rollout_workers: 8  # Number of concurrent HTTP requests to vLLM
+      rollout_workers: 128  # Number of concurrent HTTP requests to vLLM (increased for better throughput)
 
       # Weight synchronization between training and inference
       weight_sync_steps: 10  # Sync LoRA weights to vLLM every N training steps
@@ -54,7 +65,7 @@ job:
 
       # Optional: wandb logging
       wandb_project: icml26
-      wandb_name: qwen3-30b3a-opd
+      wandb_name: qwen3-30b3a-opd-vincent-test
 
       # Optional: stop after N tokens trained
       # token_budget: 1000000
