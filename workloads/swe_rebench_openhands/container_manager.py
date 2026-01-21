@@ -90,7 +90,38 @@ class ContainerManager:
         image = self.spec.docker_image
         if not image_exists(image):
             logger.info("Pulling Docker image: %s", image)
-            _run(["docker", "pull", image])
+            # Retry with exponential backoff for rate limiting
+            max_retries = 5
+            initial_delay = 1.0
+            last_error = None
+            for attempt in range(max_retries):
+                proc = _run(["docker", "pull", image], check=False)
+                if proc.returncode == 0:
+                    break
+                
+                output = proc.stdout.strip() if proc.stdout else ""
+                last_error = output
+                
+                # Check if it's a rate limit error
+                is_rate_limit = (
+                    "429" in output or 
+                    "Too Many Requests" in output or 
+                    "toomanyrequests" in output.lower() or
+                    "rate limit" in output.lower()
+                )
+                
+                if is_rate_limit and attempt < max_retries - 1:
+                    delay = initial_delay * (2 ** attempt)
+                    logger.warning(
+                        "Docker Hub rate limit hit for %s (attempt %d/%d), retrying in %.1fs...",
+                        image, attempt + 1, max_retries, delay
+                    )
+                    time.sleep(delay)
+                    continue
+                
+                # If not rate limit or last attempt, raise
+                if not is_rate_limit or attempt == max_retries - 1:
+                    raise RuntimeError(f"Failed to pull {image}: {last_error}")
         else:
             logger.info("Using cached Docker image: %s", image)
 
