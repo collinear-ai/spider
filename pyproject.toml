@@ -7,11 +7,14 @@ name = "spider"
 version = "0.0.1"
 description = "Lightweight synthetic data generation client"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<=3.11.14"
 dependencies = [
     "datasets>=4.5.0",
+    "deepspeed>=0.18.4",
+    "mpi4py>=4.1.1",
     "pydantic",
     "pyYAML",
+    "vllm>=0.13.0",
 ]
 authors = [
     { name = "Muyu He", email = "muyu@collinear.ai" }

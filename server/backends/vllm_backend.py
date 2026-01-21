@@ -524,14 +524,16 @@ def _default_tool_parser(model_name: str) -> Optional[str]:
         return "qwen3_xml"
     if "qwen3" in lower: 
         return "hermes"
+    if "qwen2.5" in lower:
+        return "hermes"
+    if "qwen" in lower:
+        return "hermes"
     if "deepseek" in lower:
         return "deepseek_v31" if "v3.1" in lower else "deepseek_v3"
     if "glm-4" in lower:
         return "glm45"
     if "mistral" in lower:
         return "mistral"
-    if "qwen2.5" in lower:
-        return "hermes"
     if "gpt-oss" in lower:
         return "openai"
     return None
