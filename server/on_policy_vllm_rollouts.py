@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import json
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import httpx
+from tqdm.auto import tqdm
 
 from .vllm_parsers import parse_assistant_turn
 
@@ -64,13 +67,27 @@ class VLLMRolloutCollector:
     _client: httpx.Client = field(init=False, default=None)
     _executor: ThreadPoolExecutor = field(init=False, default=None)
     _tokenizer: Any = field(init=False, default=None)
+    _thread_local: Any = field(init=False, default=None)
 
     def __post_init__(self) -> None:
+        # Use connection pooling and keep-alive for better performance
+        # Increase connection limits to match rollout_workers and account for multiple turns per prompt
+        # Each worker can have multiple concurrent requests (one per turn), so we need more connections
+        max_concurrent_requests = self.max_workers * min(self.max_tool_turns, 10)  # Cap at 10 concurrent turns per worker
         self._client = httpx.Client(
             base_url=self.vllm_base_url,
             timeout=httpx.Timeout(480.0, connect=60.0),
+            limits=httpx.Limits(
+                max_keepalive_connections=max(200, max_concurrent_requests),  # Keep more connections alive
+                max_connections=max(400, max_concurrent_requests * 2),  # Allow more concurrent connections
+            ),
+            http2=False,  # HTTP/1.1 is faster for vLLM
         )
         self._executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        
+        # Use thread-local storage for per-thread HTTP clients to avoid contention
+        import threading
+        self._thread_local = threading.local()
 
         # Load tokenizer for parsing
         from tinker_cookbook.tokenizer_utils import get_tokenizer
@@ -86,15 +103,66 @@ class VLLMRolloutCollector:
         Returns:
             List of RolloutResult objects for each prompt
         """
-        futures = [self._executor.submit(self._run_prompt, p) for p in prompts]
+        start_time = time.time()
+        total_prompts = len(prompts)
+        
+        # Submit all tasks
+        futures = {self._executor.submit(self._run_prompt, p): i for i, p in enumerate(prompts)}
+        
         results = []
-        for future in futures:
+        completed = 0
+        failed = 0
+        
+        # Create progress bar for rollout collection
+        # Use position=0 and file=sys.stderr to persist at bottom of terminal
+        pbar = tqdm(
+            total=total_prompts,
+            desc="Rollouts",
+            unit="prompt",
+            leave=True,  # Keep visible after completion
+            ncols=100,
+            position=0,  # Fixed position at bottom
+            file=sys.stderr,  # Use stderr so it doesn't interfere with stdout logging
+            mininterval=0.5,  # Update at least every 0.5 seconds
+        )
+        
+        # Process completed futures with progress tracking
+        for future in as_completed(futures):
+            prompt_idx = futures[future]
             try:
                 result = future.result()
                 if result:
                     results.extend(result)
+                    completed += 1
+                else:
+                    logger.warning("Rollout for prompt %d returned no results", prompt_idx)
             except Exception as exc:
-                logger.error("Rollout failed: %s", exc)
+                failed += 1
+                logger.error("Rollout failed for prompt %d: %s", prompt_idx, exc, exc_info=True)
+            
+            pbar.update(1)
+            pbar.set_postfix({
+                "completed": completed,
+                "failed": failed,
+                "results": len(results)
+            })
+        
+        pbar.close()
+        
+        elapsed = time.time() - start_time
+        throughput = total_prompts / elapsed if elapsed > 0 else 0
+        
+        logger.info(
+            "Rollout collection complete: prompts=%d completed=%d failed=%d results=%d "
+            "time=%.2fs throughput=%.2f prompts/s",
+            total_prompts,
+            completed,
+            failed,
+            len(results),
+            elapsed,
+            throughput,
+        )
+        
         return results
 
     def _run_prompt(self, row: Dict[str, Any]) -> List[RolloutResult]:
@@ -120,10 +188,31 @@ class VLLMRolloutCollector:
         if self.runtime_factory:
             runtime = self.runtime_factory(row)
 
+        turn_start_time = time.time()
         try:
             for turn_idx in range(self.max_tool_turns):
                 try:
+                    turn_gen_start = time.time()
                     response = self._generate_with_logprobs(history)
+                    turn_gen_time = time.time() - turn_gen_start
+                    
+                    # Log slow generations to identify bottlenecks
+                    if turn_gen_time > 5.0:  # Log if generation takes > 5 seconds
+                        logger.warning(
+                            "Slow generation: prompt=`%s...` turn=%d generation_time=%.2fs tokens=%d",
+                            prompt[:20],
+                            turn_idx,
+                            turn_gen_time,
+                            len(response.get("token_ids", [])),
+                        )
+                    elif self.verbose:
+                        logger.debug(
+                            "Prompt=`%s...` turn=%d generation_time=%.2fs tokens=%d",
+                            prompt[:20],
+                            turn_idx,
+                            turn_gen_time,
+                            len(response.get("token_ids", [])),
+                        )
                 except Exception as exc:
                     if self._is_context_window_error(exc):
                         logger.warning(
@@ -194,8 +283,18 @@ class VLLMRolloutCollector:
                 if not tool_calls:
                     break
 
-                # Execute tool calls
+                # Execute tool calls (measure time to identify slow tools)
+                tool_exec_start = time.time()
                 self._execute_tool_calls(tool_calls, history)
+                tool_exec_time = time.time() - tool_exec_start
+                if tool_exec_time > 1.0:  # Log if tool execution takes > 1 second
+                    logger.warning(
+                        "Slow tool execution: prompt=`%s...` turn=%d tool_time=%.2fs num_tools=%d",
+                        prompt[:20],
+                        turn_idx,
+                        tool_exec_time,
+                        len(tool_calls),
+                    )
 
         finally:
             if runtime is not None:
@@ -209,6 +308,21 @@ class VLLMRolloutCollector:
             return [turn_items[0]]
 
         return [self._combine_turns(turn_items)]
+
+    def _get_client(self) -> httpx.Client:
+        """Get thread-local HTTP client to avoid contention on shared client."""
+        if not hasattr(self._thread_local, 'client'):
+            # Create per-thread client with same configuration
+            self._thread_local.client = httpx.Client(
+                base_url=self.vllm_base_url,
+                timeout=httpx.Timeout(480.0, connect=60.0),
+                limits=httpx.Limits(
+                    max_keepalive_connections=50,  # Per-thread connection pool
+                    max_connections=100,  # Per-thread max connections
+                ),
+                http2=False,
+            )
+        return self._thread_local.client
 
     def _generate_with_logprobs(
         self, messages: List[Dict[str, Any]]
@@ -235,7 +349,9 @@ class VLLMRolloutCollector:
         if self.tools:
             payload["tools"] = self.tools
 
-        response = self._client.post("/v1/chat/completions", json=payload)
+        # Use thread-local client to avoid contention
+        client = self._get_client()
+        response = client.post("/v1/chat/completions", json=payload)
 
         if response.status_code >= 400:
             body = (response.text or "").strip()
