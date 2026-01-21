@@ -57,11 +57,15 @@ def load_model_with_lora(
         checkpoint_path,
     )
 
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
     base_model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch_dtype,
         device_map=device_map,
         trust_remote_code=True,
+        attn_implementation="flash_attention_2",
     )
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -90,6 +94,8 @@ def load_model_with_lora(
         )
         model = get_peft_model(base_model, lora_config)
         model.print_trainable_parameters()
+
+    model.gradient_checkpointing_enable()
 
     return model, tokenizer
 

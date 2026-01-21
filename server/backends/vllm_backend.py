@@ -388,7 +388,7 @@ class VLLMBackend:
                 command.extend(["--lora-modules", self._lora_modules])
 
         # Add --enforce-eager to prevent CUDA graph issues with multiprocessing
-        command.append("--enforce-eager")
+        # command.append("--enforce-eager")
 
         for key, value in self._model_params.items():
             if value is None: continue
@@ -428,7 +428,7 @@ class VLLMBackend:
         if self._enable_lora:
             env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
             # Disable fused MoE LoRA to work around Triton compilation issues on B200
-            env["VLLM_MOE_LORA_USE_FUSED_KERNEL"] = "0"
+            env["VLLM_MOE_LORA_USE_FUSED_KERNEL"] = "1"
         # Set GPU visibility for vLLM server
         if self._gpu_ids is not None:
             env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self._gpu_ids))
@@ -436,11 +436,11 @@ class VLLMBackend:
         env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
         # Use V0 engine for better stability with subprocess spawning
         # V1 engine has known issues with CUDA initialization in multiprocessing
-        env["VLLM_USE_V1"] = "0"
+        env["VLLM_USE_V1"] = "1"
         # Also set the multiprocessing start method to spawn to avoid fork issues
         env["VLLM_MULTIPROC_METHOD"] = "spawn"
         # Disable async output processing which can cause issues with multiprocessing
-        env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1"
         # Ensure clean CUDA state in subprocess
         env.pop("CUDA_DEVICE_ORDER", None)
         # Clear any CUDA initialization flags that might interfere
