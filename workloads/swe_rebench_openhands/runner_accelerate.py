@@ -219,17 +219,50 @@ def _prune_unused_images(keep_images: Set[str]) -> None:
     )
 
 
-def _pull_image(image: str) -> str:
-    proc = subprocess.run(
-        ["docker", "pull", image],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stdout.strip())
-    return proc.stdout
+def _pull_image(image: str, max_retries: int = 5, initial_delay: float = 1.0) -> str:
+    """Pull Docker image with retry logic and exponential backoff for rate limiting.
+    
+    Handles Docker Hub rate limiting (429 errors) by retrying with exponential backoff.
+    """
+    last_error = None
+    for attempt in range(max_retries):
+        proc = subprocess.run(
+            ["docker", "pull", image],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        
+        if proc.returncode == 0:
+            return proc.stdout
+        
+        output = proc.stdout.strip()
+        last_error = output
+        
+        # Check if it's a rate limit error
+        is_rate_limit = (
+            "429" in output or 
+            "Too Many Requests" in output or 
+            "toomanyrequests" in output.lower() or
+            "rate limit" in output.lower()
+        )
+        
+        if is_rate_limit and attempt < max_retries - 1:
+            # Exponential backoff: 1s, 2s, 4s, 8s, 16s
+            delay = initial_delay * (2 ** attempt)
+            logger.warning(
+                "Docker Hub rate limit hit for %s (attempt %d/%d), retrying in %.1fs...",
+                image, attempt + 1, max_retries, delay
+            )
+            time.sleep(delay)
+            continue
+        
+        # If not rate limit or last attempt, raise immediately
+        if not is_rate_limit or attempt == max_retries - 1:
+            break
+    
+    raise RuntimeError(f"Failed to pull {image} after {max_retries} attempts: {last_error}")
 
 
 def _collect_batch_images(rows: List[Dict[str, Any]]) -> Set[str]:

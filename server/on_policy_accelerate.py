@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -15,7 +16,10 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
+from accelerate import DeepSpeedPlugin
 from peft import PeftModel
+
+from tqdm.auto import tqdm
 
 from spider.config import JobConfig
 
@@ -367,8 +371,51 @@ def _run_tool_on_policy_stream_accelerate(
 
     verbose_turns = bool(job.generation.verbose)
 
-    # Initialize Accelerator
-    accelerator = Accelerator(mixed_precision="bf16")
+    # Initialize DeepSpeed plugin if enabled
+    use_deepspeed = getattr(options, "use_deepspeed", False)
+    deepspeed_plugin = None
+    
+    if use_deepspeed:
+        deepspeed_config_path = getattr(options, "deepspeed_config_path", None)
+        if deepspeed_config_path and Path(deepspeed_config_path).exists():
+            # Load DeepSpeed config from file
+            import json
+            with open(deepspeed_config_path) as f:
+                ds_config = json.load(f)
+            
+            zero_stage = ds_config.get("zero_optimization", {}).get("stage", 2)
+            deepspeed_plugin = DeepSpeedPlugin(
+                hf_ds_config=ds_config,
+                zero3_init_flag=zero_stage == 3,
+            )
+            logger.info(
+                "Using DeepSpeed config from file: %s (ZeRO stage %d)",
+                deepspeed_config_path,
+                zero_stage,
+            )
+        else:
+            # Create DeepSpeed plugin programmatically
+            zero_stage = getattr(options, "deepspeed_zero_stage", 2)
+            offload_optimizer = getattr(options, "deepspeed_offload_optimizer", False)
+            offload_param = getattr(options, "deepspeed_offload_param", False)
+            
+            deepspeed_plugin = DeepSpeedPlugin(
+                zero_stage=zero_stage,
+                offload_optimizer_device="cpu" if offload_optimizer else None,
+                offload_param_device="cpu" if offload_param else None,
+            )
+            logger.info(
+                "Using DeepSpeed ZeRO stage %d (optimizer offload: %s, param offload: %s)",
+                zero_stage,
+                offload_optimizer,
+                offload_param,
+            )
+
+    # Initialize Accelerator with DeepSpeed
+    accelerator = Accelerator(
+        mixed_precision="bf16",
+        deepspeed_plugin=deepspeed_plugin,
+    )
 
     # Get the model from sampler context
     model = sampler_ctx.get_model()
@@ -705,6 +752,20 @@ def _run_tool_on_policy_stream_accelerate(
         last_checkpoint = None
         global_step = 0
         token_cum = 0
+        
+        # Create progress bar for training batches
+        # Use position=0 and file=sys.stderr to persist at bottom of terminal
+        train_pbar = tqdm(
+            total=total_batches,
+            desc="Training",
+            unit="batch",
+            initial=0,
+            ncols=120,
+            position=0,  # Fixed position at bottom
+            file=sys.stderr,  # Use stderr so it doesn't interfere with stdout logging
+            leave=True,  # Keep visible after completion
+            mininterval=0.5,  # Update at least every 0.5 seconds
+        )
 
         for batch_index, trajectories in enumerate(rollout_stream):
             batch_start = time.time()
@@ -714,13 +775,29 @@ def _run_tool_on_policy_stream_accelerate(
 
             step_tokens = sum(int(sum(turn.get("reward_mask") or [])) for turn in trajectories)
             token_cum += step_tokens
+            
+            # Calculate throughput metrics
+            tokens_per_sec = step_tokens / batch_time if batch_time > 0 else 0
+
+            # Update progress bar
+            train_pbar.update(1)
+            train_pbar.set_postfix({
+                "loss": f"{batch_metrics.get('loss', 0):.4f}" if batch_metrics.get('loss') else "N/A",
+                "tokens": step_tokens,
+                "cum_tokens": token_cum,
+                "time": f"{batch_time:.1f}s",
+                "tokens/s": f"{tokens_per_sec:.1f}",
+            })
 
             logger.info(
-                "tool rollout batch=%d step_time=%.3fs token_step=%d token_cum=%d token_budget=%s",
-                batch_index,
+                "tool rollout batch=%d/%d step_time=%.3fs token_step=%d token_cum=%d "
+                "tokens/s=%.1f token_budget=%s",
+                batch_index + 1,
+                total_batches,
                 batch_time,
                 step_tokens,
                 token_cum,
+                tokens_per_sec,
                 token_budget,
             )
 
@@ -770,9 +847,11 @@ def _run_tool_on_policy_stream_accelerate(
                     code="tool_on_policy_accelerate.token_budget_reached",
                     data={"token_cum": token_cum, "token_budget": token_budget},
                 )
+                train_pbar.close()
                 break
 
             if (batch_index + 1) % save_every == 0:
+                train_pbar.write(f"💾 Saving checkpoint at batch {batch_index + 1}")
                 last_checkpoint = save_checkpoint_accelerate(
                     model=model,
                     optimizer=optimizer,
@@ -794,6 +873,10 @@ def _run_tool_on_policy_stream_accelerate(
                         code="tool_on_policy_accelerate.sampler_refreshed",
                         data={"batch_index": batch_index, "sampler_path": sampler_path},
                     )
+        
+        train_pbar.close()
+        logger.info("Training loop complete: total_batches=%d total_tokens=%d", total_batches, token_cum)
+        
         return last_checkpoint
 
     try:
@@ -874,6 +957,9 @@ def _run_tool_on_policy_vllm_accelerate(
         parameters={
             "tensor_parallel_size": getattr(options, "vllm_tensor_parallel_size", 1),
             "gpu_memory_utilization": getattr(options, "vllm_gpu_memory_utilization", 0.9),
+            # Performance optimizations for better throughput
+            "max_num_batched_tokens": getattr(options, "vllm_max_num_batched_tokens", None),
+            "max_num_seqs": getattr(options, "vllm_max_num_seqs", None),
         },
     )
 
@@ -915,31 +1001,101 @@ def _run_tool_on_policy_vllm_accelerate(
             os.environ["CUDA_VISIBLE_DEVICES"],
         )
 
-        # Initialize Accelerator
-        accelerator = Accelerator(mixed_precision="bf16")
+        # Initialize DeepSpeed plugin if enabled
+        use_deepspeed = getattr(options, "use_deepspeed", False)
+        deepspeed_plugin = None
+        
+        if use_deepspeed:
+            deepspeed_config_path = getattr(options, "deepspeed_config_path", None)
+            if deepspeed_config_path and Path(deepspeed_config_path).exists():
+                # Load DeepSpeed config from file
+                import json
+                with open(deepspeed_config_path) as f:
+                    ds_config = json.load(f)
+                
+                zero_stage = ds_config.get("zero_optimization", {}).get("stage", 2)
+                deepspeed_plugin = DeepSpeedPlugin(
+                    hf_ds_config=ds_config,
+                    zero3_init_flag=zero_stage == 3,
+                )
+                logger.info(
+                    "Using DeepSpeed config from file: %s (ZeRO stage %d)",
+                    deepspeed_config_path,
+                    zero_stage,
+                )
+            else:
+                # Create DeepSpeed plugin programmatically
+                zero_stage = getattr(options, "deepspeed_zero_stage", 2)
+                offload_optimizer = getattr(options, "deepspeed_offload_optimizer", False)
+                offload_param = getattr(options, "deepspeed_offload_param", False)
+                
+                deepspeed_plugin = DeepSpeedPlugin(
+                    zero_stage=zero_stage,
+                    offload_optimizer_device="cpu" if offload_optimizer else None,
+                    offload_param_device="cpu" if offload_param else None,
+                )
+                logger.info(
+                    "Using DeepSpeed ZeRO stage %d (optimizer offload: %s, param offload: %s)",
+                    zero_stage,
+                    offload_optimizer,
+                    offload_param,
+                )
 
-        # Load training model with LoRA
-        model, tokenizer = load_model_with_lora(
-            model_name=student_model,
-            lora_rank=options.lora_rank,
-            checkpoint_path=student_checkpoint,
+        # Initialize Accelerator with DeepSpeed
+        accelerator = Accelerator(
+            mixed_precision="bf16",
+            deepspeed_plugin=deepspeed_plugin,
         )
 
-        # Create optimizer
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=options.learning_rate,
-            betas=(0.9, 0.95),
-            eps=1e-8,
-        )
+        # Delay loading training model until first batch (for testing inference speed)
+        # Model will be loaded lazily when first needed for training
+        model = None
+        tokenizer = None
+        optimizer = None
+        training_model_loaded = False
 
-        # Prepare with accelerator
-        model, optimizer = accelerator.prepare(model, optimizer)
+        def _ensure_training_model_loaded():
+            """Lazily load training model when first needed."""
+            nonlocal model, tokenizer, optimizer, training_model_loaded
+            if training_model_loaded:
+                return
+            
+            logger.info("Loading training model (deferred until first training step)...")
+            # When using DeepSpeed, don't use device_map (Accelerate/DeepSpeed will handle device placement)
+            # For ZeRO-3, load on CPU first (DeepSpeed will shard during prepare)
+            if use_deepspeed:
+                zero_stage = getattr(options, "deepspeed_zero_stage", 2)
+                if zero_stage == 3:
+                    device_map = "cpu"  # ZeRO-3 needs CPU loading
+                else:
+                    device_map = None  # ZeRO-1/2: let Accelerate/DeepSpeed handle device placement
+            else:
+                device_map = "auto"  # No DeepSpeed: use auto device mapping
+            
+            model, tokenizer = load_model_with_lora(
+                model_name=student_model,
+                lora_rank=options.lora_rank,
+                checkpoint_path=student_checkpoint,
+                device_map=device_map,
+            )
+
+            # Create optimizer
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=options.learning_rate,
+                betas=(0.9, 0.95),
+                eps=1e-8,
+            )
+
+            # Prepare with accelerator
+            model, optimizer = accelerator.prepare(model, optimizer)
+            training_model_loaded = True
+            logger.info("Training model loaded and prepared.")
 
         training_dir = workspace / "training"
         training_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create weight synchronizer
+        # Create weight synchronizer (will sync after model is loaded)
         weight_sync_steps = getattr(options, "weight_sync_steps", 10)
         synchronizer = WeightSynchronizer(
             sync_every_n_steps=weight_sync_steps,
@@ -949,10 +1105,12 @@ def _run_tool_on_policy_vllm_accelerate(
             vllm_backend=vllm_backend,
         )
 
-        # Do initial sync to load the LoRA adapter into vLLM
-        synchronizer.force_sync(model, accelerator, step=0)
+        # Skip initial sync - will sync after first batch when model is loaded
+        logger.info("Skipping initial weight sync (model not loaded yet). Will sync after first batch.")
 
         # Create rollout collector
+        # Note: lora_name will be None initially (no LoRA adapter loaded yet)
+        # vLLM will work without LoRA for initial rollouts
         rollout_workers = getattr(options, "rollout_workers", 8)
         collector = VLLMRolloutCollector(
             vllm_base_url=vllm_backend.base_url,
@@ -965,7 +1123,7 @@ def _run_tool_on_policy_vllm_accelerate(
             max_tool_turns=max(1, job.generation.max_tool_turns or 16),
             max_tokens=job.generation.parameters.get("max_tokens", 4096),
             temperature=job.generation.parameters.get("temperature", 1.0),
-            lora_name=synchronizer.get_lora_name(),
+            lora_name=None,  # Will be set after first batch when model is loaded
             runtime_factory=runtime_factory,
             verbose=verbose_turns,
         )
@@ -1065,6 +1223,15 @@ def _run_tool_on_policy_vllm_accelerate(
         def _process_batch(
             batch_index: int, trajectories: List[Dict[str, Any]]
         ) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
+            # Load training model lazily on first batch
+            _ensure_training_model_loaded()
+            
+            # Do initial weight sync on first batch (if not done yet)
+            if batch_index == 0:
+                synchronizer.force_sync(model, accelerator, step=0)
+                # Update collector to use the LoRA adapter after sync
+                collector.lora_name = synchronizer.get_lora_name()
+                logger.info("Initial weight sync completed after first batch. LoRA adapter loaded: %s", collector.lora_name)
             """Process a batch of trajectories and perform a training step."""
             items = []
             batch_metrics = {
@@ -1268,6 +1435,20 @@ def _run_tool_on_policy_vllm_accelerate(
         last_checkpoint = None
         global_step = 0
         token_cum = 0
+        
+        # Create progress bar for training batches
+        # Use position=0 and file=sys.stderr to persist at bottom of terminal
+        train_pbar = tqdm(
+            total=total_batches,
+            desc="Training",
+            unit="batch",
+            initial=0,
+            ncols=120,
+            position=0,  # Fixed position at bottom
+            file=sys.stderr,  # Use stderr so it doesn't interfere with stdout logging
+            leave=True,  # Keep visible after completion
+            mininterval=0.5,  # Update at least every 0.5 seconds
+        )
 
         for batch_index, start in enumerate(range(0, len(prompt_rows), batch_size)):
             batch_start = time.time()
@@ -1284,9 +1465,18 @@ def _run_tool_on_policy_vllm_accelerate(
             chunk = prompt_rows[start : start + batch_size]
 
             # Collect rollouts in parallel using vLLM
-            logger.info("Collecting rollouts for batch %d (%d prompts)", batch_index, len(chunk))
+            rollout_start = time.time()
+            logger.info("Collecting rollouts for batch %d/%d (%d prompts)", batch_index + 1, total_batches, len(chunk))
             rollout_results = collector.collect_batch(chunk)
+            rollout_time = time.time() - rollout_start
             trajectories = rollout_results_to_dicts(rollout_results)
+            
+            logger.info(
+                "Rollout collection complete for batch %d: time=%.2fs trajectories=%d",
+                batch_index,
+                rollout_time,
+                len(trajectories),
+            )
 
             if on_batch_complete is not None:
                 on_batch_complete(chunk)
@@ -1305,20 +1495,41 @@ def _run_tool_on_policy_vllm_accelerate(
                 },
             )
 
-            # Process batch
+            # Process batch (training step)
+            training_start = time.time()
             batch_items, batch_metrics = _process_batch(batch_index, trajectories)
+            training_time = time.time() - training_start
             batch_time = time.time() - batch_start
             global_step += 1
 
             step_tokens = sum(int(sum(turn.get("reward_mask") or [])) for turn in trajectories)
             token_cum += step_tokens
+            
+            # Calculate throughput metrics
+            tokens_per_sec = step_tokens / batch_time if batch_time > 0 else 0
+            rollout_throughput = len(chunk) / rollout_time if rollout_time > 0 else 0
+
+            # Update progress bar
+            train_pbar.update(1)
+            train_pbar.set_postfix({
+                "loss": f"{batch_metrics.get('loss', 0):.4f}" if batch_metrics.get('loss') else "N/A",
+                "tokens": step_tokens,
+                "cum_tokens": token_cum,
+                "time": f"{batch_time:.1f}s",
+                "tokens/s": f"{tokens_per_sec:.1f}",
+            })
 
             logger.info(
-                "vllm rollout batch=%d step_time=%.3fs token_step=%d token_cum=%d token_budget=%s",
-                batch_index,
+                "vllm rollout batch=%d/%d step_time=%.3fs (rollout=%.2fs train=%.2fs) "
+                "token_step=%d token_cum=%d tokens/s=%.1f token_budget=%s",
+                batch_index + 1,
+                total_batches,
                 batch_time,
+                rollout_time,
+                training_time,
                 step_tokens,
                 token_cum,
+                tokens_per_sec,
                 token_budget,
             )
 
@@ -1365,6 +1576,7 @@ def _run_tool_on_policy_vllm_accelerate(
                     code="tool_on_policy_vllm_accelerate.token_budget_reached",
                     data={"token_cum": token_cum, "token_budget": token_budget},
                 )
+                train_pbar.close()
                 break
 
             # Sync weights to vLLM and save checkpoint
@@ -1378,8 +1590,8 @@ def _run_tool_on_policy_vllm_accelerate(
                     loop_state={"batch": batch_index + 1},
                 )
 
-            # Sync weights to vLLM for inference
-            if synchronizer.maybe_sync(model, accelerator, batch_index + 1):
+            # Sync weights to vLLM for inference (only if model is loaded)
+            if training_model_loaded and synchronizer.maybe_sync(model, accelerator, batch_index + 1):
                 # Update the collector to use the new LoRA adapter
                 collector.lora_name = synchronizer.get_lora_name()
                 logger.info(
@@ -1392,8 +1604,12 @@ def _run_tool_on_policy_vllm_accelerate(
                     data={"batch_index": batch_index},
                 )
 
-        # Final checkpoint
-        if not last_checkpoint:
+        # Close progress bar
+        train_pbar.close()
+        logger.info("Training loop complete: total_batches=%d total_tokens=%d", total_batches, token_cum)
+
+        # Final checkpoint (only if model was loaded)
+        if training_model_loaded and not last_checkpoint:
             last_checkpoint = save_checkpoint_accelerate(
                 model=model,
                 optimizer=optimizer,

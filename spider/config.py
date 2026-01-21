@@ -120,6 +120,16 @@ class OnPolicyConfig(BaseModel):
         le=1.0,
         description="GPU memory utilization for vLLM server"
     )
+    vllm_max_num_batched_tokens: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Maximum number of batched tokens for vLLM (default: 4096, increase for larger batches)"
+    )
+    vllm_max_num_seqs: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Maximum number of concurrent sequences for vLLM (default: 256, increase for more parallelism)"
+    )
     vllm_gpu_ids: List[int] = Field(
         default_factory=lambda: [0],
         description="GPU IDs for vLLM inference server (e.g. [0, 1] for TP=2)"
@@ -132,6 +142,29 @@ class OnPolicyConfig(BaseModel):
         default=8,
         ge=1,
         description="Number of parallel workers for rollout collection"
+    )
+    # DeepSpeed configuration
+    use_deepspeed: bool = Field(
+        default=False,
+        description="Enable DeepSpeed ZeRO optimizer for memory-efficient training"
+    )
+    deepspeed_config_path: Optional[str] = Field(
+        default=None,
+        description="Path to DeepSpeed config JSON file (if None, uses programmatic config)"
+    )
+    deepspeed_zero_stage: int = Field(
+        default=2,
+        ge=1,
+        le=3,
+        description="DeepSpeed ZeRO stage (1, 2, or 3). Stage 2 recommended for LoRA training."
+    )
+    deepspeed_offload_optimizer: bool = Field(
+        default=False,
+        description="Offload optimizer states to CPU (saves GPU memory)"
+    )
+    deepspeed_offload_param: bool = Field(
+        default=False,
+        description="Offload parameters to CPU (ZeRO-3 only, saves more memory)"
     )
     weight_sync_steps: int = Field(
         default=10,
