@@ -35,7 +35,7 @@ def load_model_with_lora(
     model_name: str,
     lora_rank: int,
     checkpoint_path: str | None = None,
-    device_map: str = "auto",
+    device_map: str | None = "auto",
     torch_dtype: torch.dtype = torch.bfloat16,
 ) -> Tuple[PeftModel, PreTrainedTokenizer]:
     """Load base model and apply LoRA (or load existing adapter).
@@ -44,24 +44,32 @@ def load_model_with_lora(
         model_name: HuggingFace model name or path
         lora_rank: LoRA rank for adapter
         checkpoint_path: Optional path to existing LoRA adapter
-        device_map: Device mapping strategy
+        device_map: Device mapping strategy (None means no device mapping, for DeepSpeed)
         torch_dtype: Torch dtype for model weights
 
     Returns:
         Tuple of (PeftModel, Tokenizer)
     """
     logger.info(
-        "Loading model %s with LoRA rank=%d, checkpoint=%s",
+        "Loading model %s with LoRA rank=%d, checkpoint=%s, device_map=%s",
         model_name,
         lora_rank,
         checkpoint_path,
+        device_map,
     )
+
+    # Build kwargs for from_pretrained
+    model_kwargs = {
+        "torch_dtype": torch_dtype,
+        "trust_remote_code": True,
+    }
+    # Only add device_map if it's not None (None means let Accelerate/DeepSpeed handle it)
+    if device_map is not None:
+        model_kwargs["device_map"] = device_map
 
     base_model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch_dtype,
-        device_map=device_map,
-        trust_remote_code=True,
+        **model_kwargs,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -311,7 +319,16 @@ def save_checkpoint_accelerate(
     # Save optimizer state
     state_path = checkpoint_dir / "state"
     state_path.mkdir(parents=True, exist_ok=True)
-    accelerator.save_state(str(state_path))
+    
+    # DeepSpeed handles checkpointing differently
+    if accelerator.state.deepspeed_plugin is not None:
+        # DeepSpeed checkpoint - save using DeepSpeed's method
+        # Note: DeepSpeed checkpoints are saved automatically during training
+        # We still save the LoRA adapter separately for vLLM sync
+        accelerator.save_state(str(state_path))
+    else:
+        # Standard Accelerate checkpoint
+        accelerator.save_state(str(state_path))
 
     paths = {
         "sampler_path": str(adapter_path),
@@ -709,7 +726,7 @@ class FireworksTeacherContext:
 
         # Align lengths - use prompt_tokens from usage to slice logprobs
         prompt_tokens = response_json["usage"]["prompt_tokens"]
-        # Fireworks returns the prefix/completion tokens + 2 extra completion tokens.
+        # Fireworks returns the prefix/completion tokens + 1 extra completion token.
         # So we will just consider the prompt tokens (prefix/completion).
         # Extract completion logprobs starting after prefix_tokens
         logprobs = lp_list[:prompt_tokens]
