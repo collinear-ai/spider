@@ -54,7 +54,7 @@ job:
 
       # Optional: wandb logging
       wandb_project: icml26
-      wandb_name: qwen3-30b3a-opd
+      wandb_name: qwen3-30b3a-opd-muyu-test-1
 
       # Optional: stop after N tokens trained
       # token_budget: 1000000
