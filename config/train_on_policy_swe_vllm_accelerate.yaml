@@ -1,39 +1,38 @@
 job:
   model:
     provider: tinker
-    name: "collinear-ai/TEMP_qwen_sft_30p_icml_26"
+    name: "Qwen/Qwen3-8B"
   source:
     dataset: collinear-ai/SWE-rebench-split
     split: filtered
   generation:
     on_policy: true
-    max_tool_turns: 100
+    max_tool_turns: 10
     parameters:
       temperature: 0.7
       top_p: 0.95
-      max_tokens: 40768
+      max_tokens: 24096
       tool_choice: auto
     on_policy_options:
       # Teacher model - HF name for tokenizer
-      teacher: Qwen/Qwen3-Coder-480B-A35B-Instruct
+      teacher: Qwen/Qwen3-8B
       # Fireworks model ID - set this to use Fireworks API instead of loading locally
-      fireworks_model: accounts/fireworks/models/qwen3-coder-480b-a35b-instruct
+      fireworks_model: accounts/keith-7ff28a/deployments/qaapghki
 
       # Training hyperparameters
       learning_rate: 1e-4
-      groups_per_batch: 1024
+      groups_per_batch: 8
       lora_rank: 64
       save_every: 50
       kl_penalty_coef: 1.0
       kl_discount_factor: 0.0
 
-      # DeepSpeed configuration (optional - for memory efficiency and multi-GPU scaling)
-      use_deepspeed: true  # Set to true to enable DeepSpeed ZeRO
-      deepspeed_config_path: "config/deepspeed_config_zer2.json"  # Path to config file (uses ZeRO-2, no CPU offload for speed)
-      # Note: The config file settings override the programmatic options below
-      deepspeed_zero_stage: 2  # 1, 2, or 3 (2 recommended for LoRA - only used if config_path is None)
-      deepspeed_offload_optimizer: false  # Only used if config_path is None
-      deepspeed_offload_param: false  # Only used if config_path is None (ZeRO-3 only)
+      # DeepSpeed configuration (recommended for LoRA - ZeRO-2 shards optimizer states/gradients)
+      use_deepspeed: false  # Enable DeepSpeed ZeRO-2 for memory efficiency
+      deepspeed_config_path: null  # Set to path if you have a custom config file
+      deepspeed_zero_stage: 2  # ZeRO-2 recommended for LoRA (shards optimizer + gradients, not params)
+      deepspeed_offload_optimizer: false  # Set to true if still OOM (slower but saves more memory)
+      deepspeed_offload_param: false  # Only for ZeRO-3
 
       # === Separated vLLM Inference + Training Architecture ===
       # Enable vLLM-based inference (parallel rollouts, proper tool parsing)
@@ -44,15 +43,16 @@ job:
       #   2 GPU:  vllm_gpu_ids: [0], training_gpu_ids: [1]
       #   4 GPU:  vllm_gpu_ids: [0, 1], training_gpu_ids: [2, 3]  (TP=2 for vLLM)
       #   8 GPU:  vllm_gpu_ids: [0, 1, 2, 3], training_gpu_ids: [4, 5, 6, 7]
-      vllm_gpu_ids: [0,1,2,3]
-      training_gpu_ids: [4,5,6,7]
+      vllm_gpu_ids: [4,5,6,7]
+      training_gpu_ids: [0,1,2,3]
 
       # vLLM server configuration
       vllm_tensor_parallel_size: 4 # Should match len(vllm_gpu_ids) for multi-GPU inference
-      vllm_gpu_memory_utilization: 0.9
+      vllm_gpu_memory_utilization: 0.7  # Reduced to 70% to save memory
       # vLLM batch size optimizations (for better throughput)
-      vllm_max_num_batched_tokens: 16384  # Default: 4096, increase for larger batches
-      vllm_max_num_seqs: 256  # Default: 256, more concurrent sequences
+      # KV cache size = max_num_batched_tokens × max_tokens × hidden_size × num_layers × 2 (K+V)
+      vllm_max_num_batched_tokens: 4096  # Reduced to default to shrink KV cache
+      vllm_max_num_seqs: 128  # Reduced from 256 to shrink KV cache (fewer concurrent sequences)
 
       # Parallel rollout collection
       rollout_workers: 128  # Number of concurrent HTTP requests to vLLM (increased for better throughput)
@@ -62,6 +62,13 @@ job:
 
       # PPO-style importance sampling clipping
       importance_sampling_clip: 0.2
+
+      # Gradient accumulation (process N trajectories per backward pass, then step)
+      # Set to 1 to process one at a time, or None/>=num_trajectories to process all at once
+      gradient_accumulation_steps: 4  # Process 4 trajectories per backward pass
+
+      # Training precision (bf16, fp16, or fp8 for H100 GPUs)
+      training_precision: fp8
 
       # Optional: wandb logging
       wandb_project: icml26
