@@ -264,29 +264,6 @@ def importance_sampling_loss_with_clip(
     Returns:
         Tuple of (loss, current_logprobs, metrics_dict)
     """
-    import pickle
-    
-    # Log input_ids to pickle file
-    input_ids_pkl_path = "/home/ubuntu/spider/input_ids.pkl"
-    with open(input_ids_pkl_path, "wb") as f:
-        pickle.dump(input_ids.detach().cpu().numpy(), f)
-    
-    # Log memory before model forward pass (OOM happens during the call, so we only log before)
-    if torch.cuda.is_available():
-        mem_before = torch.cuda.memory_allocated() / 1024**3  # GB
-        mem_reserved_before = torch.cuda.memory_reserved() / 1024**3  # GB
-        max_mem_before = torch.cuda.max_memory_allocated() / 1024**3  # GB
-        seq_len = input_ids.shape[1] if len(input_ids.shape) > 1 else input_ids.shape[0]
-        batch_size = input_ids.shape[0] if len(input_ids.shape) > 1 else 1
-        
-        # Save memory info to a txt file instead of logging
-        with open("oom_memory_info.txt", "a") as f:
-            f.write(
-                "MEMORY BEFORE model(input_ids) - OOM occurs here: "
-                f"allocated={mem_before:.2f}GB reserved={mem_reserved_before:.2f}GB max={max_mem_before:.2f}GB "
-                f"batch_size={batch_size} seq_len={seq_len} num_tokens={batch_size * seq_len}\n"
-            )
-
     outputs = model(input_ids=input_ids)
     logits = outputs.logits  # [batch, seq_len, vocab_size] - no slicing needed, input is already aligned
     log_probs = F.log_softmax(logits, dim=-1)
@@ -906,10 +883,28 @@ class FireworksTeacherContext:
             student_mask,
         )
 
+        # Log KL and associated tensors for inspection and debugging using pickle
+        import pickle
+
         kl_adjustments = torch.zeros_like(student_logprobs)
         kl_mask = torch.zeros_like(student_logprobs)
         kl_adjustments[start:end] = kl_slice
         kl_mask[start:end] = kl_mask_slice
+
+        debug_save = {
+            "kl_mask": kl_mask,
+            "kl_mask_slice": kl_mask_slice,
+            "start": start,
+            "end": end,
+            "student_logprobs": student_logprobs,
+            "student_ids": list(student_ids),
+            "student_lp_slice": student_lp_slice,
+            "completion_tokens": list(completion_tokens),
+            "teacher_lp_tensor": teacher_lp_tensor,
+            "student_mask": student_mask,
+        }
+        with open("debug_fireworks_teacher_alignment.pkl", "wb") as f:
+            pickle.dump(debug_save, f)
 
         return {
             "kl_adjustments": kl_adjustments.tolist(),
