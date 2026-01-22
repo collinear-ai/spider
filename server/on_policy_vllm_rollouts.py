@@ -376,25 +376,30 @@ class VLLMRolloutCollector:
         logprobs_data = choice.get("logprobs") or {}
         logprobs_content = logprobs_data.get("content") or []
 
-        token_ids = []
+        token_strings = []
         logprobs = []
         for lp_entry in logprobs_content:
-            token_logprob = lp_entry.get("logprob", 0.0)
-            # Get token ID
-            top_lps = lp_entry.get("top_logprobs") or []
-            token = lp_entry.get("token", "")
-            token_id = None
-            for top_lp in top_lps:
-                if top_lp.get("token") == token:
-                    token_id = top_lp.get("token_id")
-                    break
-            if token_id is None:
-                token_id = lp_entry.get("token_id", 0)
+            try:
+                token_strings.append(lp_entry["token"])
+            except KeyError:
+                token_strings.append("")
+            try:
+                logprobs.append(lp_entry["logprob"])
+            except KeyError:
+                logprobs.append(0.0)
 
-            token_ids.append(token_id)
-            logprobs.append(token_logprob)
+        import unicodedata
+        concatenated = "".join(token_strings)
+        normalized_text = unicodedata.normalize('NFC', concatenated)
+        token_ids = self._tokenizer.encode(normalized_text, add_special_tokens=False)
+        
+        if len(token_ids) != len(token_strings):
+            logger.debug(
+                "Token count mismatch: original=%d re-encoded=%d",
+                len(token_strings),
+                len(token_ids),
+            )
 
-        # Get raw text by decoding token_ids
         raw_text = self._tokenizer.decode(token_ids, skip_special_tokens=False)
 
         # Parse the response using official vLLM parsers
