@@ -11,6 +11,8 @@ import logging
 import os
 import sys
 import time
+import concurrent.futures
+import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -1061,14 +1063,26 @@ def _run_tool_on_policy_vllm_accelerate(
         tokenizer = None
         optimizer = None
         training_model_loaded = False
+        training_model_future = None
+        training_model_lock = threading.Lock()
+        training_model_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-        def _ensure_training_model_loaded():
-            """Lazily load training model when first needed."""
+        def _load_training_model():
             nonlocal model, tokenizer, optimizer, training_model_loaded
-            if training_model_loaded:
-                return
+            with training_model_lock:
+                if training_model_loaded:
+                    return
             
-            logger.info("Loading training model (deferred until first training step)...")
+            logger.info("Loading training model (async)...")
+            load_start = time.time()
+            pbar = tqdm(
+                total=3,
+                desc="Loading training model",
+                unit="step",
+                position=1,
+                file=sys.stderr,
+                leave=True,
+            )
             # When using DeepSpeed, don't use device_map (Accelerate/DeepSpeed will handle device placement)
             # For ZeRO-3, load on CPU first (DeepSpeed will shard during prepare)
             if use_deepspeed:
@@ -1079,26 +1093,54 @@ def _run_tool_on_policy_vllm_accelerate(
                     device_map = None  # ZeRO-1/2: let Accelerate/DeepSpeed handle device placement
             else:
                 device_map = "auto"  # No DeepSpeed: use auto device mapping
-            
+
+            phase_start = time.time()
+
             model, tokenizer = load_model_with_lora(
                 model_name=student_model,
                 lora_rank=options.lora_rank,
                 checkpoint_path=student_checkpoint,
                 device_map=device_map,
             )
+            pbar.update(1)
+            logger.info("Training model weights loaded in %.2fs", time.time() - phase_start)
 
             # Create optimizer
+            phase_start = time.time()
             optimizer = torch.optim.AdamW(
                 model.parameters(),
                 lr=options.learning_rate,
                 betas=(0.9, 0.95),
                 eps=1e-8,
             )
+            pbar.update(1)
+            logger.info("Training optimizer created in %.2fs", time.time() - phase_start)
 
             # Prepare with accelerator
+            phase_start = time.time()
             model, optimizer = accelerator.prepare(model, optimizer)
+            pbar.update(1)
+            logger.info("Accelerator prepare completed in %.2fs", time.time() - phase_start)
+            pbar.close()
+
             training_model_loaded = True
-            logger.info("Training model loaded and prepared.")
+            logger.info("Training model loaded and prepared in %.2fs", time.time() - load_start)
+
+        def _start_training_model_load_async():
+            nonlocal training_model_future
+            with training_model_lock:
+                if training_model_loaded or training_model_future:
+                    return
+                training_model_future = training_model_executor.submit(_load_training_model)
+
+        def _ensure_training_model_loaded():
+            nonlocal training_model_future
+            if training_model_loaded:
+                return
+            if training_model_future is not None:
+                training_model_future.result()
+                return
+            _load_training_model()
 
         training_dir = workspace / "training"
         training_dir.mkdir(parents=True, exist_ok=True)
@@ -1490,6 +1532,9 @@ def _run_tool_on_policy_vllm_accelerate(
 
             chunk = prompt_rows[start : start + batch_size]
 
+            if batch_index == 0:
+                _start_training_model_load_async()
+
             # Collect rollouts in parallel using vLLM
             rollout_start = time.time()
             logger.info("Collecting rollouts for batch %d/%d (%d prompts)", batch_index + 1, total_batches, len(chunk))
@@ -1661,6 +1706,8 @@ def _run_tool_on_policy_vllm_accelerate(
             wandb_run.finish()
         if 'collector' in locals():
             collector.close()
+        if 'training_model_executor' in locals():
+            training_model_executor.shutdown(wait=False)
         if 'synchronizer' in locals():
             synchronizer.close()
         vllm_backend.close()
