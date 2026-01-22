@@ -22,6 +22,7 @@ from peft import PeftModel
 
 from tqdm.auto import tqdm
 
+from liger_kernel.transformers import apply_liger_kernel_to_qwen3
 from spider.config import JobConfig
 
 from .on_policy_accelerate_utils import (
@@ -49,6 +50,8 @@ RolloutBatch = List[Dict[str, Any]]
 
 logger = logging.getLogger(__name__)
 
+
+apply_liger_kernel_to_qwen3(fused_linear_cross_entropy=False)
 
 class _AccelerateStudentSamplerContext:
     """Student sampler context using transformers generate()."""
