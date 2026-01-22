@@ -68,6 +68,7 @@ server = [
     "tqdm",
     "httpx",
     "wandb",
+    "liger-kernel",
 ]
 all = [
     "httpx",
