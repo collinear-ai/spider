@@ -1378,48 +1378,73 @@ def _run_tool_on_policy_vllm_accelerate(
                         n_reward,
                     )
 
-            # Perform training step with clipped importance sampling
-            total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            # Perform training step with clipped importance sampling and gradient accumulation
+            num_trajectories = len(all_input_ids)
+            gradient_accumulation_steps = getattr(options, "gradient_accumulation_steps", 1)
+            if gradient_accumulation_steps is None or gradient_accumulation_steps <= 0:
+                gradient_accumulation_steps = num_trajectories  # Process all at once if not set
+            
+            # Zero gradients at start
+            optimizer.zero_grad()
+            
+            accumulated_loss_value = 0.0
             total_clip_fraction = 0.0
-
-            for input_ids, target_ids, sampling_lp, advantages, loss_mask in zip(
-                all_input_ids, all_target_ids, all_sampling_logprobs, all_advantages, all_loss_masks
-            ):
-                input_ids = input_ids.unsqueeze(0)
-                target_ids = target_ids.unsqueeze(0)
-                sampling_lp = sampling_lp.unsqueeze(0)
-                advantages = advantages.unsqueeze(0)
-                loss_mask = loss_mask.unsqueeze(0)
-
-                loss, _, metrics = importance_sampling_loss_with_clip(
-                    model=model,
-                    input_ids=input_ids,
-                    target_ids=target_ids,
-                    sampling_logprobs=sampling_lp,
-                    advantages=advantages,
-                    loss_mask=loss_mask,
-                    clip_ratio=clip_ratio,
-                )
-                total_loss = total_loss + loss
-                total_clip_fraction += metrics["clip_fraction"]
+            
+            # Process trajectories in chunks for gradient accumulation
+            for chunk_start in range(0, num_trajectories, gradient_accumulation_steps):
+                chunk_end = min(chunk_start + gradient_accumulation_steps, num_trajectories)
+                chunk_size = chunk_end - chunk_start
                 
-                # Clear intermediate tensors after each sequence
-                del input_ids, target_ids, sampling_lp, advantages, loss_mask
+                chunk_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                chunk_clip_frac = 0.0
+                
+                for idx in range(chunk_start, chunk_end):
+                    input_ids = all_input_ids[idx].unsqueeze(0)
+                    target_ids = all_target_ids[idx].unsqueeze(0)
+                    sampling_lp = all_sampling_logprobs[idx].unsqueeze(0)
+                    advantages = all_advantages[idx].unsqueeze(0)
+                    loss_mask = all_loss_masks[idx].unsqueeze(0)
+
+                    loss, _, metrics = importance_sampling_loss_with_clip(
+                        model=model,
+                        input_ids=input_ids,
+                        target_ids=target_ids,
+                        sampling_logprobs=sampling_lp,
+                        advantages=advantages,
+                        loss_mask=loss_mask,
+                        clip_ratio=clip_ratio,
+                    )
+                    chunk_loss = chunk_loss + loss
+                    chunk_clip_frac += metrics["clip_fraction"]
+                    
+                    # Clear intermediate tensors after each sequence
+                    del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                
+                # Average chunk loss and scale by number of chunks
+                chunk_loss = chunk_loss / chunk_size
+                num_chunks = (num_trajectories + gradient_accumulation_steps - 1) // gradient_accumulation_steps
+                chunk_loss = chunk_loss / num_chunks
+                
+                # Backward on chunk (gradients accumulate)
+                accelerator.backward(chunk_loss)
+                accumulated_loss_value += chunk_loss.item() * chunk_size
+                total_clip_fraction += chunk_clip_frac
+                
+                del chunk_loss
                 torch.cuda.empty_cache()
                 gc.collect()
-
-            total_loss = total_loss / len(trajectories)
-            batch_metrics["clip_fraction_sum"] += total_clip_fraction
-            batch_metrics["clip_count"] += len(trajectories)
-
-            optimizer.zero_grad()
-            accelerator.backward(total_loss)
+            
+            # Step optimizer once after all chunks
             optimizer.step()
-
-            loss_value = total_loss.item()
+            
+            # Average loss for logging
+            loss_value = accumulated_loss_value / num_trajectories if num_trajectories > 0 else 0.0
+            batch_metrics["clip_fraction_sum"] += total_clip_fraction
+            batch_metrics["clip_count"] += num_trajectories
             
             # Aggressive memory cleanup after backward pass
-            del total_loss
             torch.cuda.empty_cache()
             gc.collect()
             torch.cuda.synchronize()

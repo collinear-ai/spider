@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import flash_attn
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer
@@ -66,6 +67,14 @@ def load_model_with_lora(
     # Only add device_map if it's not None (None means let Accelerate/DeepSpeed handle it)
     if device_map is not None:
         model_kwargs["device_map"] = device_map
+    else:
+        # When device_map is None, load on CPU first to avoid default GPU placement
+        # Accelerate will move it to the correct device during prepare()
+        model_kwargs["device_map"] = "cpu"
+    
+    # Enable Flash Attention 2 for memory efficiency (if available)
+    model_kwargs["attn_implementation"] = "flash_attention_2"
+    logger.info("Flash Attention 2 enabled for memory efficiency")
 
     base_model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -115,6 +124,7 @@ def load_model_with_lora(
         logger.info("Gradient checkpointing enabled on base_model.model for memory efficiency")
     else:
         logger.warning("Could not enable gradient checkpointing - model may not support it")
+    model.config.use_cache = False  # VERY IMPORTANT
 
     return model, tokenizer
 
@@ -254,12 +264,40 @@ def importance_sampling_loss_with_clip(
     Returns:
         Tuple of (loss, current_logprobs, metrics_dict)
     """
+    import pickle
+    
+    # Log input_ids to pickle file
+    input_ids_pkl_path = "/home/ubuntu/spider/input_ids.pkl"
+    with open(input_ids_pkl_path, "wb") as f:
+        pickle.dump(input_ids.detach().cpu().numpy(), f)
+    
+    # Log memory before model forward pass (OOM happens during the call, so we only log before)
+    if torch.cuda.is_available():
+        mem_before = torch.cuda.memory_allocated() / 1024**3  # GB
+        mem_reserved_before = torch.cuda.memory_reserved() / 1024**3  # GB
+        max_mem_before = torch.cuda.max_memory_allocated() / 1024**3  # GB
+        seq_len = input_ids.shape[1] if len(input_ids.shape) > 1 else input_ids.shape[0]
+        batch_size = input_ids.shape[0] if len(input_ids.shape) > 1 else 1
+        
+        # Save memory info to a txt file instead of logging
+        with open("oom_memory_info.txt", "a") as f:
+            f.write(
+                "MEMORY BEFORE model(input_ids) - OOM occurs here: "
+                f"allocated={mem_before:.2f}GB reserved={mem_reserved_before:.2f}GB max={max_mem_before:.2f}GB "
+                f"batch_size={batch_size} seq_len={seq_len} num_tokens={batch_size * seq_len}\n"
+            )
+
     outputs = model(input_ids=input_ids)
     logits = outputs.logits  # [batch, seq_len, vocab_size] - no slicing needed, input is already aligned
     log_probs = F.log_softmax(logits, dim=-1)
 
     # Gather logprobs for target tokens
     current_logprobs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+    
+    # Delete logits and log_probs immediately - they're large and not needed for backward
+    # Only current_logprobs is needed for the computation graph
+    del logits, log_probs, outputs
+    torch.cuda.empty_cache()  # Force immediate cleanup of freed tensors
 
     # Importance weight: exp(current - sampling)
     ratio = torch.exp(current_logprobs - sampling_logprobs)
@@ -636,11 +674,18 @@ class AccelerateTeacherContext:
         self.model_name = model_name
         logger.info("Loading teacher model: %s", model_name)
 
+        # Enable Flash Attention 2 for teacher model (if available)
+        model_kwargs = {
+            "torch_dtype": torch_dtype,
+            "device_map": device_map,
+            "trust_remote_code": True,
+        }
+        model_kwargs["attn_implementation"] = "flash_attention_2"
+        logger.info("Flash Attention 2 enabled for teacher model")
+  
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
-            trust_remote_code=True,
+            **model_kwargs,
         )
         self.model.eval()
 
