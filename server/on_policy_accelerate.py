@@ -553,6 +553,13 @@ def _run_tool_on_policy_stream_accelerate(
 
             student_logprobs = torch.tensor(logprobs, dtype=torch.float32, device=device)
 
+            if not len(reward_mask) == len(token_ids) == len(student_logprobs):
+                raise ValueError(
+                    f"Length mismatch: reward_mask={len(reward_mask)} "
+                    f"token_ids={len(token_ids)} "
+                    f"student_logprobs={len(student_logprobs)} "
+                )
+
             # Check if this is a combined multi-turn item
             combined_turns = turn.get("_combined_turns")
             if combined_turns:
@@ -1258,6 +1265,13 @@ def _run_tool_on_policy_vllm_accelerate(
                 reward_mask = turn["reward_mask"]
 
                 student_logprobs = torch.tensor(logprobs, dtype=torch.float32, device=device)
+
+                if not len(reward_mask) == len(token_ids) == len(student_logprobs):
+                    raise ValueError(
+                        f"Length mismatch: reward_mask={len(reward_mask)} "
+                        f"token_ids={len(token_ids)} "
+                        f"student_logprobs={len(student_logprobs)} "
+                    )
 
                 # Check if this is a combined multi-turn item
                 combined_turns = turn.get("_combined_turns")
