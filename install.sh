@@ -69,3 +69,8 @@ docker buildx inspect --bootstrap > /dev/null 2>&1
 
 echo "Docker storage configured: $(docker info | grep 'Docker Root Dir')"
 echo "Buildx cache directory: /mnt/local/docker-cache"
+
+
+##### Docker Start & Login after reboot #####
+sudo systemctl restart docker.socket && sleep 2 && sudo systemctl restart docker
+# docker login with adit's docker account 🙏
