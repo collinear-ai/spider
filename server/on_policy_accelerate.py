@@ -6,6 +6,7 @@ Accelerate and PEFT instead of Tinker for training.
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import sys
@@ -1401,6 +1402,11 @@ def _run_tool_on_policy_vllm_accelerate(
                 )
                 total_loss = total_loss + loss
                 total_clip_fraction += metrics["clip_fraction"]
+                
+                # Clear intermediate tensors after each sequence
+                del input_ids, target_ids, sampling_lp, advantages, loss_mask
+                torch.cuda.empty_cache()
+                gc.collect()
 
             total_loss = total_loss / len(trajectories)
             batch_metrics["clip_fraction_sum"] += total_clip_fraction
@@ -1411,6 +1417,12 @@ def _run_tool_on_policy_vllm_accelerate(
             optimizer.step()
 
             loss_value = total_loss.item()
+            
+            # Aggressive memory cleanup after backward pass
+            del total_loss
+            torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.synchronize()
             batch_metrics["loss"] = loss_value
 
             logger.info(

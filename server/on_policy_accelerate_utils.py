@@ -100,6 +100,22 @@ def load_model_with_lora(
         model = get_peft_model(base_model, lora_config)
         model.print_trainable_parameters()
 
+    # Enable gradient checkpointing to save VRAM during training
+    # This trades compute for memory by recomputing activations during backward pass
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        logger.info("Gradient checkpointing enabled for memory efficiency")
+    elif hasattr(model, "base_model") and hasattr(model.base_model, "gradient_checkpointing_enable"):
+        # For PEFT models, enable on the base model
+        model.base_model.gradient_checkpointing_enable()
+        logger.info("Gradient checkpointing enabled on base model for memory efficiency")
+    elif hasattr(model, "base_model") and hasattr(model.base_model, "model") and hasattr(model.base_model.model, "gradient_checkpointing_enable"):
+        # Some PEFT models have base_model.model structure
+        model.base_model.model.gradient_checkpointing_enable()
+        logger.info("Gradient checkpointing enabled on base_model.model for memory efficiency")
+    else:
+        logger.warning("Could not enable gradient checkpointing - model may not support it")
+
     return model, tokenizer
 
 
@@ -489,6 +505,22 @@ def compute_teacher_alignment_for_rewards_direct(
         teacher_lp_tensor,
         student_mask,
     )
+
+    # Save KL and associated tensors for inspection and debugging using pickle
+    import pickle
+
+    debug_save = {
+        "kl_slice": kl_slice,
+        "kl_mask_slice": kl_mask_slice,
+        "student_ids": list(student_ids),
+        "student_lp_slice": student_lp_slice,
+        "completion_tokens": list(completion_tokens),
+        "teacher_lp_tensor": teacher_lp_tensor,
+        "student_mask": student_mask,
+        "student_logprobs": student_logprobs,
+    }
+    with open("debug_teacher_alignment.pkl", "wb") as f:
+        pickle.dump(debug_save, f)
 
     kl_adjustments = torch.zeros_like(student_logprobs)
     kl_mask = torch.zeros_like(student_logprobs)
