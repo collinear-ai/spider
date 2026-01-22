@@ -4,10 +4,11 @@ job:
     name: "Qwen/Qwen3-8B"
   source:
     dataset: collinear-ai/SWE-rebench-split
-    split: filtered
+    split: filtered[0:128]
+    shuffle: true
   generation:
     on_policy: true
-    max_tool_turns: 10
+    max_tool_turns: 30
     parameters:
       temperature: 0.7
       top_p: 0.95
@@ -17,22 +18,23 @@ job:
       # Teacher model - HF name for tokenizer
       teacher: Qwen/Qwen3-8B
       # Fireworks model ID - set this to use Fireworks API instead of loading locally
-      fireworks_model: accounts/keith-7ff28a/deployments/qaapghki
+      fireworks_model: accounts/fireworks/models/qwen3-8b
 
       # Training hyperparameters
       learning_rate: 1e-4
-      groups_per_batch: 8
+      groups_per_batch: 
       lora_rank: 64
       save_every: 50
       kl_penalty_coef: 1.0
       kl_discount_factor: 0.0
 
-      # DeepSpeed configuration (recommended for LoRA - ZeRO-2 shards optimizer states/gradients)
-      use_deepspeed: false  # Enable DeepSpeed ZeRO-2 for memory efficiency
-      deepspeed_config_path: null  # Set to path if you have a custom config file
-      deepspeed_zero_stage: 2  # ZeRO-2 recommended for LoRA (shards optimizer + gradients, not params)
-      deepspeed_offload_optimizer: false  # Set to true if still OOM (slower but saves more memory)
-      deepspeed_offload_param: false  # Only for ZeRO-3
+      # DeepSpeed configuration (optional - for memory efficiency and multi-GPU scaling)
+      use_deepspeed: false  # Set to true to enable DeepSpeed ZeRO
+      deepspeed_config_path: "config/deepspeed_config_zer2.json"  # Path to config file (uses ZeRO-2, no CPU offload for speed)
+      # Note: The config file settings override the programmatic options below
+      deepspeed_zero_stage: 2  # 1, 2, or 3 (2 recommended for LoRA - only used if config_path is None)
+      deepspeed_offload_optimizer: false  # Only used if config_path is None
+      deepspeed_offload_param: false  # Only used if config_path is None (ZeRO-3 only)
 
       # === Separated vLLM Inference + Training Architecture ===
       # Enable vLLM-based inference (parallel rollouts, proper tool parsing)
@@ -71,8 +73,8 @@ job:
       training_precision: fp8
 
       # Optional: wandb logging
-      wandb_project: icml26
-      wandb_name: qwen3-30b3a-opd-adit-test
+      wandb_project: icml26-muyu
+      wandb_name: qwen3-4b-opd-muyu-test
 
       # Optional: stop after N tokens trained
       # token_budget: 1000000
