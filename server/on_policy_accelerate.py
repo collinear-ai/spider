@@ -1142,6 +1142,8 @@ def _run_tool_on_policy_vllm_accelerate(
                 return
             _load_training_model()
 
+        _start_training_model_load_async()
+
         training_dir = workspace / "training"
         training_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1556,9 +1558,6 @@ def _run_tool_on_policy_vllm_accelerate(
                     on_batch_start(next_chunk)
 
             chunk = prompt_rows[start : start + batch_size]
-
-            if batch_index == 0:
-                _start_training_model_load_async()
 
             # Collect rollouts in parallel using vLLM
             rollout_start = time.time()

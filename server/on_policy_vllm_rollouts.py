@@ -233,9 +233,16 @@ class VLLMRolloutCollector:
 
                 # Build reward mask (1 for generated tokens, 0 for prompt)
                 reward_mask = [0] * prompt_token_count + [1] * len(token_ids)
+                full_logprobs = [0.0] * prompt_token_count + logprobs
 
                 # Full token sequence
                 full_token_ids = response["full_token_ids"]
+
+                if not (len(full_logprobs) == len(full_token_ids) == len(reward_mask)):
+                    raise ValueError(
+                        "Length mismatch: full_logprobs=%d full_token_ids=%d reward_mask=%d logprobs=%d token_ids=%d prompt_token_count=%d",
+                        len(full_logprobs), len(full_token_ids), len(reward_mask), len(logprobs), len(token_ids), prompt_token_count
+                    )
 
                 if len(full_token_ids) <= 1:
                     logger.warning(
@@ -268,7 +275,7 @@ class VLLMRolloutCollector:
                         prompt=prompt,
                         messages=list(history),
                         token_ids=full_token_ids,
-                        logprobs=[0.0] * prompt_token_count + logprobs,
+                        logprobs=full_logprobs,
                         reward_mask=reward_mask,
                         assistant_content=content,
                         assistant_reasoning_content=reasoning,
