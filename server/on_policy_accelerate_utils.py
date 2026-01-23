@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import requests
+import time
+from tqdm.auto import tqdm
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -59,72 +61,122 @@ def load_model_with_lora(
         device_map,
     )
 
+    step_timings = {}
+
+    def _timed_step(step_name):
+        start_time = time.perf_counter()
+        logger.info("Starting %s", step_name)
+        return start_time
+
+    def _finish_step(step_name, start_time, progress_bar):
+        elapsed = time.perf_counter() - start_time
+        step_timings[step_name] = round(elapsed, 3)
+        logger.info("Completed %s in %.2fs", step_name, elapsed)
+        progress_bar.update(1)
+        progress_bar.set_postfix_str(f"{step_name} {elapsed:.1f}s", refresh=True)
+
+    total_steps = 6
+    pbar = tqdm(total=total_steps, desc="load_model_with_lora", unit="step")
+
     # Build kwargs for from_pretrained
-    model_kwargs = {
-        "torch_dtype": torch_dtype,
-        "trust_remote_code": True,
-    }
-    # Only add device_map if it's not None (None means let Accelerate/DeepSpeed handle it)
-    if device_map is not None:
-        model_kwargs["device_map"] = device_map
-    else:
-        # When device_map is None, load on CPU first to avoid default GPU placement
-        # Accelerate will move it to the correct device during prepare()
-        model_kwargs["device_map"] = "cpu"
+    try:
+        step = "build_model_kwargs"
+        start = _timed_step(step)
+        model_kwargs = {
+            "torch_dtype": torch_dtype,
+            "trust_remote_code": True,
+        }
+        # Only add device_map if it's not None (None means let Accelerate/DeepSpeed handle it)
+        if device_map is not None:
+            model_kwargs["device_map"] = device_map
+        else:
+            # When device_map is None, load on CPU first to avoid default GPU placement
+            # Accelerate will move it to the correct device during prepare()
+            model_kwargs["device_map"] = "cpu"
     
-    # Enable Flash Attention 2 for memory efficiency (if available)
-    model_kwargs["attn_implementation"] = "flash_attention_2"
-    logger.info("Flash Attention 2 enabled for memory efficiency")
+        # Enable Flash Attention 2 for memory efficiency (if available)
+        model_kwargs["attn_implementation"] = "flash_attention_2"
+        logger.info("Flash Attention 2 enabled for memory efficiency")
 
-    base_model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        **model_kwargs,
-    )
-    
+        _finish_step(step, start, pbar)
+        
+        step = "load_base_model"
+        start = _timed_step(step)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    if checkpoint_path and Path(checkpoint_path).exists():
-        logger.info("Loading existing LoRA adapter from %s", checkpoint_path)
-        model = PeftModel.from_pretrained(base_model, checkpoint_path)
-    else:
-        lora_config = LoraConfig(
-            r=lora_rank,
-            lora_alpha=lora_rank * 2,
-            target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
-            lora_dropout=0.0,
-            bias="none",
-            task_type=TaskType.CAUSAL_LM,
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            **model_kwargs,
         )
-        model = get_peft_model(base_model, lora_config)
-        model.print_trainable_parameters()
+        _finish_step(step, start, pbar)
 
-    # Enable gradient checkpointing to save VRAM during training
-    # This trades compute for memory by recomputing activations during backward pass
-    if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
-        logger.info("Gradient checkpointing enabled for memory efficiency")
-    elif hasattr(model, "base_model") and hasattr(model.base_model, "gradient_checkpointing_enable"):
-        # For PEFT models, enable on the base model
-        model.base_model.gradient_checkpointing_enable()
-        logger.info("Gradient checkpointing enabled on base model for memory efficiency")
-    elif hasattr(model, "base_model") and hasattr(model.base_model, "model") and hasattr(model.base_model.model, "gradient_checkpointing_enable"):
-        # Some PEFT models have base_model.model structure
-        model.base_model.model.gradient_checkpointing_enable()
-        logger.info("Gradient checkpointing enabled on base_model.model for memory efficiency")
-    else:
-        logger.warning("Could not enable gradient checkpointing - model may not support it")
-    model.config.use_cache = False  # VERY IMPORTANT
+        step = "load_tokenizer"
+        start = _timed_step(step)
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        _finish_step(step, start, pbar)
+
+        if checkpoint_path and Path(checkpoint_path).exists():
+            step = "load_lora_adapter"
+            start = _timed_step(step)
+            logger.info("Loading existing LoRA adapter from %s", checkpoint_path)
+            model = PeftModel.from_pretrained(base_model, checkpoint_path)
+            _finish_step(step, start, pbar)
+    
+        else:
+            step = "apply_lora"
+            start = _timed_step(step)
+            lora_config = LoraConfig(
+                r=lora_rank,
+                lora_alpha=lora_rank * 2,
+                target_modules=[
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                ],
+                lora_dropout=0.0,
+                bias="none",
+                task_type=TaskType.CAUSAL_LM,
+            )
+            model = get_peft_model(base_model, lora_config)
+            _finish_step(step, start, pbar)
+
+            step = "print_trainable_parameters"
+            start = _timed_step(step)
+            model.print_trainable_parameters()
+            _finish_step(step, start, pbar)
+
+        step = "enable_gradient_checkpointing"
+        start = _timed_step(step)
+        # Enable gradient checkpointing to save VRAM during training
+        # This trades compute for memory by recomputing activations during backward pass
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+            logger.info("Gradient checkpointing enabled for memory efficiency")
+        elif hasattr(model, "base_model") and hasattr(model.base_model, "gradient_checkpointing_enable"):
+            # For PEFT models, enable on the base model
+            model.base_model.gradient_checkpointing_enable()
+            logger.info("Gradient checkpointing enabled on base model for memory efficiency")
+        elif hasattr(model, "base_model") and hasattr(model.base_model, "model") and hasattr(model.base_model.model, "gradient_checkpointing_enable"):
+            # Some PEFT models have base_model.model structure
+            model.base_model.model.gradient_checkpointing_enable()
+            logger.info("Gradient checkpointing enabled on base_model.model for memory efficiency")
+        else:
+            logger.warning("Could not enable gradient checkpointing - model may not support it")
+        model.config.use_cache = False  # VERY IMPORTANT
+        _finish_step(step, start, pbar)
+    
+    finally:
+        pbar.close()
+        logger.info(
+            "load_model_with_lora timing summary: %s",
+            json.dumps(step_timings, sort_keys=False)
+        )
 
     return model, tokenizer
 
