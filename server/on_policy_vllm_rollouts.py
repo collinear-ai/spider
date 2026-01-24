@@ -12,8 +12,8 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence
-
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 import httpx
 from tqdm.auto import tqdm
 
@@ -358,13 +358,52 @@ class VLLMRolloutCollector:
 
         # Use thread-local client to avoid contention
         client = self._get_client()
-        response = client.post("/v1/chat/completions", json=payload)
-
-        if response.status_code >= 400:
-            body = (response.text or "").strip()
-            raise RuntimeError(
-                f"vLLM chat failed (status={response.status_code}): {body[:512]}"
-            )
+        
+        # Retry logic for JSON serialization errors
+        max_retries = 3
+        for attempt in range(max_retries):
+            response = client.post("/v1/chat/completions", json=payload)
+            
+            if response.status_code >= 400:
+                body = (response.text or "").strip()
+                
+                # Check if it's the JSON serialization error (inf/-inf in logprobs)
+                is_json_error = (
+                    response.status_code == 500 and
+                    ("Out of range float values" in body or "JSON compliant" in body)
+                )
+                
+                if is_json_error and attempt < max_retries - 1:
+                    logger.warning(
+                        "vLLM JSON serialization error (attempt %d/%d), retrying...",
+                        attempt + 1,
+                        max_retries,
+                    )
+                    time.sleep(0.5 * (attempt + 1))  # Exponential backoff
+                    continue
+                
+                # Log error and raise
+                import pickle
+                from datetime import datetime
+                log_dir = Path("/home/ubuntu/spider/vllm_call_logs")
+                log_dir.mkdir(exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                log_file = log_dir / f"vllm_call_input_{timestamp}.pkl"
+                with open(log_file, "wb") as f:
+                    pickle.dump({
+                        "payload": payload,
+                        "model_name": model_name,
+                        "messages": messages,
+                        "error": body[:500],
+                    }, f)
+                logger.debug("Saved vLLM call input to %s", log_file)
+                
+                raise RuntimeError(
+                    f"vLLM chat failed (status={response.status_code}): {body[:512]}"
+                )
+            
+            # Success - break out of retry loop
+            break
 
         data = response.json()
         choices = data.get("choices") or []
