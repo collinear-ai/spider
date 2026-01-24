@@ -26,10 +26,8 @@ from liger_kernel.transformers import apply_liger_kernel_to_qwen3
 from spider.config import JobConfig
 
 from .on_policy_accelerate_utils import (
-    AccelerateTeacherContext,
     FireworksTeacherContext,
     TransformersSamplerContext,
-    compute_teacher_alignment_for_rewards_direct,
     importance_sampling_loss,
     importance_sampling_loss_with_clip,
     load_model_with_lora,
@@ -416,10 +414,12 @@ def _run_tool_on_policy_stream_accelerate(
             )
 
     # Initialize Accelerator with DeepSpeed
+    training_precision = getattr(options, "training_precision", "bf16")
     accelerator = Accelerator(
-        mixed_precision="bf16",
+        mixed_precision=training_precision,
         deepspeed_plugin=deepspeed_plugin,
     )
+    logger.info("Accelerator initialized with mixed_precision=%s", training_precision)
 
     # Get the model from sampler context
     model = sampler_ctx.get_model()
@@ -435,19 +435,16 @@ def _run_tool_on_policy_stream_accelerate(
     # Prepare with accelerator
     model, optimizer = accelerator.prepare(model, optimizer)
 
-    # Load teacher model (use Fireworks API if fireworks_model is specified)
+    # Load teacher model using Fireworks API
     fireworks_model = getattr(options, "fireworks_model", None)
-    if fireworks_model:
-        teacher_ctx = FireworksTeacherContext(
-            model_name=options.teacher,
-            fireworks_model=fireworks_model,
-        )
-        logger.info("Using Fireworks API for teacher: %s", fireworks_model)
-    else:
-        teacher_ctx = AccelerateTeacherContext(
-            model_name=options.teacher,
-            torch_dtype=torch.bfloat16,
-        )
+    if not fireworks_model:
+        raise ValueError("fireworks_model must be specified in options")
+    
+    teacher_ctx = FireworksTeacherContext(
+        model_name=options.teacher,
+        fireworks_model=fireworks_model,
+    )
+    logger.info("Using Fireworks API for teacher: %s", fireworks_model)
 
     training_dir = workspace / "training"
     training_dir.mkdir(parents=True, exist_ok=True)
@@ -493,7 +490,7 @@ def _run_tool_on_policy_stream_accelerate(
 
     device = accelerator.device
 
-    # Helper to call teacher alignment (handles both sync and async contexts)
+    # Helper to call teacher alignment
     def _compute_teacher_alignment(
         messages,
         tools,
@@ -502,31 +499,15 @@ def _run_tool_on_policy_stream_accelerate(
         reward_mask,
         assistant_raw_text,
     ):
-        if isinstance(teacher_ctx, FireworksTeacherContext):
-            # Fireworks uses synchronous requests
-            return teacher_ctx.compute_teacher_alignment(
-                messages=messages,
-                tools=tools,
-                student_model=job.model.name,
-                student_token_ids=student_token_ids,
-                student_logprobs=student_logprobs,
-                reward_mask=reward_mask,
-                assistant_raw_text=assistant_raw_text,
-            )
-        else:
-            # AccelerateTeacherContext - use direct function call
-            return compute_teacher_alignment_for_rewards_direct(
-                model=teacher_ctx.model,
-                messages=messages,
-                tools=tools,
-                teacher_model=options.teacher,
-                student_model=job.model.name,
-                student_token_ids=student_token_ids,
-                student_logprobs=student_logprobs,
-                reward_mask=reward_mask,
-                assistant_raw_text=assistant_raw_text,
-                device=device,
-            )
+        return teacher_ctx.compute_teacher_alignment(
+            messages=messages,
+            tools=tools,
+            student_model=job.model.name,
+            student_token_ids=student_token_ids,
+            student_logprobs=student_logprobs,
+            reward_mask=reward_mask,
+            assistant_raw_text=assistant_raw_text,
+        )
 
     def _process_batch(
         batch_index: int, trajectories: List[Dict[str, Any]]
@@ -1046,10 +1027,12 @@ def _run_tool_on_policy_vllm_accelerate(
                 )
 
         # Initialize Accelerator with DeepSpeed
+        training_precision = getattr(options, "training_precision", "bf16")
         accelerator = Accelerator(
-            mixed_precision="bf16",
+            mixed_precision=training_precision,
             deepspeed_plugin=deepspeed_plugin,
         )
+        logger.info("Accelerator initialized with mixed_precision=%s", training_precision)
 
         # Delay loading training model until first batch (for testing inference speed)
         # Model will be loaded lazily when first needed for training
@@ -1132,19 +1115,16 @@ def _run_tool_on_policy_vllm_accelerate(
             verbose=verbose_turns,
         )
 
-        # Load teacher model
+        # Load teacher model using Fireworks API
         fireworks_model = getattr(options, "fireworks_model", None)
-        if fireworks_model:
-            teacher_ctx = FireworksTeacherContext(
-                model_name=options.teacher,
-                fireworks_model=fireworks_model,
-            )
-            logger.info("Using Fireworks API for teacher: %s", fireworks_model)
-        else:
-            teacher_ctx = AccelerateTeacherContext(
-                model_name=options.teacher,
-                torch_dtype=torch.bfloat16,
-            )
+        if not fireworks_model:
+            raise ValueError("fireworks_model must be specified in options")
+        
+        teacher_ctx = FireworksTeacherContext(
+            model_name=options.teacher,
+            fireworks_model=fireworks_model,
+        )
+        logger.info("Using Fireworks API for teacher: %s", fireworks_model)
 
         # Initialize wandb
         wandb_project = getattr(options, "wandb_project", None)
@@ -1199,30 +1179,15 @@ def _run_tool_on_policy_vllm_accelerate(
             reward_mask,
             assistant_raw_text,
         ):
-            if isinstance(teacher_ctx, FireworksTeacherContext):
-                # Fireworks uses synchronous requests
-                return teacher_ctx.compute_teacher_alignment(
-                    messages=messages,
-                    tools=tools,
-                    student_model=student_model,
-                    student_token_ids=student_token_ids,
-                    student_logprobs=student_logprobs,
-                    reward_mask=reward_mask,
-                    assistant_raw_text=assistant_raw_text,
-                )
-            else:
-                return compute_teacher_alignment_for_rewards_direct(
-                    model=teacher_ctx.model,
-                    messages=messages,
-                    tools=tools,
-                    teacher_model=options.teacher,
-                    student_model=student_model,
-                    student_token_ids=student_token_ids,
-                    student_logprobs=student_logprobs,
-                    reward_mask=reward_mask,
-                    assistant_raw_text=assistant_raw_text,
-                    device=device,
-                )
+            return teacher_ctx.compute_teacher_alignment(
+                messages=messages,
+                tools=tools,
+                student_model=student_model,
+                student_token_ids=student_token_ids,
+                student_logprobs=student_logprobs,
+                reward_mask=reward_mask,
+                assistant_raw_text=assistant_raw_text,
+            )
 
         def _process_batch(
             batch_index: int, trajectories: List[Dict[str, Any]]
@@ -1237,6 +1202,7 @@ def _run_tool_on_policy_vllm_accelerate(
                 collector.lora_name = synchronizer.get_lora_name()
                 logger.info("Initial weight sync completed after first batch. LoRA adapter loaded: %s", collector.lora_name)
             """Process a batch of trajectories and perform a training step."""
+            
             items = []
             batch_metrics = {
                 "kl_sum": 0.0,
@@ -1254,65 +1220,127 @@ def _run_tool_on_policy_vllm_accelerate(
             all_advantages = []
             all_loss_masks = []
 
+            # Collect all teacher alignment calls for parallelization
+            from concurrent.futures import as_completed
+            
+            alignment_tasks = []
             for turn_index, turn in enumerate(trajectories):
                 messages = turn["messages"]
                 token_ids = turn["token_ids"]
                 logprobs = turn["logprobs"]
                 reward_mask = turn["reward_mask"]
-
                 student_logprobs = torch.tensor(logprobs, dtype=torch.float32, device=device)
-
-                # Check if this is a combined multi-turn item
+                
+                combined_turns = turn.get("_combined_turns")
+                if combined_turns:
+                    for turn_info in combined_turns:
+                        turn_messages = turn_info["messages"]
+                        turn_assistant_raw_text = turn_info.get("assistant_raw_text")
+                        if not turn_assistant_raw_text:
+                            continue
+                        
+                        turn_reward_mask = [0] * len(token_ids)
+                        completion_start = turn_info["completion_start"]
+                        completion_end = turn_info["completion_end"]
+                        for idx in range(completion_start, completion_end):
+                            if idx < len(turn_reward_mask):
+                                turn_reward_mask[idx] = 1
+                        
+                        alignment_tasks.append({
+                            "turn_index": turn_index,
+                            "turn": turn,
+                            "turn_info": turn_info,
+                            "messages": turn_messages,
+                            "token_ids": token_ids,
+                            "student_logprobs": student_logprobs,
+                            "reward_mask": turn_reward_mask,
+                            "assistant_raw_text": turn_assistant_raw_text,
+                        })
+                else:
+                    alignment_tasks.append({
+                        "turn_index": turn_index,
+                        "turn": turn,
+                        "turn_info": None,
+                        "messages": messages,
+                        "token_ids": token_ids,
+                        "student_logprobs": student_logprobs,
+                        "reward_mask": reward_mask,
+                        "assistant_raw_text": turn.get("assistant_raw_text"),
+                    })
+            
+            # Submit all tasks in parallel
+            futures = {}
+            for task in alignment_tasks:
+                future = teacher_ctx._executor.submit(
+                    _compute_teacher_alignment,
+                    messages=task["messages"],
+                    tools=tool_defs,
+                    student_token_ids=task["token_ids"],
+                    student_logprobs=task["student_logprobs"],
+                    reward_mask=task["reward_mask"],
+                    assistant_raw_text=task["assistant_raw_text"],
+                )
+                futures[future] = task
+            
+            # Collect results
+            alignment_results = {}
+            for future in as_completed(futures):
+                task = futures[future]
+                turn_idx = task["turn_index"]
+                
+                try:
+                    alignment = future.result()
+                except Exception as e:
+                    logger.error(f"Error in parallel teacher alignment: {e}")
+                    alignment = {
+                        "kl_adjustments": [0.0] * len(task["token_ids"]),
+                        "kl_mask": [0.0] * len(task["token_ids"]),
+                    }
+                
+                if turn_idx not in alignment_results:
+                    alignment_results[turn_idx] = []
+                alignment_results[turn_idx].append({
+                    "task": task,
+                    "alignment": alignment,
+                })
+            
+            # Process trajectories with alignment results
+            for turn_index, turn in enumerate(trajectories):
+                messages = turn["messages"]
+                token_ids = turn["token_ids"]
+                logprobs = turn["logprobs"]
+                reward_mask = turn["reward_mask"]
+                student_logprobs = torch.tensor(logprobs, dtype=torch.float32, device=device)
+                
+                # Use pre-computed alignment results
+                results = alignment_results[turn_index]
                 combined_turns = turn.get("_combined_turns")
                 if combined_turns:
                     kl_adjustments_combined = [0.0] * len(token_ids)
                     kl_mask_combined = [0.0] * len(token_ids)
-
-                    for turn_info in combined_turns:
-                        turn_messages = turn_info["messages"]
-                        turn_assistant_raw_text = turn_info.get("assistant_raw_text")
+                    
+                    for result in results:
+                        task = result["task"]
+                        alignment = result["alignment"]
+                        turn_info = task["turn_info"]
                         completion_start = turn_info["completion_start"]
                         completion_end = turn_info["completion_end"]
-
-                        if not turn_assistant_raw_text:
-                            continue
-
-                        turn_reward_mask = [0] * len(token_ids)
-                        for idx in range(completion_start, completion_end):
-                            if idx < len(turn_reward_mask):
-                                turn_reward_mask[idx] = 1
-
-                        turn_alignment = _compute_teacher_alignment(
-                            messages=turn_messages,
-                            tools=tool_defs,
-                            student_token_ids=token_ids,
-                            student_logprobs=student_logprobs,
-                            reward_mask=turn_reward_mask,
-                            assistant_raw_text=turn_assistant_raw_text,
-                        )
-
-                        turn_kl_adj = turn_alignment.get("kl_adjustments") or [0.0] * len(token_ids)
-                        turn_kl_mask = turn_alignment.get("kl_mask") or [0.0] * len(token_ids)
-
+                        
+                        turn_kl_adj = alignment.get("kl_adjustments") or [0.0] * len(token_ids)
+                        turn_kl_mask = alignment.get("kl_mask") or [0.0] * len(token_ids)
+                        
                         for idx in range(completion_start, completion_end):
                             if idx < len(kl_adjustments_combined):
                                 kl_adjustments_combined[idx] = turn_kl_adj[idx]
                                 if idx < len(turn_kl_mask):
                                     kl_mask_combined[idx] = turn_kl_mask[idx]
-
+                    
                     teacher_alignment = {
                         "kl_adjustments": kl_adjustments_combined,
                         "kl_mask": kl_mask_combined,
                     }
                 else:
-                    teacher_alignment = _compute_teacher_alignment(
-                        messages=messages,
-                        tools=tool_defs,
-                        student_token_ids=token_ids,
-                        student_logprobs=student_logprobs,
-                        reward_mask=reward_mask,
-                        assistant_raw_text=turn.get("assistant_raw_text"),
-                    )
+                    teacher_alignment = results[0]["alignment"]
 
                 item = dict(turn)
                 item.update({
@@ -1345,7 +1373,22 @@ def _run_tool_on_policy_vllm_accelerate(
 
                 target_tensor = torch.tensor(target_tokens, dtype=torch.long, device=device)
                 mask_tensor = torch.tensor(mask_tokens, dtype=torch.float32, device=device)
-                advantages_tokens = advantages_tokens * mask_tensor
+                try:
+                    advantages_tokens = advantages_tokens * mask_tensor
+                except Exception as e:
+                    import pickle
+                    with open("tensor_mismatch.pkl", "wb") as f:
+                        debug_save = {
+                            "token_ids": token_ids,
+                            "advantage": advantage,
+                            "kl_discount": kl_discount,
+                            "reward_mask": reward_mask,
+                            "mask_tokens": mask_tokens,
+                            "advantages_tokens": advantages_tokens.tolist(),
+                            "mask_tensor": mask_tensor.tolist(),
+                        }
+                        pickle.dump(debug_save, f)
+                    raise e
 
                 all_input_ids.append(torch.tensor(input_tokens, dtype=torch.long, device=device))
                 all_target_ids.append(target_tensor)

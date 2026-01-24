@@ -274,7 +274,6 @@ def importance_sampling_loss_with_clip(
     # Delete logits and log_probs immediately - they're large and not needed for backward
     # Only current_logprobs is needed for the computation graph
     del logits, log_probs, outputs
-    torch.cuda.empty_cache()  # Force immediate cleanup of freed tensors
 
     # Importance weight: exp(current - sampling)
     ratio = torch.exp(current_logprobs - sampling_logprobs)
@@ -431,125 +430,6 @@ def compute_teacher_logprobs_direct(
     return token_ids, prompt_len, logprobs
 
 
-def compute_teacher_alignment_for_rewards_direct(
-    *,
-    model: torch.nn.Module,
-    messages: Sequence[Dict[str, object]],
-    tools: Sequence[Dict[str, object]] | None,
-    teacher_model: str,
-    student_model: str,
-    student_token_ids: Sequence[int],
-    student_logprobs: torch.Tensor,
-    reward_mask: Sequence[int],
-    assistant_raw_text: str,
-    device: torch.device,
-) -> Dict[str, object]:
-    """Compute teacher alignment for rewards using direct forward pass.
-
-    This is the accelerate version of compute_teacher_alignment_for_rewards
-    from on_policy_utils.py. It uses direct model forward pass instead of
-    tinker.SamplingClient.
-
-    Args:
-        model: Teacher model
-        messages: Chat messages (must end with assistant turn)
-        tools: Tool definitions
-        teacher_model: Teacher model name
-        student_model: Student model name
-        student_token_ids: Student's token IDs
-        student_logprobs: Student's logprobs
-        reward_mask: Mask for reward tokens
-        assistant_raw_text: Raw text of assistant response
-        device: Device to run on
-
-    Returns:
-        Dict with kl_adjustments, kl_mask, teacher_token_ids, teacher_logprobs
-    """
-    if not messages or messages[-1].get("role") != "assistant":
-        raise ValueError("Messages must end with an assistant turn.")
-
-    student_tokenizer = AutoTokenizer.from_pretrained(student_model, use_fast=True, trust_remote_code=True)
-    teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model, use_fast=True, trust_remote_code=True)
-
-    prefix_msgs = messages[:-1]
-
-    prefix_tokens, _ = render_chat_tokens(
-        messages=prefix_msgs,
-        tools=tools,
-        model_name=teacher_model,
-        add_generation_prompt=True,
-    )
-
-    if assistant_raw_text is None:
-        raise ValueError("Assistant raw text is required for teacher alignment")
-
-    completion_tokens = teacher_tokenizer.encode(
-        assistant_raw_text,
-        add_special_tokens=False,
-    )
-    full_tokens = list(prefix_tokens) + list(completion_tokens)
-
-    # Compute logprobs via direct forward pass
-    logprobs = compute_logprobs_for_sequence(model, full_tokens, device)
-    completion_lp = logprobs[len(prefix_tokens) :]
-
-    # Find reward region
-    start = reward_mask.index(1)
-    end = len(reward_mask) - list(reversed(reward_mask)).index(1)
-
-    student_ids = list(student_token_ids)[start:end]
-    student_lp_slice = student_logprobs[start:end]
-    student_mask = torch.tensor(
-        reward_mask[start:end],
-        device=student_logprobs.device,
-        dtype=student_logprobs.dtype,
-    )
-
-    teacher_lp_tensor = torch.tensor(
-        completion_lp,
-        device=student_logprobs.device,
-        dtype=student_logprobs.dtype,
-    )
-
-    kl_slice, kl_mask_slice = _compute_groupwise_reverse_kl(
-        student_tokenizer,
-        student_ids,
-        student_lp_slice,
-        teacher_tokenizer,
-        completion_tokens,
-        teacher_lp_tensor,
-        student_mask,
-    )
-
-    # Save KL and associated tensors for inspection and debugging using pickle
-    import pickle
-
-    debug_save = {
-        "kl_slice": kl_slice,
-        "kl_mask_slice": kl_mask_slice,
-        "student_ids": list(student_ids),
-        "student_lp_slice": student_lp_slice,
-        "completion_tokens": list(completion_tokens),
-        "teacher_lp_tensor": teacher_lp_tensor,
-        "student_mask": student_mask,
-        "student_logprobs": student_logprobs,
-    }
-    with open("debug_teacher_alignment.pkl", "wb") as f:
-        pickle.dump(debug_save, f)
-
-    kl_adjustments = torch.zeros_like(student_logprobs)
-    kl_mask = torch.zeros_like(student_logprobs)
-    kl_adjustments[start:end] = kl_slice
-    kl_mask[start:end] = kl_mask_slice
-
-    return {
-        "kl_adjustments": kl_adjustments.tolist(),
-        "kl_mask": kl_mask.tolist(),
-        "teacher_token_ids": list(completion_tokens),
-        "teacher_logprobs": list(completion_lp),
-    }
-
-
 class TransformersSamplerContext:
     """Context for generating samples using transformers generate().
 
@@ -639,67 +519,6 @@ class TransformersSamplerContext:
         self.model.load_adapter(adapter_path, adapter_name="default")
 
 
-class AccelerateTeacherContext:
-    """Context for computing teacher logprobs using accelerate/transformers."""
-
-    def __init__(
-        self,
-        model_name: str,
-        device_map: str = "auto",
-        torch_dtype: torch.dtype = torch.bfloat16,
-    ) -> None:
-        self.model_name = model_name
-        logger.info("Loading teacher model: %s", model_name)
-
-        # Enable Flash Attention 2 for teacher model (if available)
-        model_kwargs = {
-            "torch_dtype": torch_dtype,
-            "device_map": device_map,
-            "trust_remote_code": True,
-        }
-        model_kwargs["attn_implementation"] = "flash_attention_2"
-        logger.info("Flash Attention 2 enabled for teacher model")
-  
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            **model_kwargs,
-        )
-        self.model.eval()
-
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name, trust_remote_code=True
-        )
-        self._device = next(self.model.parameters()).device
-
-    def compute_logprobs(self, token_ids: List[int]) -> List[float]:
-        """Compute logprobs for a sequence of tokens."""
-        return compute_logprobs_for_sequence(self.model, token_ids, self._device)
-
-    async def compute_teacher_alignment(
-        self,
-        messages: Sequence[Dict[str, object]],
-        tools: Sequence[Dict[str, object]] | None,
-        student_model: str,
-        student_token_ids: Sequence[int],
-        student_logprobs: torch.Tensor,
-        reward_mask: Sequence[int],
-        assistant_raw_text: str,
-    ) -> Dict[str, object]:
-        """Compute teacher alignment for rewards (async interface for compatibility)."""
-        return compute_teacher_alignment_for_rewards_direct(
-            model=self.model,
-            messages=messages,
-            tools=tools,
-            teacher_model=self.model_name,
-            student_model=student_model,
-            student_token_ids=student_token_ids,
-            student_logprobs=student_logprobs,
-            reward_mask=reward_mask,
-            assistant_raw_text=assistant_raw_text,
-            device=self._device,
-        )
-
-
 class FireworksTeacherContext:
     """Context for computing teacher logprobs using Fireworks API.
 
@@ -741,6 +560,10 @@ class FireworksTeacherContext:
 
         # Load tokenizer locally (small memory footprint)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        
+        # Thread pool for parallel API calls
+        from concurrent.futures import ThreadPoolExecutor
+        self._executor = ThreadPoolExecutor(max_workers=32)
 
     def compute_logprobs(self, text: str) -> Tuple[List[int], List[float]]:
         """Compute logprobs for text using Fireworks completions API.
@@ -800,6 +623,33 @@ class FireworksTeacherContext:
 
         return token_ids, [lp if lp is not None else 0.0 for lp in logprobs]
 
+    def compute_logprobs_batch(self, texts: List[str]) -> List[Tuple[List[int], List[float]]]:
+        """Compute logprobs for multiple texts in parallel.
+        
+        Args:
+            texts: List of texts to compute logprobs for
+            
+        Returns:
+            List of (token_ids, logprobs) tuples
+        """
+        from concurrent.futures import as_completed
+        
+        futures = {self._executor.submit(self.compute_logprobs, text): i 
+                  for i, text in enumerate(texts)}
+        
+        results = [None] * len(texts)
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                results[idx] = future.result()
+            except Exception as e:
+                logger.error(f"Error computing logprobs for text {idx}: {e}")
+                # Fallback: return empty result
+                token_ids = self.tokenizer.encode(texts[idx], add_special_tokens=False)
+                results[idx] = (token_ids, [0.0] * len(token_ids))
+        
+        return results
+
     def compute_teacher_alignment(
         self,
         messages: Sequence[Dict[str, object]],
@@ -837,7 +687,7 @@ class FireworksTeacherContext:
 
         full_text = prefix_text + assistant_raw_text
 
-        # Get logprobs from Fireworks
+        # Get logprobs from Fireworks (uses thread pool for parallelization)
         _, full_logprobs = self.compute_logprobs(full_text)
 
 
@@ -884,27 +734,31 @@ class FireworksTeacherContext:
         )
 
         # Log KL and associated tensors for inspection and debugging using pickle
-        import pickle
-
         kl_adjustments = torch.zeros_like(student_logprobs)
         kl_mask = torch.zeros_like(student_logprobs)
         kl_adjustments[start:end] = kl_slice
-        kl_mask[start:end] = kl_mask_slice
+        try:
+            kl_mask[start:end] = kl_mask_slice
+        except Exception as e:
+            import pickle
 
-        debug_save = {
-            "kl_mask": kl_mask,
-            "kl_mask_slice": kl_mask_slice,
-            "start": start,
-            "end": end,
-            "student_logprobs": student_logprobs,
-            "student_ids": list(student_ids),
-            "student_lp_slice": student_lp_slice,
-            "completion_tokens": list(completion_tokens),
-            "teacher_lp_tensor": teacher_lp_tensor,
-            "student_mask": student_mask,
-        }
-        with open("debug_fireworks_teacher_alignment.pkl", "wb") as f:
-            pickle.dump(debug_save, f)
+            debug_save = {
+                "kl_mask": kl_mask,
+                "kl_mask_slice": kl_mask_slice,
+                "start": start,
+                "end": end,
+                "student_logprobs": student_logprobs,
+                "student_ids": list(student_ids),
+                "student_lp_slice": student_lp_slice,
+                "completion_tokens": list(completion_tokens),
+                "teacher_lp_tensor": teacher_lp_tensor,
+                "student_mask": student_mask,
+            }
+
+            with open("debug_fireworks_teacher_alignment.pkl", "wb") as f:
+                pickle.dump(debug_save, f)
+            raise e
+
 
         return {
             "kl_adjustments": kl_adjustments.tolist(),
