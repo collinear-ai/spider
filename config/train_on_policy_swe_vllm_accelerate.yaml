@@ -28,6 +28,7 @@ job:
       save_every: 50
       kl_penalty_coef: 1.0
       kl_discount_factor: 0.0
+      max_grad_norm: 0.2
 
       # DeepSpeed configuration (optional - for memory efficiency and multi-GPU scaling)
       use_deepspeed: false  # Set to true to enable DeepSpeed ZeRO

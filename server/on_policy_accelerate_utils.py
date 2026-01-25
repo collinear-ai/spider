@@ -327,21 +327,11 @@ def importance_sampling_loss_with_clip(
     # Only current_logprobs is needed for the computation graph
     del logits, log_probs, outputs
 
-    # Clamp log-ratio to prevent exp() overflow (exp(88) ~ 1e38, exp(89) overflows in fp32)
-    # This is equivalent to clamping the ratio but numerically stable
-    log_ratio = current_logprobs - sampling_logprobs
-    log_ratio_clamped = torch.clamp(log_ratio, min=-20.0, max=20.0)
-    
     # Importance weight: exp(current - sampling)
-    ratio = torch.exp(log_ratio_clamped)
+    ratio = torch.exp(current_logprobs - sampling_logprobs)
 
     # Clip the ratio for stability
     clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
-    
-    # Replace any NaN/inf in advantages with 0 (defensive)
-    advantages = torch.where(
-        torch.isfinite(advantages), advantages, torch.zeros_like(advantages)
-    )
 
     # Pessimistic loss (take worse of clipped/unclipped)
     # For positive advantages: we want to maximize ratio * advantage
@@ -351,42 +341,27 @@ def importance_sampling_loss_with_clip(
 
     # Take the maximum (pessimistic) loss
     loss_per_token = torch.max(loss_unclipped, loss_clipped)
-    
-    # Compute loss with NaN protection
-    mask_sum = loss_mask.sum()
-    if mask_sum > 0:
-        loss = loss_per_token.sum() / (mask_sum + 1e-8)
-    else:
-        loss = torch.tensor(0.0, device=input_ids.device, requires_grad=True)
-    
-    # Final NaN check - return zero loss if NaN (prevents poison gradients)
-    if torch.isnan(loss) or torch.isinf(loss):
-        logger.warning("NaN/Inf detected in loss, returning zero loss for this sample")
-        loss = torch.tensor(0.0, device=input_ids.device, requires_grad=True)
+    loss = loss_per_token.sum() / (loss_mask.sum() + 1e-8)
 
     # Compute metrics for logging
     with torch.no_grad():
-        mask_sum_val = mask_sum.item() if mask_sum > 0 else 0
-        if mask_sum_val > 0:
-            mean_ratio = (ratio * loss_mask).sum().item() / mask_sum_val
-            mean_clipped_ratio = (clipped_ratio * loss_mask).sum().item() / mask_sum_val
+        mask_sum = loss_mask.sum().item()
+        if mask_sum > 0:
+            mean_ratio = (ratio * loss_mask).sum().item() / mask_sum
+            mean_clipped_ratio = (clipped_ratio * loss_mask).sum().item() / mask_sum
             # Count how many tokens were clipped
             clipped_low = ((ratio < 1.0 - clip_ratio) * loss_mask).sum().item()
             clipped_high = ((ratio > 1.0 + clip_ratio) * loss_mask).sum().item()
-            clip_fraction = (clipped_low + clipped_high) / mask_sum_val
-            # Track log-ratio stats for debugging
-            log_ratio_max = (log_ratio * loss_mask).abs().max().item()
+            clip_fraction = (clipped_low + clipped_high) / mask_sum
         else:
             mean_ratio = 1.0
             mean_clipped_ratio = 1.0
             clip_fraction = 0.0
-            log_ratio_max = 0.0
 
     metrics = {
         "mean_ratio": mean_ratio,
         "mean_clipped_ratio": mean_clipped_ratio,
         "clip_fraction": clip_fraction,
-        "log_ratio_max": log_ratio_max,
     }
 
     return loss, current_logprobs, metrics

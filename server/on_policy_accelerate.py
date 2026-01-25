@@ -1437,11 +1437,6 @@ def _run_tool_on_policy_vllm_accelerate(
                 kl_adj = teacher_alignment.get("kl_adjustments") or [0.0] * len(token_ids)
                 kl_mask = teacher_alignment.get("kl_mask") or [0.0] * len(token_ids)
                 kl_tensor = torch.tensor(kl_adj, device=device, dtype=torch.float32)
-                
-                # Replace NaN/inf in KL adjustments (can happen from Fireworks API issues)
-                kl_tensor = torch.where(
-                    torch.isfinite(kl_tensor), kl_tensor, torch.zeros_like(kl_tensor)
-                )
 
                 kl_coef = float(getattr(options, "kl_penalty_coef", 1.0))
                 kl_discount = float(getattr(options, "kl_discount_factor", 0.0))
@@ -1453,9 +1448,6 @@ def _run_tool_on_policy_vllm_accelerate(
                         device=device,
                         dtype=torch.float32,
                     )
-                
-                # Clamp advantages to prevent extreme values
-                advantage = torch.clamp(advantage, min=-100.0, max=100.0)
 
                 input_tokens = list(token_ids)[:-1]
                 target_tokens = list(token_ids)[1:]
@@ -1626,11 +1618,6 @@ def _run_tool_on_policy_vllm_accelerate(
                 del chunk_loss
                 torch.cuda.empty_cache()
                 gc.collect()
-            
-            # Clip gradients to prevent explosion (common cause of NaN)
-            max_grad_norm = getattr(options, "max_grad_norm", 1.0)
-            if max_grad_norm is not None and max_grad_norm > 0:
-                accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
             
             # Step optimizer once after all chunks
             optimizer.step()

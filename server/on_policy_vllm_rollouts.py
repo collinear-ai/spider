@@ -430,7 +430,12 @@ class VLLMRolloutCollector:
             except KeyError:
                 token_strings.append("")
             try:
-                logprobs.append(lp_entry["logprob"])
+                lp_val = lp_entry["logprob"]
+                # Sanitize inf/-inf/nan logprobs (vLLM can return these)
+                import math
+                if lp_val is None or not math.isfinite(lp_val):
+                    lp_val = -100.0  # Use a very negative but finite value
+                logprobs.append(lp_val)
             except KeyError:
                 logprobs.append(0.0)
 
