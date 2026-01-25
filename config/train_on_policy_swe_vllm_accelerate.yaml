@@ -22,19 +22,11 @@ job:
 
       # Training hyperparameters
       learning_rate: 1e-4
-      groups_per_batch: 
+      groups_per_batch: 8
       lora_rank: 64
       save_every: 50
       kl_penalty_coef: 1.0
       kl_discount_factor: 0.0
-
-      # DeepSpeed configuration (optional - for memory efficiency and multi-GPU scaling)
-      use_deepspeed: false  # Set to true to enable DeepSpeed ZeRO
-      deepspeed_config_path: "config/deepspeed_config_zer2.json"  # Path to config file (uses ZeRO-2, no CPU offload for speed)
-      # Note: The config file settings override the programmatic options below
-      deepspeed_zero_stage: 2  # 1, 2, or 3 (2 recommended for LoRA - only used if config_path is None)
-      deepspeed_offload_optimizer: false  # Only used if config_path is None
-      deepspeed_offload_param: false  # Only used if config_path is None (ZeRO-3 only)
 
       # === Separated vLLM Inference + Training Architecture ===
       # Enable vLLM-based inference (parallel rollouts, proper tool parsing)
@@ -60,7 +52,7 @@ job:
       rollout_workers: 128  # Number of concurrent HTTP requests to vLLM (increased for better throughput)
 
       # Weight synchronization between training and inference
-      weight_sync_steps: 10  # Sync LoRA weights to vLLM every N training steps
+      weight_sync_steps: 1  # Sync LoRA weights to vLLM every N training steps
 
       # PPO-style importance sampling clipping
       importance_sampling_clip: 0.2
@@ -70,7 +62,8 @@ job:
       gradient_accumulation_steps: 4  # Process 4 trajectories per backward pass
 
       # Training precision (bf16, fp16, or fp8 for H100 GPUs)
-      training_precision: fp8
+      # Use bf16 for numerical stability on Qwen3-8B
+      training_precision: bf16
 
       # Optional: wandb logging
       wandb_project: icml26-muyu

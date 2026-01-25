@@ -19,12 +19,15 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from accelerate import DeepSpeedPlugin
 from peft import PeftModel
+from transformers import get_scheduler
 
 from tqdm.auto import tqdm
 
-from liger_kernel.transformers import apply_liger_kernel_to_qwen3
+# DISABLED: Liger kernel causes corrupted logits with Qwen3 + LoRA + gradient checkpointing
+# Symptoms: logits range from -260 to +300, predictions are garbage
+# Result: importance sampling ratio ≈ 0, gradient explosion, NaN loss
+# from liger_kernel.transformers import apply_liger_kernel_to_qwen3
 from spider.config import JobConfig
 
 from .on_policy_accelerate_utils import (
@@ -50,8 +53,6 @@ RolloutBatch = List[Dict[str, Any]]
 
 logger = logging.getLogger(__name__)
 
-
-apply_liger_kernel_to_qwen3(fused_linear_cross_entropy=False)
 
 class _AccelerateStudentSamplerContext:
     """Student sampler context using transformers generate()."""
@@ -79,11 +80,21 @@ class _AccelerateStudentSamplerContext:
                 "job.model.name must be provided to create a sampling context."
             )
 
+        # Determine torch dtype based on training precision
+        training_precision = getattr(self._job.generation.on_policy_options, "training_precision", "bf16")
+        if training_precision == "fp32":
+            model_dtype = torch.float32
+        elif training_precision == "fp16":
+            model_dtype = torch.float16
+        else:
+            model_dtype = torch.bfloat16
+
         # Load model with LoRA
         self._model, self._tokenizer = load_model_with_lora(
             model_name=model_name,
             lora_rank=lora_rank,
             checkpoint_path=checkpoint_path,
+            torch_dtype=model_dtype,
         )
 
         self._sampler = TransformersSamplerContext(
@@ -375,52 +386,9 @@ def _run_tool_on_policy_stream_accelerate(
 
     verbose_turns = bool(job.generation.verbose)
 
-    # Initialize DeepSpeed plugin if enabled
-    use_deepspeed = getattr(options, "use_deepspeed", False)
-    deepspeed_plugin = None
-    
-    if use_deepspeed:
-        deepspeed_config_path = getattr(options, "deepspeed_config_path", None)
-        if deepspeed_config_path and Path(deepspeed_config_path).exists():
-            # Load DeepSpeed config from file
-            import json
-            with open(deepspeed_config_path) as f:
-                ds_config = json.load(f)
-            
-            zero_stage = ds_config.get("zero_optimization", {}).get("stage", 2)
-            deepspeed_plugin = DeepSpeedPlugin(
-                hf_ds_config=ds_config,
-                zero3_init_flag=zero_stage == 3,
-            )
-            logger.info(
-                "Using DeepSpeed config from file: %s (ZeRO stage %d)",
-                deepspeed_config_path,
-                zero_stage,
-            )
-        else:
-            # Create DeepSpeed plugin programmatically
-            zero_stage = getattr(options, "deepspeed_zero_stage", 2)
-            offload_optimizer = getattr(options, "deepspeed_offload_optimizer", False)
-            offload_param = getattr(options, "deepspeed_offload_param", False)
-            
-            deepspeed_plugin = DeepSpeedPlugin(
-                zero_stage=zero_stage,
-                offload_optimizer_device="cpu" if offload_optimizer else None,
-                offload_param_device="cpu" if offload_param else None,
-            )
-            logger.info(
-                "Using DeepSpeed ZeRO stage %d (optimizer offload: %s, param offload: %s)",
-                zero_stage,
-                offload_optimizer,
-                offload_param,
-            )
-
-    # Initialize Accelerator with DeepSpeed
+    # Initialize Accelerator
     training_precision = getattr(options, "training_precision", "bf16")
-    accelerator = Accelerator(
-        mixed_precision=training_precision,
-        deepspeed_plugin=deepspeed_plugin,
-    )
+    accelerator = Accelerator(mixed_precision=training_precision)
     logger.info("Accelerator initialized with mixed_precision=%s", training_precision)
 
     # Get the model from sampler context
@@ -434,8 +402,23 @@ def _run_tool_on_policy_stream_accelerate(
         eps=1e-8,
     )
 
+    # LR scheduler: cosine with warmup
+    total_training_steps = max(total_batches, 1)
+    warmup_ratio = float(getattr(options, "warmup_ratio", 0.1) or 0.0)
+    warmup_steps = int(total_training_steps * warmup_ratio)
+    scheduler = get_scheduler(
+        name="cosine",
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_training_steps,
+    )
+    logger.info(
+        "LR scheduler: cosine with %d warmup steps out of %d total",
+        warmup_steps, total_training_steps,
+    )
+
     # Prepare with accelerator
-    model, optimizer = accelerator.prepare(model, optimizer)
+    model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
 
     # Load teacher model using Fireworks API
     fireworks_model = getattr(options, "fireworks_model", None)
@@ -721,6 +704,7 @@ def _run_tool_on_policy_stream_accelerate(
         optimizer.zero_grad()
         accelerator.backward(total_loss)
         optimizer.step()
+        scheduler.step()
 
         loss_value = total_loss.item()
         batch_metrics["loss"] = loss_value
@@ -963,9 +947,6 @@ def _run_tool_on_policy_vllm_accelerate(
         vllm_gpu_ids,
     )
 
-    # Save original CUDA_VISIBLE_DEVICES to restore if needed
-    original_cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-
     # CRITICAL: Ensure CUDA is not initialized before starting vLLM subprocess.
     # vLLM workers need a clean CUDA context. If torch has already initialized
     # CUDA, the subprocess workers may inherit corrupted state.
@@ -995,52 +976,9 @@ def _run_tool_on_policy_vllm_accelerate(
             os.environ["CUDA_VISIBLE_DEVICES"],
         )
 
-        # Initialize DeepSpeed plugin if enabled
-        use_deepspeed = getattr(options, "use_deepspeed", False)
-        deepspeed_plugin = None
-        
-        if use_deepspeed:
-            deepspeed_config_path = getattr(options, "deepspeed_config_path", None)
-            if deepspeed_config_path and Path(deepspeed_config_path).exists():
-                # Load DeepSpeed config from file
-                import json
-                with open(deepspeed_config_path) as f:
-                    ds_config = json.load(f)
-                
-                zero_stage = ds_config.get("zero_optimization", {}).get("stage", 2)
-                deepspeed_plugin = DeepSpeedPlugin(
-                    hf_ds_config=ds_config,
-                    zero3_init_flag=zero_stage == 3,
-                )
-                logger.info(
-                    "Using DeepSpeed config from file: %s (ZeRO stage %d)",
-                    deepspeed_config_path,
-                    zero_stage,
-                )
-            else:
-                # Create DeepSpeed plugin programmatically
-                zero_stage = getattr(options, "deepspeed_zero_stage", 2)
-                offload_optimizer = getattr(options, "deepspeed_offload_optimizer", False)
-                offload_param = getattr(options, "deepspeed_offload_param", False)
-                
-                deepspeed_plugin = DeepSpeedPlugin(
-                    zero_stage=zero_stage,
-                    offload_optimizer_device="cpu" if offload_optimizer else None,
-                    offload_param_device="cpu" if offload_param else None,
-                )
-                logger.info(
-                    "Using DeepSpeed ZeRO stage %d (optimizer offload: %s, param offload: %s)",
-                    zero_stage,
-                    offload_optimizer,
-                    offload_param,
-                )
-
-        # Initialize Accelerator with DeepSpeed
+        # Initialize Accelerator
         training_precision = getattr(options, "training_precision", "bf16")
-        accelerator = Accelerator(
-            mixed_precision=training_precision,
-            deepspeed_plugin=deepspeed_plugin,
-        )
+        accelerator = Accelerator(mixed_precision=training_precision)
         logger.info("Accelerator initialized with mixed_precision=%s", training_precision)
 
         # Delay loading training model until first batch (for testing inference speed)
@@ -1048,13 +986,14 @@ def _run_tool_on_policy_vllm_accelerate(
         model = None
         tokenizer = None
         optimizer = None
+        scheduler = None
         training_model_loaded = False
         training_model_future = None
         training_model_lock = threading.Lock()
         training_model_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
         def _load_training_model():
-            nonlocal model, tokenizer, optimizer, training_model_loaded
+            nonlocal model, tokenizer, optimizer, scheduler, training_model_loaded
             with training_model_lock:
                 if training_model_loaded:
                     return
@@ -1069,24 +1008,24 @@ def _run_tool_on_policy_vllm_accelerate(
                 file=sys.stderr,
                 leave=True,
             )
-            # When using DeepSpeed, don't use device_map (Accelerate/DeepSpeed will handle device placement)
-            # For ZeRO-3, load on CPU first (DeepSpeed will shard during prepare)
-            if use_deepspeed:
-                zero_stage = getattr(options, "deepspeed_zero_stage", 2)
-                if zero_stage == 3:
-                    device_map = "cpu"  # ZeRO-3 needs CPU loading
-                else:
-                    device_map = None  # ZeRO-1/2: let Accelerate/DeepSpeed handle device placement
-            else:
-                device_map = "auto"  # No DeepSpeed: use auto device mapping
 
             phase_start = time.time()
+
+            # Determine torch dtype based on training precision
+            training_precision = getattr(options, "training_precision", "bf16")
+            if training_precision == "fp32":
+                model_dtype = torch.float32
+            elif training_precision == "fp16":
+                model_dtype = torch.float16
+            else:  # bf16 or anything else
+                model_dtype = torch.bfloat16
+            logger.info("Loading model with dtype %s (training_precision=%s)", model_dtype, training_precision)
 
             model, tokenizer = load_model_with_lora(
                 model_name=student_model,
                 lora_rank=options.lora_rank,
                 checkpoint_path=student_checkpoint,
-                device_map=device_map,
+                torch_dtype=model_dtype,
             )
             pbar.update(1)
             logger.info("Training model weights loaded in %.2fs", time.time() - phase_start)
@@ -1099,12 +1038,27 @@ def _run_tool_on_policy_vllm_accelerate(
                 betas=(0.9, 0.95),
                 eps=1e-8,
             )
+            
+            # LR scheduler: cosine with warmup
+            total_training_steps = max(total_batches, 1)
+            warmup_ratio = float(getattr(options, "warmup_ratio", 0.1) or 0.0)
+            warmup_steps = int(total_training_steps * warmup_ratio)
+            scheduler = get_scheduler(
+                name="cosine",
+                optimizer=optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=total_training_steps,
+            )
+            logger.info(
+                "LR scheduler: cosine with %d warmup steps out of %d total",
+                warmup_steps, total_training_steps,
+            )
             pbar.update(1)
             logger.info("Training optimizer created in %.2fs", time.time() - phase_start)
 
             # Prepare with accelerator
             phase_start = time.time()
-            model, optimizer = accelerator.prepare(model, optimizer)
+            model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
             pbar.update(1)
             logger.info("Accelerator prepare completed in %.2fs", time.time() - phase_start)
             pbar.close()
@@ -1143,12 +1097,15 @@ def _run_tool_on_policy_vllm_accelerate(
             vllm_backend=vllm_backend,
         )
 
-        # Skip initial sync - will sync after first batch when model is loaded
-        logger.info("Skipping initial weight sync (model not loaded yet). Will sync after first batch.")
+        # CRITICAL: Wait for training model to load and sync BEFORE collecting rollouts
+        # This ensures importance ratio starts at ~1.0 (same model for sampling and training)
+        logger.info("Waiting for training model to load before collecting rollouts...")
+        _ensure_training_model_loaded()
+        synchronizer.force_sync(model, accelerator, step=0)
+        initial_lora_name = synchronizer.get_lora_name()
+        logger.info("Initial weight sync completed. LoRA adapter loaded: %s", initial_lora_name)
 
-        # Create rollout collector
-        # Note: lora_name will be None initially (no LoRA adapter loaded yet)
-        # vLLM will work without LoRA for initial rollouts
+        # Create rollout collector with the synced LoRA adapter
         rollout_workers = getattr(options, "rollout_workers", 8)
         collector = VLLMRolloutCollector(
             vllm_base_url=vllm_backend.base_url,
@@ -1161,7 +1118,7 @@ def _run_tool_on_policy_vllm_accelerate(
             max_tool_turns=max(1, job.generation.max_tool_turns or 16),
             max_tokens=job.generation.parameters.get("max_tokens", 4096),
             temperature=job.generation.parameters.get("temperature", 1.0),
-            lora_name=None,  # Will be set after first batch when model is loaded
+            lora_name=initial_lora_name,  # Use synced LoRA from the start
             runtime_factory=runtime_factory,
             verbose=verbose_turns,
         )
@@ -1243,15 +1200,6 @@ def _run_tool_on_policy_vllm_accelerate(
         def _process_batch(
             batch_index: int, trajectories: List[Dict[str, Any]]
         ) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
-            # Load training model lazily on first batch
-            _ensure_training_model_loaded()
-            
-            # Do initial weight sync on first batch (if not done yet)
-            if batch_index == 0:
-                synchronizer.force_sync(model, accelerator, step=0)
-                # Update collector to use the LoRA adapter after sync
-                collector.lora_name = synchronizer.get_lora_name()
-                logger.info("Initial weight sync completed after first batch. LoRA adapter loaded: %s", collector.lora_name)
             """Process a batch of trajectories and perform a training step."""
             
             items = []
@@ -1425,22 +1373,7 @@ def _run_tool_on_policy_vllm_accelerate(
 
                 target_tensor = torch.tensor(target_tokens, dtype=torch.long, device=device)
                 mask_tensor = torch.tensor(mask_tokens, dtype=torch.float32, device=device)
-                try:
-                    advantages_tokens = advantages_tokens * mask_tensor
-                except Exception as e:
-                    import pickle
-                    with open("tensor_mismatch.pkl", "wb") as f:
-                        debug_save = {
-                            "token_ids": token_ids,
-                            "advantage": advantage,
-                            "kl_discount": kl_discount,
-                            "reward_mask": reward_mask,
-                            "mask_tokens": mask_tokens,
-                            "advantages_tokens": advantages_tokens.tolist(),
-                            "mask_tensor": mask_tensor.tolist(),
-                        }
-                        pickle.dump(debug_save, f)
-                    raise e
+                advantages_tokens = advantages_tokens * mask_tensor
 
                 all_input_ids.append(torch.tensor(input_tokens, dtype=torch.long, device=device))
                 all_target_ids.append(target_tensor)
@@ -1525,6 +1458,11 @@ def _run_tool_on_policy_vllm_accelerate(
                 num_chunks = (num_trajectories + gradient_accumulation_steps - 1) // gradient_accumulation_steps
                 chunk_loss = chunk_loss / num_chunks
                 
+                # Guard against NaN/Inf loss before backward
+                if not torch.isfinite(chunk_loss):
+                    logger.error("NaN/Inf loss detected at batch %d, aborting", batch_index)
+                    sys.exit(1)
+
                 # Backward on chunk (gradients accumulate)
                 accelerator.backward(chunk_loss)
                 accumulated_loss_value += chunk_loss.item() * chunk_size
@@ -1534,8 +1472,24 @@ def _run_tool_on_policy_vllm_accelerate(
                 torch.cuda.empty_cache()
                 gc.collect()
             
-            # Step optimizer once after all chunks
-            optimizer.step()
+            # Step optimizer once after all chunks (with gradient clipping for stability)
+            max_grad_norm = float(getattr(options, "max_grad_norm", 1.0))
+            
+            # Check for NaN gradients before stepping (they would corrupt weights)
+            has_nan_grad = False
+            for name, param in model.named_parameters():
+                if param.grad is not None and not torch.isfinite(param.grad).all():
+                    has_nan_grad = True
+                    logger.error("NaN gradient detected in %s before optimizer step", name)
+                    break
+            
+            if has_nan_grad:
+                logger.error("Skipping optimizer step due to NaN gradients")
+                optimizer.zero_grad()  # Clear the bad gradients
+            else:
+                accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+                optimizer.step()
+                scheduler.step()
             
             # Average loss for logging
             loss_value = accumulated_loss_value / num_trajectories if num_trajectories > 0 else 0.0
@@ -1632,7 +1586,14 @@ def _run_tool_on_policy_vllm_accelerate(
 
             # Process batch (training step)
             training_start = time.time()
-            batch_items, batch_metrics = _process_batch(batch_index, trajectories)
+            try:
+                batch_items, batch_metrics = _process_batch(batch_index, trajectories)
+            except RuntimeError as e:
+                if "Non-finite loss" in str(e):
+                    logger.error("Aborting training at batch %d due to non-finite loss", batch_index)
+                    break
+                raise
+
             training_time = time.time() - training_start
             batch_time = time.time() - batch_start
             global_step += 1

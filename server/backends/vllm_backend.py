@@ -375,8 +375,8 @@ class VLLMBackend:
         if self._tool_parser:
             command.append("--enable-auto-tool-choice")
             command.extend(["--tool-call-parser", self._tool_parser])
-        if self._chat_template: # special template for auto-tool-choice
-            command.extend(["--chat-template", str(self._chat_template)])
+        # if self._chat_template: # special template for auto-tool-choice
+        #     command.extend(["--chat-template", str(self._chat_template)])
         if self._reasoning_parser:
             command.extend(["--reasoning-parser", self._reasoning_parser])
 

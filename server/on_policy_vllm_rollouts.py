@@ -347,7 +347,6 @@ class VLLMRolloutCollector:
         payload = {
             "model": model_name,
             "messages": messages,
-            "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "logprobs": True,
             "top_logprobs": 1,
@@ -359,51 +358,13 @@ class VLLMRolloutCollector:
         # Use thread-local client to avoid contention
         client = self._get_client()
         
-        # Retry logic for JSON serialization errors
-        max_retries = 3
-        for attempt in range(max_retries):
-            response = client.post("/v1/chat/completions", json=payload)
-            
-            if response.status_code >= 400:
-                body = (response.text or "").strip()
-                
-                # Check if it's the JSON serialization error (inf/-inf in logprobs)
-                is_json_error = (
-                    response.status_code == 500 and
-                    ("Out of range float values" in body or "JSON compliant" in body)
-                )
-                
-                if is_json_error and attempt < max_retries - 1:
-                    logger.warning(
-                        "vLLM JSON serialization error (attempt %d/%d), retrying...",
-                        attempt + 1,
-                        max_retries,
-                    )
-                    time.sleep(0.5 * (attempt + 1))  # Exponential backoff
-                    continue
-                
-                # Log error and raise
-                import pickle
-                from datetime import datetime
-                log_dir = Path("/home/ubuntu/spider/vllm_call_logs")
-                log_dir.mkdir(exist_ok=True)
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                log_file = log_dir / f"vllm_call_input_{timestamp}.pkl"
-                with open(log_file, "wb") as f:
-                    pickle.dump({
-                        "payload": payload,
-                        "model_name": model_name,
-                        "messages": messages,
-                        "error": body[:500],
-                    }, f)
-                logger.debug("Saved vLLM call input to %s", log_file)
-                
-                raise RuntimeError(
-                    f"vLLM chat failed (status={response.status_code}): {body[:512]}"
-                )
-            
-            # Success - break out of retry loop
-            break
+        response = client.post("/v1/chat/completions", json=payload)
+        
+        if response.status_code >= 400:
+            body = (response.text or "").strip()
+            raise RuntimeError(
+                f"vLLM chat failed (status={response.status_code}): {body}"
+            )
 
         data = response.json()
         choices = data.get("choices") or []
@@ -418,32 +379,76 @@ class VLLMRolloutCollector:
         reasoning = message.get("reasoning") or message.get("reasoning_content")
         tool_calls = message.get("tool_calls")
 
-        # Extract logprobs
+        # Extract logprobs and token IDs
+        # CRITICAL: We must keep logprobs aligned with token_ids for importance sampling
+        # vLLM returns logprobs[i] for its token[i], so we need the exact token IDs vLLM used
         logprobs_data = choice.get("logprobs") or {}
         logprobs_content = logprobs_data.get("content") or []
 
         token_strings = []
         logprobs = []
+        token_ids = []
+        
         for lp_entry in logprobs_content:
+            # Extract token string
             try:
-                token_strings.append(lp_entry["token"])
+                token_str = lp_entry["token"]
+                token_strings.append(token_str)
             except KeyError:
                 token_strings.append("")
+                token_str = ""
+            
+            # Extract logprob
             try:
                 logprobs.append(lp_entry["logprob"])
             except KeyError:
                 logprobs.append(0.0)
-
-        import unicodedata
-        concatenated = "".join(token_strings)
-        normalized_text = unicodedata.normalize('NFC', concatenated)
-        token_ids = self._tokenizer.encode(normalized_text, add_special_tokens=False)
+            
+            # Convert token string to token ID
+            # Method 1: Try convert_tokens_to_ids (handles tokenizer-specific token formats)
+            token_id = self._tokenizer.convert_tokens_to_ids(token_str)
+            if token_id != self._tokenizer.unk_token_id:
+                token_ids.append(token_id)
+                continue
+            
+            # Method 2: Try using bytes if available (most accurate for edge cases)
+            token_bytes = lp_entry.get("bytes")
+            if token_bytes is not None:
+                try:
+                    token_text = bytes(token_bytes).decode("utf-8")
+                    # Try convert_tokens_to_ids first
+                    token_id = self._tokenizer.convert_tokens_to_ids(token_text)
+                    if token_id != self._tokenizer.unk_token_id:
+                        token_ids.append(token_id)
+                        continue
+                    # Fall back to encode
+                    ids = self._tokenizer.encode(token_text, add_special_tokens=False)
+                    if ids:
+                        token_ids.append(ids[0])
+                        if len(ids) > 1:
+                            logger.debug("Token from bytes encoded to multiple IDs: %s -> %s", token_text[:20], ids[:5])
+                        continue
+                except Exception as e:
+                    logger.debug("Failed to process token bytes: %s", e)
+            
+            # Method 3: Fall back to encoding the token string
+            ids = self._tokenizer.encode(token_str, add_special_tokens=False)
+            if ids:
+                token_ids.append(ids[0])
+                if len(ids) > 1:
+                    logger.debug("Token string encoded to multiple IDs: '%s' -> %s", token_str[:20], ids[:5])
+            else:
+                # Last resort: use unknown token
+                token_ids.append(self._tokenizer.unk_token_id or 0)
+                logger.debug("Could not convert token to ID, using unk: '%s'", token_str[:20])
         
-        if len(token_ids) != len(token_strings):
-            logger.debug(
-                "Token count mismatch: original=%d re-encoded=%d",
-                len(token_strings),
+        # Verify alignment - this is critical for importance sampling
+        if len(token_ids) != len(logprobs):
+            logger.error(
+                "CRITICAL: Token/logprob count mismatch: token_ids=%d logprobs=%d. "
+                "This will cause importance sampling ratio errors!",
                 len(token_ids),
+                len(logprobs),
             )
 
         raw_text = self._tokenizer.decode(token_ids, skip_special_tokens=False)
@@ -466,12 +471,15 @@ class VLLMRolloutCollector:
             if parsed.reasoning:
                 reasoning = parsed.reasoning
 
-        # Get prompt token count from usage
+        # Get prompt token count from vLLM's usage - this is the authoritative count
+        # CRITICAL: We must use vLLM's count, not local tokenization, because vLLM may use
+        # a different chat template that produces different token counts
         usage = data.get("usage") or {}
-        prompt_tokens = usage.get("prompt_tokens", 0)
+        vllm_prompt_tokens = usage.get("prompt_tokens", 0)
+        vllm_completion_tokens = usage.get("completion_tokens", 0)
 
         # Build full token sequence (prompt + generated)
-        # We need to get the prompt tokens from the input
+        # Compute prompt tokens locally for the full sequence
         prompt_text = self._tokenizer.apply_chat_template(
             messages,
             tools=self.tools if self.tools else None,
@@ -479,6 +487,49 @@ class VLLMRolloutCollector:
             tokenize=False,
         )
         prompt_token_ids = self._tokenizer.encode(prompt_text)
+        
+        # Log diagnostic info
+        local_prompt_count = len(prompt_token_ids)
+        logger.info(
+            "Token counts: vLLM_prompt=%d vLLM_completion=%d local_prompt=%d generated=%d logprobs=%d",
+            vllm_prompt_tokens,
+            vllm_completion_tokens,
+            local_prompt_count,
+            len(token_ids),
+            len(logprobs),
+        )
+        
+        # Log first few logprobs to verify they're not all zeros
+        if logprobs:
+            sample_lps = logprobs[:5]
+            logger.info("First 5 generated logprobs from vLLM: %s", sample_lps)
+        
+        # Check for mismatch between local and vLLM tokenization
+        if vllm_prompt_tokens > 0 and local_prompt_count != vllm_prompt_tokens:
+            logger.warning(
+                "Prompt token count mismatch: local=%d vLLM=%d (diff=%d). "
+                "Adjusting to match vLLM.",
+                local_prompt_count,
+                vllm_prompt_tokens,
+                local_prompt_count - vllm_prompt_tokens,
+            )
+            # Adjust prompt_token_ids to match vLLM's count
+            # This ensures full_token_ids, full_logprobs, and reward_mask all align
+            if vllm_prompt_tokens > local_prompt_count:
+                # vLLM has more tokens - pad with unk tokens
+                pad_count = vllm_prompt_tokens - local_prompt_count
+                pad_token = self._tokenizer.unk_token_id or 0
+                prompt_token_ids = prompt_token_ids + [pad_token] * pad_count
+            else:
+                # vLLM has fewer tokens - truncate
+                prompt_token_ids = prompt_token_ids[:vllm_prompt_tokens]
+        elif vllm_prompt_tokens == 0:
+            logger.warning("vLLM did not return prompt_tokens in usage, using local count=%d", local_prompt_count)
+        
+        # Use consistent prompt token count for all arrays
+        prompt_token_count = len(prompt_token_ids)
+        
+        # Build full token IDs
         full_token_ids = list(prompt_token_ids) + token_ids
 
         return {
@@ -488,7 +539,7 @@ class VLLMRolloutCollector:
             "token_ids": token_ids,
             "logprobs": logprobs,
             "raw_text": raw_text,
-            "prompt_token_count": len(prompt_token_ids),
+            "prompt_token_count": prompt_token_count,
             "full_token_ids": full_token_ids,
             "parser_fallback": parsed.parser_fallback,
         }

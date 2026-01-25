@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import flash_attn
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer
@@ -47,7 +46,7 @@ def load_model_with_lora(
         model_name: HuggingFace model name or path
         lora_rank: LoRA rank for adapter
         checkpoint_path: Optional path to existing LoRA adapter
-        device_map: Device mapping strategy (None means no device mapping, for DeepSpeed)
+        device_map: Device mapping strategy ("auto" for automatic placement)
         torch_dtype: Torch dtype for model weights
 
     Returns:
@@ -85,18 +84,10 @@ def load_model_with_lora(
         model_kwargs = {
             "torch_dtype": torch_dtype,
             "trust_remote_code": True,
+            "device_map": device_map,
+            "attn_implementation": "flash_attention_2",
         }
-        # Only add device_map if it's not None (None means let Accelerate/DeepSpeed handle it)
-        if device_map is not None:
-            model_kwargs["device_map"] = device_map
-        else:
-            # When device_map is None, load on CPU first to avoid default GPU placement
-            # Accelerate will move it to the correct device during prepare()
-            model_kwargs["device_map"] = "cpu"
-    
-        # Enable Flash Attention 2 for memory efficiency (if available)
-        model_kwargs["attn_implementation"] = "flash_attention_2"
-        logger.info("Flash Attention 2 enabled for memory efficiency")
+        logger.info("Flash Attention 2 enabled")
 
         _finish_step(step, start, pbar)
         
@@ -317,15 +308,12 @@ def importance_sampling_loss_with_clip(
         Tuple of (loss, current_logprobs, metrics_dict)
     """
     outputs = model(input_ids=input_ids)
-    logits = outputs.logits  # [batch, seq_len, vocab_size] - no slicing needed, input is already aligned
+    logits = outputs.logits  # [batch, seq_len, vocab_size]
+    
     log_probs = F.log_softmax(logits, dim=-1)
 
     # Gather logprobs for target tokens
     current_logprobs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
-    
-    # Delete logits and log_probs immediately - they're large and not needed for backward
-    # Only current_logprobs is needed for the computation graph
-    del logits, log_probs, outputs
 
     # Importance weight: exp(current - sampling)
     ratio = torch.exp(current_logprobs - sampling_logprobs)
@@ -334,8 +322,6 @@ def importance_sampling_loss_with_clip(
     clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
 
     # Pessimistic loss (take worse of clipped/unclipped)
-    # For positive advantages: we want to maximize ratio * advantage
-    # For negative advantages: we want to minimize ratio * (-advantage)
     loss_unclipped = -ratio * advantages * loss_mask
     loss_clipped = -clipped_ratio * advantages * loss_mask
 
@@ -349,7 +335,6 @@ def importance_sampling_loss_with_clip(
         if mask_sum > 0:
             mean_ratio = (ratio * loss_mask).sum().item() / mask_sum
             mean_clipped_ratio = (clipped_ratio * loss_mask).sum().item() / mask_sum
-            # Count how many tokens were clipped
             clipped_low = ((ratio < 1.0 - clip_ratio) * loss_mask).sum().item()
             clipped_high = ((ratio > 1.0 + clip_ratio) * loss_mask).sum().item()
             clip_fraction = (clipped_low + clipped_high) / mask_sum
@@ -402,16 +387,7 @@ def save_checkpoint_accelerate(
     # Save optimizer state
     state_path = checkpoint_dir / "state"
     state_path.mkdir(parents=True, exist_ok=True)
-    
-    # DeepSpeed handles checkpointing differently
-    if accelerator.state.deepspeed_plugin is not None:
-        # DeepSpeed checkpoint - save using DeepSpeed's method
-        # Note: DeepSpeed checkpoints are saved automatically during training
-        # We still save the LoRA adapter separately for vLLM sync
-        accelerator.save_state(str(state_path))
-    else:
-        # Standard Accelerate checkpoint
-        accelerator.save_state(str(state_path))
+    accelerator.save_state(str(state_path))
 
     paths = {
         "sampler_path": str(adapter_path),
@@ -789,28 +765,7 @@ class FireworksTeacherContext:
         kl_adjustments = torch.zeros_like(student_logprobs)
         kl_mask = torch.zeros_like(student_logprobs)
         kl_adjustments[start:end] = kl_slice
-        try:
-            kl_mask[start:end] = kl_mask_slice
-        except Exception as e:
-            import pickle
-
-            debug_save = {
-                "kl_mask": kl_mask,
-                "kl_mask_slice": kl_mask_slice,
-                "start": start,
-                "end": end,
-                "student_logprobs": student_logprobs,
-                "student_ids": list(student_ids),
-                "student_lp_slice": student_lp_slice,
-                "completion_tokens": list(completion_tokens),
-                "teacher_lp_tensor": teacher_lp_tensor,
-                "student_mask": student_mask,
-            }
-
-            with open("debug_fireworks_teacher_alignment.pkl", "wb") as f:
-                pickle.dump(debug_save, f)
-            raise e
-
+        kl_mask[start:end] = kl_mask_slice
 
         return {
             "kl_adjustments": kl_adjustments.tolist(),
