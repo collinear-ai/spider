@@ -1,14 +1,14 @@
 job:
   model:
     provider: tinker
-    name: Qwen/Qwen3-14B
+    name: collinear-ai/TEMP_qwen3_14_stage1_icml_26
   source:
     dataset: collinear-ai/SWE-rebench-split
     split: stage2
     shuffle: true
   generation:
     on_policy: true
-    max_tool_turns: 25
+    max_tool_turns: 100
     parameters:
       temperature: 0.7
       top_p: 0.95
@@ -23,9 +23,9 @@ job:
       # Training hyperparameters
       learning_rate: 1e-4
       warmup_ratio: 0.1  # cosine scheduler warmup fraction
-      groups_per_batch: 8
+      groups_per_batch: 32
       lora_rank: 64
-      save_every: 50
+      save_every: 25
       kl_penalty_coef: 1.0
       kl_discount_factor: 0.0
       max_grad_norm: 0.2
@@ -77,7 +77,7 @@ job:
 
       # Optional: wandb logging
       wandb_project: icml26
-      wandb_name: qwen3-30b3a-opd-first-run
+      wandb_name: qwen3-14b-stage-opd
 
       # Optional: stop after N tokens trained
       token_budget: 21516302
@@ -85,5 +85,5 @@ job:
   output:
     mode: upload_hf
     hf:
-      repo_id: collinear-ai/qwen3-30b-swe-rebench-stage2-opd
+      repo_id: collinear-ai/qwen3-14-stage2-opd
       repo_type: model

@@ -615,7 +615,7 @@ class FireworksTeacherContext:
         
         # Thread pool for parallel API calls
         from concurrent.futures import ThreadPoolExecutor
-        self._executor = ThreadPoolExecutor(max_workers=16)
+        self._executor = ThreadPoolExecutor(max_workers=8)
 
     def compute_logprobs(self, text: str) -> Tuple[List[int], List[float]]:
         """Compute logprobs for text using Fireworks completions API.

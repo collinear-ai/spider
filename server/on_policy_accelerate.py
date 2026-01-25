@@ -25,7 +25,7 @@ from transformers import get_scheduler
 
 from tqdm.auto import tqdm
 
-from liger_kernel.transformers import apply_liger_kernel_to_qwen3
+# from liger_kernel.transformers import apply_liger_kernel_to_qwen3
 from spider.config import JobConfig
 
 from .on_policy_accelerate_utils import (
@@ -52,7 +52,7 @@ RolloutBatch = List[Dict[str, Any]]
 logger = logging.getLogger(__name__)
 
 
-apply_liger_kernel_to_qwen3(fused_linear_cross_entropy=False)
+# apply_liger_kernel_to_qwen3(fused_linear_cross_entropy=False, rope=False)
 
 class _AccelerateStudentSamplerContext:
     """Student sampler context using transformers generate()."""
@@ -776,6 +776,39 @@ def _run_tool_on_policy_stream_accelerate(
 
         for batch_index, trajectories in enumerate(rollout_stream):
             batch_start = time.time()
+            
+            # Clean up Docker images and cache asynchronously from previous batch
+            # This runs in parallel with training so it doesn't block
+            if batch_index > 0:  # Skip on first batch (nothing to clean up yet)
+                def _async_docker_cleanup(batch_idx):
+                    try:
+                        import subprocess
+                        # Remove stopped containers
+                        subprocess.run(
+                            ["docker", "container", "prune", "-f"],
+                            capture_output=True,
+                            timeout=30,
+                        )
+                        # Remove unused images
+                        subprocess.run(
+                            ["docker", "image", "prune", "-af"],
+                            capture_output=True,
+                            timeout=60,
+                        )
+                        # Remove build cache
+                        subprocess.run(
+                            ["docker", "builder", "prune", "-af"],
+                            capture_output=True,
+                            timeout=30,
+                        )
+                        logger.debug("Docker cleanup completed for batch %d", batch_idx)
+                    except Exception as e:
+                        logger.debug("Docker cleanup failed (non-fatal): %s", e)
+                
+                # Run cleanup in background thread while training proceeds
+                cleanup_thread = threading.Thread(target=_async_docker_cleanup, args=(batch_index - 1,), daemon=True)
+                cleanup_thread.start()
+            
             batch_items, batch_metrics = _process_batch(batch_index, trajectories)
             batch_time = time.time() - batch_start
             global_step += 1
@@ -885,6 +918,19 @@ def _run_tool_on_policy_stream_accelerate(
                         code="tool_on_policy_accelerate.sampler_refreshed",
                         data={"batch_index": batch_index, "sampler_path": sampler_path},
                     )
+        
+        # Final Docker cleanup for last batch
+        def _async_docker_cleanup_final():
+            try:
+                import subprocess
+                subprocess.run(["docker", "container", "prune", "-f"], capture_output=True, timeout=30)
+                subprocess.run(["docker", "image", "prune", "-af"], capture_output=True, timeout=60)
+                subprocess.run(["docker", "builder", "prune", "-af"], capture_output=True, timeout=30)
+                logger.debug("Final Docker cleanup completed")
+            except Exception as e:
+                logger.debug("Final Docker cleanup failed (non-fatal): %s", e)
+        cleanup_thread = threading.Thread(target=_async_docker_cleanup_final, daemon=True)
+        cleanup_thread.start()
         
         train_pbar.close()
         logger.info("Training loop complete: total_batches=%d total_tokens=%d", total_batches, token_cum)
@@ -1716,6 +1762,37 @@ def _run_tool_on_policy_vllm_accelerate(
                     "total_batches": total_batches,
                 },
             )
+            
+            # Clean up Docker images and cache asynchronously after inference, before training
+            # This runs in parallel with training so it doesn't block
+            def _async_docker_cleanup(batch_idx):
+                try:
+                    import subprocess
+                    # Remove stopped containers
+                    subprocess.run(
+                        ["docker", "container", "prune", "-f"],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    # Remove unused images
+                    subprocess.run(
+                        ["docker", "image", "prune", "-af"],
+                        capture_output=True,
+                        timeout=60,
+                    )
+                    # Remove build cache
+                    subprocess.run(
+                        ["docker", "builder", "prune", "-af"],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    logger.debug("Docker cleanup completed for batch %d", batch_idx)
+                except Exception as e:
+                    logger.debug("Docker cleanup failed (non-fatal): %s", e)
+            
+            # Run cleanup in background thread while training proceeds
+            cleanup_thread = threading.Thread(target=_async_docker_cleanup, args=(batch_index,), daemon=True)
+            cleanup_thread.start()
 
             # Process batch (training step)
             training_start = time.time()
