@@ -347,7 +347,7 @@ class VLLMRolloutCollector:
         payload = {
             "model": model_name,
             "messages": messages,
-            "max_tokens": self.max_tokens,
+            # "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "logprobs": True,
             "top_logprobs": 1,

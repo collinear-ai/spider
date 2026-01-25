@@ -1,28 +1,29 @@
 job:
   model:
     provider: tinker
-    name: "Qwen/Qwen3-8B"
+    name: Qwen/Qwen3-14B
   source:
     dataset: collinear-ai/SWE-rebench-split
-    split: filtered[0:128]
+    split: stage2
     shuffle: true
   generation:
     on_policy: true
-    max_tool_turns: 30
+    max_tool_turns: 25
     parameters:
       temperature: 0.7
       top_p: 0.95
-      max_tokens: 24096
+      max_tokens: 65536
       tool_choice: auto
     on_policy_options:
       # Teacher model - HF name for tokenizer
-      teacher: Qwen/Qwen3-8B
+      teacher: Qwen/Qwen3-Coder-480B-A35B-Instruct
       # Fireworks model ID - set this to use Fireworks API instead of loading locally
-      fireworks_model: accounts/fireworks/models/qwen3-8b
+      fireworks_model: accounts/fireworks/models/qwen3-coder-480b-a35b-instruct
 
       # Training hyperparameters
       learning_rate: 1e-4
-      groups_per_batch: 
+      warmup_ratio: 0.1  # cosine scheduler warmup fraction
+      groups_per_batch: 8
       lora_rank: 64
       save_every: 50
       kl_penalty_coef: 1.0
@@ -60,27 +61,28 @@ job:
       rollout_workers: 128  # Number of concurrent HTTP requests to vLLM (increased for better throughput)
 
       # Weight synchronization between training and inference
-      weight_sync_steps: 10  # Sync LoRA weights to vLLM every N training steps
+      weight_sync_steps: 1  # Sync LoRA weights to vLLM every N training steps
 
       # PPO-style importance sampling clipping
       importance_sampling_clip: 0.2
+    
 
       # Gradient accumulation (process N trajectories per backward pass, then step)
       # Set to 1 to process one at a time, or None/>=num_trajectories to process all at once
       gradient_accumulation_steps: 4  # Process 4 trajectories per backward pass
 
       # Training precision (bf16, fp16, or fp8 for H100 GPUs)
-      training_precision: fp8
+      training_precision: bf16
 
       # Optional: wandb logging
-      wandb_project: icml26-muyu
-      wandb_name: qwen3-4b-opd-muyu-test
+      wandb_project: icml26
+      wandb_name: qwen3-30b3a-opd-first-run
 
       # Optional: stop after N tokens trained
-      # token_budget: 1000000
+      token_budget: 21516302
 
   output:
     mode: upload_hf
     hf:
-      repo_id: collinear-ai/qwen3-30b-swe-rebench-split-vllm-accelerate
+      repo_id: collinear-ai/qwen3-30b-swe-rebench-stage2-opd
       repo_type: model

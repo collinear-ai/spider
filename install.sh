@@ -30,6 +30,9 @@ uv run scripts/train_on_policy_swe_accelerate.py
 export OMP_NUM_THREADS=50
 export HF_HOME=/mnt/local/hf_home
 
+## For B200
+export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+
 ##### Docker Storage Fix #####
 # Stop Docker to move data directory
 sudo systemctl stop docker.socket docker.service

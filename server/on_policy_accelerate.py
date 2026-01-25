@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate import DeepSpeedPlugin
 from peft import PeftModel
+from transformers import get_scheduler
 
 from tqdm.auto import tqdm
 
@@ -434,8 +435,19 @@ def _run_tool_on_policy_stream_accelerate(
         eps=1e-8,
     )
 
+    # LR scheduler: cosine with warmup ratio
+    total_training_steps = max(total_batches, 1)
+    warmup_ratio = float(getattr(options, "warmup_ratio", 0.1) or 0.0)
+    warmup_steps = int(total_training_steps * warmup_ratio)
+    scheduler = get_scheduler(
+        name="cosine",
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_training_steps,
+    )
+
     # Prepare with accelerator
-    model, optimizer = accelerator.prepare(model, optimizer)
+    model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
 
     # Load teacher model using Fireworks API
     fireworks_model = getattr(options, "fireworks_model", None)
@@ -721,6 +733,7 @@ def _run_tool_on_policy_stream_accelerate(
         optimizer.zero_grad()
         accelerator.backward(total_loss)
         optimizer.step()
+        scheduler.step()
 
         loss_value = total_loss.item()
         batch_metrics["loss"] = loss_value
@@ -797,11 +810,16 @@ def _run_tool_on_policy_stream_accelerate(
 
             # Log to wandb
             if wandb_run:
+                current_lr = (
+                    scheduler.get_last_lr()[0]
+                    if 'scheduler' in locals() and scheduler is not None
+                    else options.learning_rate
+                )
                 log_data = {
                     "progress/done_frac": (batch_index + 1) / total_batches
                     if total_batches > 0
                     else 1.0,
-                    "optim/lr": options.learning_rate,
+                    "optim/lr": current_lr,
                     "rollouts": len(trajectories),
                     "time / total_seconds": batch_time,
                     "time / per_turn_seconds": batch_time / len(trajectories),
@@ -1048,6 +1066,7 @@ def _run_tool_on_policy_vllm_accelerate(
         model = None
         tokenizer = None
         optimizer = None
+        scheduler = None
         training_model_loaded = False
         training_model_future = None
         training_model_lock = threading.Lock()
@@ -1099,16 +1118,29 @@ def _run_tool_on_policy_vllm_accelerate(
                 betas=(0.9, 0.95),
                 eps=1e-8,
             )
+
+            total_training_steps = max(total_batches, 1)
+            warmup_ratio = float(getattr(options, "warmup_ratio", 0.1) or 0.0)
+            warmup_steps = int(total_training_steps * warmup_ratio)
+            scheduler_local = get_scheduler(
+                name="cosine",
+                optimizer=optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=total_training_steps,
+            )
             pbar.update(1)
             logger.info("Training optimizer created in %.2fs", time.time() - phase_start)
 
             # Prepare with accelerator
             phase_start = time.time()
-            model, optimizer = accelerator.prepare(model, optimizer)
+            model, optimizer, scheduler_prepared = accelerator.prepare(model, optimizer, scheduler_local)
             pbar.update(1)
             logger.info("Accelerator prepare completed in %.2fs", time.time() - phase_start)
             pbar.close()
 
+            scheduler_local = None
+            nonlocal scheduler
+            scheduler = scheduler_prepared
             training_model_loaded = True
             logger.info("Training model loaded and prepared in %.2fs", time.time() - load_start)
 
@@ -1405,6 +1437,11 @@ def _run_tool_on_policy_vllm_accelerate(
                 kl_adj = teacher_alignment.get("kl_adjustments") or [0.0] * len(token_ids)
                 kl_mask = teacher_alignment.get("kl_mask") or [0.0] * len(token_ids)
                 kl_tensor = torch.tensor(kl_adj, device=device, dtype=torch.float32)
+                
+                # Replace NaN/inf in KL adjustments (can happen from Fireworks API issues)
+                kl_tensor = torch.where(
+                    torch.isfinite(kl_tensor), kl_tensor, torch.zeros_like(kl_tensor)
+                )
 
                 kl_coef = float(getattr(options, "kl_penalty_coef", 1.0))
                 kl_discount = float(getattr(options, "kl_discount_factor", 0.0))
@@ -1416,6 +1453,9 @@ def _run_tool_on_policy_vllm_accelerate(
                         device=device,
                         dtype=torch.float32,
                     )
+                
+                # Clamp advantages to prevent extreme values
+                advantage = torch.clamp(advantage, min=-100.0, max=100.0)
 
                 input_tokens = list(token_ids)[:-1]
                 target_tokens = list(token_ids)[1:]
@@ -1477,10 +1517,17 @@ def _run_tool_on_policy_vllm_accelerate(
                     )
 
             # Perform training step with clipped importance sampling and gradient accumulation
+            # Use parallel forward passes across sequences (no padding - each sequence processed independently)
             num_trajectories = len(all_input_ids)
             gradient_accumulation_steps = getattr(options, "gradient_accumulation_steps", 1)
             if gradient_accumulation_steps is None or gradient_accumulation_steps <= 0:
                 gradient_accumulation_steps = num_trajectories  # Process all at once if not set
+            
+            # Number of parallel forward passes (limited by GPU memory)
+            # Each forward pass is independent, so we can overlap them with CUDA streams
+            parallel_forwards = getattr(options, "parallel_forwards", 4)
+            if parallel_forwards is None or parallel_forwards <= 0:
+                parallel_forwards = 1
             
             # Zero gradients at start
             optimizer.zero_grad()
@@ -1496,29 +1543,75 @@ def _run_tool_on_policy_vllm_accelerate(
                 chunk_loss = torch.tensor(0.0, device=device, requires_grad=True)
                 chunk_clip_frac = 0.0
                 
-                for idx in range(chunk_start, chunk_end):
-                    input_ids = all_input_ids[idx].unsqueeze(0)
-                    target_ids = all_target_ids[idx].unsqueeze(0)
-                    sampling_lp = all_sampling_logprobs[idx].unsqueeze(0)
-                    advantages = all_advantages[idx].unsqueeze(0)
-                    loss_mask = all_loss_masks[idx].unsqueeze(0)
-
-                    loss, _, metrics = importance_sampling_loss_with_clip(
-                        model=model,
-                        input_ids=input_ids,
-                        target_ids=target_ids,
-                        sampling_logprobs=sampling_lp,
-                        advantages=advantages,
-                        loss_mask=loss_mask,
-                        clip_ratio=clip_ratio,
-                    )
-                    chunk_loss = chunk_loss + loss
-                    chunk_clip_frac += metrics["clip_fraction"]
+                # Process sequences in parallel batches within the chunk
+                for parallel_start in range(chunk_start, chunk_end, parallel_forwards):
+                    parallel_end = min(parallel_start + parallel_forwards, chunk_end)
+                    parallel_size = parallel_end - parallel_start
                     
-                    # Clear intermediate tensors after each sequence
-                    del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss
-                    torch.cuda.empty_cache()
-                    gc.collect()
+                    if parallel_size == 1:
+                        # Single sequence - no parallelism needed
+                        idx = parallel_start
+                        input_ids = all_input_ids[idx].unsqueeze(0)
+                        target_ids = all_target_ids[idx].unsqueeze(0)
+                        sampling_lp = all_sampling_logprobs[idx].unsqueeze(0)
+                        advantages = all_advantages[idx].unsqueeze(0)
+                        loss_mask = all_loss_masks[idx].unsqueeze(0)
+
+                        loss, _, metrics = importance_sampling_loss_with_clip(
+                            model=model,
+                            input_ids=input_ids,
+                            target_ids=target_ids,
+                            sampling_logprobs=sampling_lp,
+                            advantages=advantages,
+                            loss_mask=loss_mask,
+                            clip_ratio=clip_ratio,
+                        )
+                        chunk_loss = chunk_loss + loss
+                        chunk_clip_frac += metrics["clip_fraction"]
+                        
+                        del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss
+                    else:
+                        # Multiple sequences - use CUDA streams for parallel execution
+                        # Each stream handles one forward pass independently
+                        streams = [torch.cuda.Stream(device=device) for _ in range(parallel_size)]
+                        losses = [None] * parallel_size
+                        clip_fracs = [0.0] * parallel_size
+                        
+                        # Launch forward passes in parallel streams
+                        for i, idx in enumerate(range(parallel_start, parallel_end)):
+                            with torch.cuda.stream(streams[i]):
+                                input_ids = all_input_ids[idx].unsqueeze(0)
+                                target_ids = all_target_ids[idx].unsqueeze(0)
+                                sampling_lp = all_sampling_logprobs[idx].unsqueeze(0)
+                                advantages = all_advantages[idx].unsqueeze(0)
+                                loss_mask = all_loss_masks[idx].unsqueeze(0)
+
+                                loss, _, metrics = importance_sampling_loss_with_clip(
+                                    model=model,
+                                    input_ids=input_ids,
+                                    target_ids=target_ids,
+                                    sampling_logprobs=sampling_lp,
+                                    advantages=advantages,
+                                    loss_mask=loss_mask,
+                                    clip_ratio=clip_ratio,
+                                )
+                                losses[i] = loss
+                                clip_fracs[i] = metrics["clip_fraction"]
+                                
+                                del input_ids, target_ids, sampling_lp, advantages, loss_mask
+                        
+                        # Synchronize all streams before aggregating
+                        torch.cuda.current_stream(device).wait_stream(streams[-1])
+                        for stream in streams:
+                            torch.cuda.current_stream(device).wait_stream(stream)
+                        
+                        # Aggregate losses
+                        for i in range(parallel_size):
+                            if losses[i] is not None:
+                                chunk_loss = chunk_loss + losses[i]
+                                chunk_clip_frac += clip_fracs[i]
+                        
+                        del streams, losses, clip_fracs
                 
                 # Average chunk loss and scale by number of chunks
                 chunk_loss = chunk_loss / chunk_size
@@ -1534,8 +1627,15 @@ def _run_tool_on_policy_vllm_accelerate(
                 torch.cuda.empty_cache()
                 gc.collect()
             
+            # Clip gradients to prevent explosion (common cause of NaN)
+            max_grad_norm = getattr(options, "max_grad_norm", 1.0)
+            if max_grad_norm is not None and max_grad_norm > 0:
+                accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+            
             # Step optimizer once after all chunks
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             
             # Average loss for logging
             loss_value = accumulated_loss_value / num_trajectories if num_trajectories > 0 else 0.0
@@ -1670,9 +1770,14 @@ def _run_tool_on_policy_vllm_accelerate(
 
             # Log to wandb
             if wandb_run:
+                current_lr = (
+                    scheduler.get_last_lr()[0]
+                    if scheduler is not None
+                    else options.learning_rate
+                )
                 log_data = {
                     "progress/done_frac": (batch_index + 1) / total_batches if total_batches > 0 else 1.0,
-                    "optim/lr": options.learning_rate,
+                    "optim/lr": current_lr,
                     "rollouts": len(trajectories),
                     "time / total_seconds": batch_time,
                     "time / per_turn_seconds": batch_time / len(trajectories) if trajectories else 0,
