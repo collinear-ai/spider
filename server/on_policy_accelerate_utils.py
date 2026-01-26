@@ -21,6 +21,47 @@ from tinker_cookbook.distillation.train_on_policy import _compute_groupwise_reve
 logger = logging.getLogger(__name__)
 
 
+def _normalize_tool_calls_args_for_qwen3(msgs: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+    """Convert string arguments in tool_calls to dict for Qwen3 chat template compatibility.
+    
+    Qwen3 chat template expects arguments as dict, but OpenAI protocol (and vLLM) returns
+    arguments as a JSON string. This function normalizes the format.
+    
+    Args:
+        msgs: List of message dicts that may contain tool_calls
+        
+    Returns:
+        List of normalized message dicts with arguments converted to dict
+    """
+    normalized = []
+    for msg in msgs:
+        msg_copy = dict(msg)
+        if msg_copy.get("role") == "assistant" and msg_copy.get("tool_calls"):
+            tool_calls = []
+            for tc in msg_copy["tool_calls"]:
+                tc_copy = dict(tc)
+                func = tc_copy.get("function", {})
+                if isinstance(func, dict):
+                    func_copy = dict(func)
+                    args = func_copy.get("arguments")
+                    # Convert string arguments to dict (Qwen3 bug fix)
+                    if isinstance(args, str):
+                        try:
+                            func_copy["arguments"] = json.loads(args)
+                        except (json.JSONDecodeError, TypeError) as e:
+                            # If parsing fails, keep as string but log warning
+                            logger.warning(
+                                "Failed to parse tool call arguments as JSON (keeping as string): %s",
+                                args[:100] if args else None
+                            )
+                            # Keep original string if parsing fails
+                    tc_copy["function"] = func_copy
+                tool_calls.append(tc_copy)
+            msg_copy["tool_calls"] = tool_calls
+        normalized.append(msg_copy)
+    return normalized
+
+
 @dataclass
 class TrainingBatch:
     """Batch of training data for importance sampling."""
@@ -314,6 +355,10 @@ def importance_sampling_loss_with_clip(
 
     # Gather logprobs for target tokens
     current_logprobs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+    
+    # Clear logits and log_probs immediately after gathering (they're large tensors)
+    # These can be huge: [batch, seq_len, vocab_size] where vocab_size ~50k+
+    del logits, log_probs
 
     # Importance weight: exp(current - sampling)
     ratio = torch.exp(current_logprobs - sampling_logprobs)
@@ -413,8 +458,10 @@ def render_chat_tokens(
 ) -> Tuple[List[int], int]:
     """Render chat messages to tokens using the model's chat template."""
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
+    # Fix Qwen3 chat template bug: convert string arguments to dict
+    normalized_messages = _normalize_tool_calls_args_for_qwen3(messages)
     prompt_text = tokenizer.apply_chat_template(
-        messages,
+        normalized_messages,
         tools=tools or None,
         add_generation_prompt=add_generation_prompt,
         tokenize=False,
@@ -496,9 +543,11 @@ class TransformersSamplerContext:
         Returns:
             Tuple of (token_ids, logprobs) for full sequence
         """
+        # Fix Qwen3 chat template bug: convert string arguments to dict
+        normalized_messages = _normalize_tool_calls_args_for_qwen3(messages)
         # Apply chat template
         input_text = self.tokenizer.apply_chat_template(
-            messages,
+            normalized_messages,
             tools=tools if tools else None,
             add_generation_prompt=True,
             tokenize=False,
@@ -696,6 +745,9 @@ class FireworksTeacherContext:
         teacher_tokenizer = self.tokenizer
 
         prefix_msgs = list(messages[:-1])
+        
+        # Fix Qwen3 chat template bug: convert string arguments to dict
+        prefix_msgs = _normalize_tool_calls_args_for_qwen3(prefix_msgs)
 
         prefix_text = teacher_tokenizer.apply_chat_template(
             prefix_msgs,
