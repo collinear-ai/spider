@@ -19,6 +19,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
+from accelerate.utils import FullyShardedDataParallelPlugin
+from torch.distributed.fsdp.fully_sharded_data_parallel import FullStateDictConfig, StateDictType
 from peft import PeftModel
 from transformers import get_scheduler
 
@@ -386,10 +388,24 @@ def _run_tool_on_policy_stream_accelerate(
 
     verbose_turns = bool(job.generation.verbose)
 
-    # Initialize Accelerator
+    # Initialize Accelerator with FSDP
     training_precision = getattr(options, "training_precision", "bf16")
-    accelerator = Accelerator(mixed_precision=training_precision)
-    logger.info("Accelerator initialized with mixed_precision=%s", training_precision)
+    use_fsdp = getattr(options, "use_fsdp", False)
+    
+    if use_fsdp:
+        # Configure FSDP plugin
+        fsdp_plugin = FullyShardedDataParallelPlugin(
+            state_dict_config=FullStateDictConfig(offload_to_cpu=False, rank0_only=False),
+            sharding_strategy="FULL_SHARD",  # Shard parameters, gradients, and optimizer states
+        )
+        accelerator = Accelerator(
+            mixed_precision=training_precision,
+            fsdp_plugin=fsdp_plugin,
+        )
+        logger.info("Accelerator initialized with FSDP and mixed_precision=%s", training_precision)
+    else:
+        accelerator = Accelerator(mixed_precision=training_precision)
+        logger.info("Accelerator initialized with mixed_precision=%s", training_precision)
 
     # Get the model from sampler context
     model = sampler_ctx.get_model()
@@ -781,11 +797,13 @@ def _run_tool_on_policy_stream_accelerate(
 
             # Log to wandb
             if wandb_run:
+                # Get current learning rate from scheduler
+                current_lr = scheduler.get_last_lr()[0] if scheduler else options.learning_rate
                 log_data = {
                     "progress/done_frac": (batch_index + 1) / total_batches
                     if total_batches > 0
                     else 1.0,
-                    "optim/lr": options.learning_rate,
+                    "optim/lr": current_lr,
                     "rollouts": len(trajectories),
                     "time / total_seconds": batch_time,
                     "time / per_turn_seconds": batch_time / len(trajectories),
@@ -916,6 +934,8 @@ def _run_tool_on_policy_vllm_accelerate(
     student_checkpoint = job.model.student_checkpoint_path
 
     batch_size, total_batches = _compute_batch_stats(prompt_rows, options)
+    num_epochs = max(1, getattr(options, "num_epochs", 1))
+    total_training_steps = total_batches * num_epochs
 
     # GPU allocation
     vllm_gpu_ids = getattr(options, "vllm_gpu_ids", [0])
@@ -976,10 +996,24 @@ def _run_tool_on_policy_vllm_accelerate(
             os.environ["CUDA_VISIBLE_DEVICES"],
         )
 
-        # Initialize Accelerator
+        # Initialize Accelerator with FSDP
         training_precision = getattr(options, "training_precision", "bf16")
-        accelerator = Accelerator(mixed_precision=training_precision)
-        logger.info("Accelerator initialized with mixed_precision=%s", training_precision)
+        use_fsdp = getattr(options, "use_fsdp", False)
+        
+        if use_fsdp:
+            # Configure FSDP plugin
+            fsdp_plugin = FullyShardedDataParallelPlugin(
+                state_dict_config=FullStateDictConfig(offload_to_cpu=False, rank0_only=False),
+                sharding_strategy="FULL_SHARD",  # Shard parameters, gradients, and optimizer states
+            )
+            accelerator = Accelerator(
+                mixed_precision=training_precision,
+                fsdp_plugin=fsdp_plugin,
+            )
+            logger.info("Accelerator initialized with FSDP and mixed_precision=%s", training_precision)
+        else:
+            accelerator = Accelerator(mixed_precision=training_precision)
+            logger.info("Accelerator initialized with mixed_precision=%s", training_precision)
 
         # Delay loading training model until first batch (for testing inference speed)
         # Model will be loaded lazily when first needed for training
@@ -1039,8 +1073,7 @@ def _run_tool_on_policy_vllm_accelerate(
                 eps=1e-8,
             )
             
-            # LR scheduler: cosine with warmup
-            total_training_steps = max(total_batches, 1)
+            # LR scheduler: cosine with warmup (across all epochs)
             warmup_ratio = float(getattr(options, "warmup_ratio", 0.1) or 0.0)
             warmup_steps = int(total_training_steps * warmup_ratio)
             scheduler = get_scheduler(
@@ -1050,8 +1083,8 @@ def _run_tool_on_policy_vllm_accelerate(
                 num_training_steps=total_training_steps,
             )
             logger.info(
-                "LR scheduler: cosine with %d warmup steps out of %d total",
-                warmup_steps, total_training_steps,
+                "LR scheduler: cosine with %d warmup steps out of %d total steps (%d batches × %d epochs)",
+                warmup_steps, total_training_steps, total_batches, num_epochs,
             )
             pbar.update(1)
             logger.info("Training optimizer created in %.2fs", time.time() - phase_start)
@@ -1118,6 +1151,7 @@ def _run_tool_on_policy_vllm_accelerate(
             max_tool_turns=max(1, job.generation.max_tool_turns or 16),
             max_tokens=job.generation.parameters.get("max_tokens", 4096),
             temperature=job.generation.parameters.get("temperature", 1.0),
+            tool_timeout=getattr(options, "tool_timeout", 200.0),  # Timeout for tool execution
             lora_name=initial_lora_name,  # Use synced LoRA from the start
             runtime_factory=runtime_factory,
             verbose=verbose_turns,
@@ -1436,6 +1470,13 @@ def _run_tool_on_policy_vllm_accelerate(
                     advantages = all_advantages[idx].unsqueeze(0)
                     loss_mask = all_loss_masks[idx].unsqueeze(0)
 
+                    # Skip this trajectory if its length exceeds 16384 tokens (too long)
+                    if input_ids.shape[1] > 16384:
+                        logger.warning(
+                            "Skipping trajectory idx=%d with seq_len=%d (>16384 tokens)", idx, input_ids.shape[1]
+                        )
+                        continue
+
                     loss, _, metrics = importance_sampling_loss_with_clip(
                         model=model,
                         input_ids=input_ids,
@@ -1449,9 +1490,7 @@ def _run_tool_on_policy_vllm_accelerate(
                     chunk_clip_frac += metrics["clip_fraction"]
                     
                     # Clear intermediate tensors after each sequence
-                    del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss
-                    torch.cuda.empty_cache()
-                    gc.collect()
+                    del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss, metrics
                 
                 # Average chunk loss and scale by number of chunks
                 chunk_loss = chunk_loss / chunk_size
@@ -1468,9 +1507,10 @@ def _run_tool_on_policy_vllm_accelerate(
                 accumulated_loss_value += chunk_loss.item() * chunk_size
                 total_clip_fraction += chunk_clip_frac
                 
+                # Clear chunk_loss and free memory immediately after backward
                 del chunk_loss
-                torch.cuda.empty_cache()
-                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
             # Step optimizer once after all chunks (with gradient clipping for stability)
             max_grad_norm = float(getattr(options, "max_grad_norm", 1.0))
@@ -1520,15 +1560,19 @@ def _run_tool_on_policy_vllm_accelerate(
         save_every = max(1, getattr(options, "save_every", 1))
         if total_batches > 0 and save_every > total_batches:
             save_every = total_batches
+        shuffle = getattr(job.source, "shuffle", False)
 
         last_checkpoint = None
         global_step = 0
         token_cum = 0
         
+        # Total batches across all epochs
+        total_batches_all_epochs = total_batches * num_epochs
+        
         # Create progress bar for training batches
         # Use position=0 and file=sys.stderr to persist at bottom of terminal
         train_pbar = tqdm(
-            total=total_batches,
+            total=total_batches_all_epochs,
             desc="Training",
             unit="batch",
             initial=0,
@@ -1539,170 +1583,195 @@ def _run_tool_on_policy_vllm_accelerate(
             mininterval=0.5,  # Update at least every 0.5 seconds
         )
 
-        for batch_index, start in enumerate(range(0, len(prompt_rows), batch_size)):
-            batch_start = time.time()
-
-            # Handle lookahead callbacks
-            if on_batch_start and on_batch_start_lookahead > 0:
-                for ahead in range(1, on_batch_start_lookahead + 1):
-                    next_start = start + ahead * batch_size
-                    if next_start >= len(prompt_rows):
-                        break
-                    next_chunk = prompt_rows[next_start : next_start + batch_size]
-                    on_batch_start(next_chunk)
-
-            chunk = prompt_rows[start : start + batch_size]
-
-            # Collect rollouts in parallel using vLLM
-            rollout_start = time.time()
-            logger.info("Collecting rollouts for batch %d/%d (%d prompts)", batch_index + 1, total_batches, len(chunk))
-            rollout_results = collector.collect_batch(chunk)
-            rollout_time = time.time() - rollout_start
-            trajectories = rollout_results_to_dicts(rollout_results)
+        for epoch in range(num_epochs):
+            logger.info("Starting epoch %d/%d", epoch + 1, num_epochs)
             
-            logger.info(
-                "Rollout collection complete for batch %d: time=%.2fs trajectories=%d",
-                batch_index,
-                rollout_time,
-                len(trajectories),
-            )
-
-            if on_batch_complete is not None:
-                on_batch_complete(chunk)
-
-            if not trajectories:
-                logger.warning("No trajectories collected for batch %d", batch_index)
-                continue
-
-            events.emit(
-                "Tool rollout batch ready (vLLM + accelerate).",
-                code="tool_on_policy_vllm_accelerate.batch_ready",
-                data={
-                    "batch_index": batch_index,
-                    "batch_size": len(chunk),
-                    "total_batches": total_batches,
-                },
-            )
-
-            # Process batch (training step)
-            training_start = time.time()
-            try:
-                batch_items, batch_metrics = _process_batch(batch_index, trajectories)
-            except RuntimeError as e:
-                if "Non-finite loss" in str(e):
-                    logger.error("Aborting training at batch %d due to non-finite loss", batch_index)
-                    break
-                raise
-
-            training_time = time.time() - training_start
-            batch_time = time.time() - batch_start
-            global_step += 1
-
-            step_tokens = sum(int(sum(turn.get("reward_mask") or [])) for turn in trajectories)
-            token_cum += step_tokens
+            # Shuffle dataset at start of each epoch (except first if already shuffled)
+            if shuffle and epoch > 0:
+                import random
+                random.shuffle(prompt_rows)
+                logger.info("Shuffled dataset for epoch %d", epoch + 1)
             
-            # Calculate throughput metrics
-            tokens_per_sec = step_tokens / batch_time if batch_time > 0 else 0
-            rollout_throughput = len(chunk) / rollout_time if rollout_time > 0 else 0
+            for batch_index_in_epoch, start in enumerate(range(0, len(prompt_rows), batch_size)):
+                # Global batch index across all epochs
+                batch_index = epoch * total_batches + batch_index_in_epoch
+                batch_start = time.time()
 
-            # Update progress bar
-            train_pbar.update(1)
-            train_pbar.set_postfix({
-                "loss": f"{batch_metrics.get('loss', 0):.4f}" if batch_metrics.get('loss') else "N/A",
-                "tokens": step_tokens,
-                "cum_tokens": token_cum,
-                "time": f"{batch_time:.1f}s",
-                "tokens/s": f"{tokens_per_sec:.1f}",
-            })
+                # Handle lookahead callbacks
+                if on_batch_start and on_batch_start_lookahead > 0:
+                    for ahead in range(1, on_batch_start_lookahead + 1):
+                        next_start = start + ahead * batch_size
+                        if next_start >= len(prompt_rows):
+                            break
+                        next_chunk = prompt_rows[next_start : next_start + batch_size]
+                        on_batch_start(next_chunk)
 
-            logger.info(
-                "vllm rollout batch=%d/%d step_time=%.3fs (rollout=%.2fs train=%.2fs) "
-                "token_step=%d token_cum=%d tokens/s=%.1f token_budget=%s",
-                batch_index + 1,
-                total_batches,
-                batch_time,
-                rollout_time,
-                training_time,
-                step_tokens,
-                token_cum,
-                tokens_per_sec,
-                token_budget,
-            )
+                chunk = prompt_rows[start : start + batch_size]
 
-            # Log to wandb
-            if wandb_run:
-                log_data = {
-                    "progress/done_frac": (batch_index + 1) / total_batches if total_batches > 0 else 1.0,
-                    "optim/lr": options.learning_rate,
-                    "rollouts": len(trajectories),
-                    "time / total_seconds": batch_time,
-                    "time / per_turn_seconds": batch_time / len(trajectories) if trajectories else 0,
-                    "token_step": step_tokens,
-                    "token_cum": token_cum,
-                }
-
-                if token_budget is not None:
-                    log_data["token_budget"] = token_budget
-                if batch_metrics.get("loss") is not None:
-                    log_data["loss"] = batch_metrics["loss"]
-                if batch_metrics["kl_count"] > 0:
-                    log_data["kl_mean"] = batch_metrics["kl_sum"] / batch_metrics["kl_count"]
-                if batch_metrics["advantage_count"] > 0:
-                    adv_mean = batch_metrics["advantage_sum"] / batch_metrics["advantage_count"]
-                    adv_var = (batch_metrics["advantage_sq_sum"] / batch_metrics["advantage_count"]) - adv_mean**2
-                    log_data["advantage_mean"] = adv_mean
-                    log_data["advantage_std"] = adv_var**0.5 if adv_var > 0 else 0.0
-                if batch_metrics["clip_count"] > 0:
-                    log_data["clip_fraction"] = batch_metrics["clip_fraction_sum"] / batch_metrics["clip_count"]
-
-                flat_log_data = {}
-                for k, v in log_data.items():
-                    key = k.split("/")[-1] if "/" in k else k
-                    flat_log_data[key] = v
-                wandb_run.log(flat_log_data, step=global_step)
-
-            if token_budget is not None and token_cum >= token_budget:
+                # Collect rollouts in parallel using vLLM
+                rollout_start = time.time()
                 logger.info(
-                    "vllm rollout token budget reached. stopping training. token_cum=%d budget=%d",
+                    "Epoch %d/%d: Collecting rollouts for batch %d/%d (%d prompts)",
+                    epoch + 1, num_epochs, batch_index_in_epoch + 1, total_batches, len(chunk)
+                )
+                rollout_results = collector.collect_batch(chunk)
+                rollout_time = time.time() - rollout_start
+                trajectories = rollout_results_to_dicts(rollout_results)
+                
+                logger.info(
+                    "Epoch %d/%d: Rollout collection complete for batch %d/%d: time=%.2fs trajectories=%d",
+                    epoch + 1, num_epochs, batch_index_in_epoch + 1, total_batches,
+                    rollout_time,
+                    len(trajectories),
+                )
+
+                if on_batch_complete is not None:
+                    on_batch_complete(chunk)
+
+                if not trajectories:
+                    logger.warning("No trajectories collected for batch %d", batch_index)
+                    continue
+
+                events.emit(
+                    "Tool rollout batch ready (vLLM + accelerate).",
+                    code="tool_on_policy_vllm_accelerate.batch_ready",
+                    data={
+                        "batch_index": batch_index,
+                        "batch_size": len(chunk),
+                        "total_batches": total_batches,
+                    },
+                )
+
+                # Process batch (training step)
+                training_start = time.time()
+                try:
+                    batch_items, batch_metrics = _process_batch(batch_index, trajectories)
+                except RuntimeError as e:
+                    if "Non-finite loss" in str(e):
+                        logger.error("Aborting training at batch %d due to non-finite loss", batch_index)
+                        break
+                    raise
+
+                training_time = time.time() - training_start
+                batch_time = time.time() - batch_start
+                global_step += 1
+
+                step_tokens = sum(int(sum(turn.get("reward_mask") or [])) for turn in trajectories)
+                token_cum += step_tokens
+                
+                # Calculate throughput metrics
+                tokens_per_sec = step_tokens / batch_time if batch_time > 0 else 0
+                rollout_throughput = len(chunk) / rollout_time if rollout_time > 0 else 0
+
+                # Update progress bar
+                train_pbar.update(1)
+                train_pbar.set_description(f"Training (epoch {epoch + 1}/{num_epochs})")
+                train_pbar.set_postfix({
+                    "loss": f"{batch_metrics.get('loss', 0):.4f}" if batch_metrics.get('loss') else "N/A",
+                    "tokens": step_tokens,
+                    "cum_tokens": token_cum,
+                    "time": f"{batch_time:.1f}s",
+                    "tokens/s": f"{tokens_per_sec:.1f}",
+                })
+
+                logger.info(
+                    "Epoch %d/%d: vllm rollout batch=%d/%d step_time=%.3fs (rollout=%.2fs train=%.2fs) "
+                    "token_step=%d token_cum=%d tokens/s=%.1f token_budget=%s",
+                    epoch + 1, num_epochs,
+                    batch_index_in_epoch + 1,
+                    total_batches,
+                    batch_time,
+                    rollout_time,
+                    training_time,
+                    step_tokens,
                     token_cum,
+                    tokens_per_sec,
                     token_budget,
                 )
-                events.emit(
-                    "Tool rollout token budget reached (vLLM + accelerate).",
-                    code="tool_on_policy_vllm_accelerate.token_budget_reached",
-                    data={"token_cum": token_cum, "token_budget": token_budget},
-                )
-                train_pbar.close()
-                break
 
-            # Sync weights to vLLM and save checkpoint
-            if (batch_index + 1) % save_every == 0:
-                last_checkpoint = save_checkpoint_accelerate(
-                    model=model,
-                    optimizer=optimizer,
-                    accelerator=accelerator,
-                    name=f"{batch_index:06d}",
-                    log_path=str(training_dir),
-                    loop_state={"batch": batch_index + 1},
-                )
+                # Log to wandb
+                if wandb_run:
+                    # Get current learning rate from scheduler
+                    current_lr = scheduler.get_last_lr()[0] if scheduler else options.learning_rate
+                    log_data = {
+                        "epoch": epoch + 1,
+                        "progress/done_frac": (batch_index + 1) / total_batches_all_epochs if total_batches_all_epochs > 0 else 1.0,
+                        "progress/epoch_done_frac": (batch_index_in_epoch + 1) / total_batches if total_batches > 0 else 1.0,
+                        "optim/lr": current_lr,
+                        "rollouts": len(trajectories),
+                        "time / total_seconds": batch_time,
+                        "time / per_turn_seconds": batch_time / len(trajectories) if trajectories else 0,
+                        "token_step": step_tokens,
+                        "token_cum": token_cum,
+                    }
 
-            # Sync weights to vLLM for inference (only if model is loaded)
-            if training_model_loaded and synchronizer.maybe_sync(model, accelerator, batch_index + 1):
-                # Update the collector to use the new LoRA adapter
-                collector.lora_name = synchronizer.get_lora_name()
-                logger.info(
-                    "Synced LoRA weights to vLLM at batch=%d",
-                    batch_index,
-                )
-                events.emit(
-                    "Synced LoRA weights to vLLM (accelerate).",
-                    code="tool_on_policy_vllm_accelerate.weights_synced",
-                    data={"batch_index": batch_index},
-                )
+                    if token_budget is not None:
+                        log_data["token_budget"] = token_budget
+                    if batch_metrics.get("loss") is not None:
+                        log_data["loss"] = batch_metrics["loss"]
+                    if batch_metrics["kl_count"] > 0:
+                        log_data["kl_mean"] = batch_metrics["kl_sum"] / batch_metrics["kl_count"]
+                    if batch_metrics["advantage_count"] > 0:
+                        adv_mean = batch_metrics["advantage_sum"] / batch_metrics["advantage_count"]
+                        adv_var = (batch_metrics["advantage_sq_sum"] / batch_metrics["advantage_count"]) - adv_mean**2
+                        log_data["advantage_mean"] = adv_mean
+                        log_data["advantage_std"] = adv_var**0.5 if adv_var > 0 else 0.0
+                    if batch_metrics["clip_count"] > 0:
+                        log_data["clip_fraction"] = batch_metrics["clip_fraction_sum"] / batch_metrics["clip_count"]
+
+                    flat_log_data = {}
+                    for k, v in log_data.items():
+                        key = k.split("/")[-1] if "/" in k else k
+                        flat_log_data[key] = v
+                    wandb_run.log(flat_log_data, step=global_step)
+
+                if token_budget is not None and token_cum >= token_budget:
+                    logger.info(
+                        "vllm rollout token budget reached. stopping training. token_cum=%d budget=%d",
+                        token_cum,
+                        token_budget,
+                    )
+                    events.emit(
+                        "Tool rollout token budget reached (vLLM + accelerate).",
+                        code="tool_on_policy_vllm_accelerate.token_budget_reached",
+                        data={"token_cum": token_cum, "token_budget": token_budget},
+                    )
+                    train_pbar.close()
+                    break
+
+                # Sync weights to vLLM and save checkpoint
+                if (batch_index + 1) % save_every == 0:
+                    last_checkpoint = save_checkpoint_accelerate(
+                        model=model,
+                        optimizer=optimizer,
+                        accelerator=accelerator,
+                        name=f"{batch_index:06d}",
+                        log_path=str(training_dir),
+                        loop_state={"epoch": epoch + 1, "batch": batch_index + 1},
+                    )
+
+                # Sync weights to vLLM for inference (only if model is loaded)
+                if training_model_loaded and synchronizer.maybe_sync(model, accelerator, batch_index + 1):
+                    # Update the collector to use the new LoRA adapter
+                    collector.lora_name = synchronizer.get_lora_name()
+                    logger.info(
+                        "Synced LoRA weights to vLLM at batch=%d",
+                        batch_index,
+                    )
+                    events.emit(
+                        "Synced LoRA weights to vLLM (accelerate).",
+                        code="tool_on_policy_vllm_accelerate.weights_synced",
+                        data={"batch_index": batch_index},
+                    )
+            
+            logger.info("Completed epoch %d/%d", epoch + 1, num_epochs)
 
         # Close progress bar
         train_pbar.close()
-        logger.info("Training loop complete: total_batches=%d total_tokens=%d", total_batches, token_cum)
+        logger.info(
+            "Training complete: %d epochs, %d batches/epoch, %d total batches, %d total tokens",
+            num_epochs, total_batches, total_batches_all_epochs, token_cum
+        )
 
         # Final checkpoint (only if model was loaded)
         if training_model_loaded and not last_checkpoint:
@@ -1787,80 +1856,100 @@ def _tool_rollout_stream(
 
         try:
             for turn_idx in range(turn_limit):
-                try:
-                    # Generate using transformers
-                    messages = list(history)
-                    max_tokens = job.generation.parameters.get("max_tokens", 4096)
-                    temperature = job.generation.parameters.get("temperature", 1.0)
+                # try:
+                # Generate using transformers
+                messages = list(history)
+                max_tokens = job.generation.parameters.get("max_tokens", 4096)
+                temperature = job.generation.parameters.get("temperature", 1.0)
 
-                    # Apply chat template and generate
-                    input_text = tokenizer.apply_chat_template(
-                        messages,
-                        tools=tool_defs if tool_defs else None,
-                        add_generation_prompt=True,
-                        tokenize=False,
+                # Apply chat template and generate
+                input_text = tokenizer.apply_chat_template(
+                    messages,
+                    tools=tool_defs if tool_defs else None,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+                input_ids = tokenizer.encode(input_text, return_tensors="pt").to(device)
+                prompt_token_count = input_ids.shape[1]
+                
+                # Early stopping if input_ids exceeds 15k tokens
+                if prompt_token_count > 15000:
+                    logger.warning(
+                        "Prompt token count (%d) exceeds 15k limit at turn %d. Stopping early.",
+                        prompt_token_count,
+                        turn_idx,
                     )
-                    input_ids = tokenizer.encode(input_text, return_tensors="pt").to(device)
-                    prompt_token_count = input_ids.shape[1]
+                    break
 
-                    with torch.no_grad():
-                        output = model.generate(
-                            input_ids,
-                            max_new_tokens=max_tokens,
-                            do_sample=True,
-                            temperature=temperature,
-                            return_dict_in_generate=True,
-                            output_scores=True,
-                            pad_token_id=tokenizer.pad_token_id,
-                        )
-
-                    full_ids = output.sequences[0].tolist()
-                    generated_ids = full_ids[prompt_token_count:]
-
-                    # Compute logprobs for generated tokens
-                    scores = output.scores
-                    gen_logprobs = []
-                    for i, score in enumerate(scores):
-                        log_probs = F.log_softmax(score, dim=-1)
-                        token_id = generated_ids[i] if i < len(generated_ids) else 0
-                        gen_logprobs.append(log_probs[0, token_id].item())
-
-                    # Full sequence logprobs (0 for prompt tokens)
-                    all_logprobs = [0.0] * prompt_token_count + gen_logprobs
-
-                    # Decode generated text
-                    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=False)
-
-                    # Parse response for tool calls using vLLM parsers
-                    tool_parser_name = _default_tool_parser(model_name)
-                    reasoning_parser_name = _default_reasoning_parser(model_name)
-                    parsed = parse_assistant_turn(
-                        messages=messages,
-                        assistant_text=generated_text,
-                        tools=tool_defs if tool_defs else None,
-                        tool_choice="auto" if tool_defs else None,
-                        tool_parser_name=tool_parser_name,
-                        reasoning_parser_name=reasoning_parser_name,
-                        tokenizer=tokenizer,
-                        token_ids=generated_ids,
-                        chat_template_kwargs=None,
+                with torch.no_grad():
+                    output = model.generate(
+                        input_ids,
+                        max_new_tokens=max_tokens,
+                        do_sample=True,
+                        temperature=temperature,
+                        return_dict_in_generate=True,
+                        output_scores=True,
+                        pad_token_id=tokenizer.pad_token_id,
                     )
-                    content = parsed.content
-                    tool_calls = parsed.tool_calls
-                    reasoning_content = parsed.reasoning
 
-                    # Build reward mask (1 for generated tokens, 0 for prompt)
-                    reward_mask = [0] * prompt_token_count + [1] * len(generated_ids)
+                full_ids = output.sequences[0].tolist()
+                generated_ids = full_ids[prompt_token_count:]
+                
+                # Early stopping if full sequence exceeds 15k tokens
+                if len(full_ids) > 15000:
+                    logger.warning(
+                        "Full sequence length (%d) exceeds 15k limit at turn %d. Stopping early.",
+                        len(full_ids),
+                        turn_idx,
+                    )
+                    break
 
-                except Exception as exc:
-                    if _is_context_window_error(exc):
-                        logger.warning(
-                            "Prompt=`%s...` turn=%d exceeded context window; ending trajectory.",
-                            prompt[:20],
-                            turn_idx,
-                        )
-                        break
-                    raise
+                # Compute logprobs for generated tokens
+                scores = output.scores
+                gen_logprobs = []
+                for i, score in enumerate(scores):
+                    log_probs = F.log_softmax(score, dim=-1)
+                    token_id = generated_ids[i] if i < len(generated_ids) else 0
+                    gen_logprobs.append(log_probs[0, token_id].item())
+
+                # Full sequence logprobs (0 for prompt tokens)
+                all_logprobs = [0.0] * prompt_token_count + gen_logprobs
+
+                # Decode generated text
+                generated_text = tokenizer.decode(generated_ids, skip_special_tokens=False)
+
+            
+                # Parse response for tool calls using vLLM parsers
+                tool_parser_name = _default_tool_parser(model_name)
+                reasoning_parser_name = _default_reasoning_parser(model_name)
+                parsed = parse_assistant_turn(
+                    messages=messages,
+                    assistant_text=generated_text,
+                    tools=tool_defs if tool_defs else None,
+                    tool_choice="auto" if tool_defs else None,
+                    tool_parser_name=tool_parser_name,
+                    reasoning_parser_name=reasoning_parser_name,
+                    tokenizer=tokenizer,
+                    token_ids=generated_ids,
+                    chat_template_kwargs=None,
+                )
+
+                content = parsed.content
+                tool_calls = parsed.tool_calls
+                reasoning_content = parsed.reasoning
+
+                # Build reward mask (1 for generated tokens, 0 for prompt)
+                reward_mask = [0] * prompt_token_count + [1] * len(generated_ids)
+
+                # except Exception as exc:
+                #     if _is_context_window_error(exc):
+                #         logger.warning(
+                #             "Prompt=`%s...` turn=%d exceeded context window; ending trajectory.",
+                #             prompt[:20],
+                #             turn_idx,
+                #         )
+                #         break
+                #     raise
 
                 if len(full_ids) <= 1:
                     raise JobExecutionError(
