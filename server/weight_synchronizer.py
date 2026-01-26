@@ -39,21 +39,25 @@ class WeightSynchronizer:
         vllm_base_url: str,
         lora_name: str = "student",
         vllm_backend: Optional["VLLMBackend"] = None,
+        save_every_n_steps: int = 5,  # How often to persist checkpoints
     ):
         """Initialize the weight synchronizer.
 
         Args:
-            sync_every_n_steps: How often to sync weights (every N training steps)
+            sync_every_n_steps: How often to sync weights to vLLM (every N training steps)
             checkpoint_dir: Directory to save adapter checkpoints
             vllm_base_url: Base URL of the vLLM server
             lora_name: Name to use for the LoRA adapter in vLLM
             vllm_backend: Optional VLLMBackend instance to use directly
+            save_every_n_steps: How often to save permanent checkpoints (every N steps)
         """
         self._sync_steps = sync_every_n_steps
+        self._save_steps = save_every_n_steps
         self._checkpoint_dir = Path(checkpoint_dir)
         self._lora_name = lora_name
         self._vllm_backend = vllm_backend
         self._last_sync_step = -1
+        self._last_save_step = -1
         self._adapter_loaded = False
 
         if vllm_backend is not None:
@@ -65,6 +69,8 @@ class WeightSynchronizer:
             )
 
         self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self._current_checkpoint = self._checkpoint_dir / "current"
+        self._current_checkpoint.mkdir(parents=True, exist_ok=True)
 
     def maybe_sync(
         self,
@@ -106,27 +112,32 @@ class WeightSynchronizer:
         Returns:
             True if sync was successful, False otherwise
         """
-        adapter_path = self._checkpoint_dir / f"step_{step}"
-        adapter_path.mkdir(parents=True, exist_ok=True)
-
-        # Save adapter weights
+        # Always save to "current" for vLLM sync
         unwrapped = accelerator.unwrap_model(model)
-        unwrapped.save_pretrained(str(adapter_path))
-        logger.info("Saved LoRA adapter to %s", adapter_path)
+        unwrapped.save_pretrained(str(self._current_checkpoint))
 
         # Unload old adapter if one was previously loaded
         if self._adapter_loaded:
             if not self._unload_adapter():
                 logger.warning("Failed to unload old LoRA adapter, continuing anyway")
 
-        # Load new adapter
-        if not self._load_adapter(str(adapter_path)):
+        # Load new adapter from current checkpoint
+        if not self._load_adapter(str(self._current_checkpoint)):
             logger.error("Failed to load LoRA adapter at step %d", step)
             return False
 
         self._last_sync_step = step
         self._adapter_loaded = True
         logger.info("Synced LoRA weights to vLLM at step %d", step)
+
+        # Save permanent checkpoint every N steps
+        if step % self._save_steps == 0 and step > self._last_save_step:
+            adapter_path = self._checkpoint_dir / f"step_{step}"
+            adapter_path.mkdir(parents=True, exist_ok=True)
+            unwrapped.save_pretrained(str(adapter_path))
+            self._last_save_step = step
+            logger.info("Saved permanent LoRA checkpoint to %s", adapter_path)
+
         return True
 
     def _load_adapter(self, adapter_path: str) -> bool:

@@ -348,6 +348,11 @@ def importance_sampling_loss_with_clip(
     Returns:
         Tuple of (loss, current_logprobs, metrics_dict)
     """
+    # Log input shape for debugging OOM
+    seq_len = input_ids.shape[1] if len(input_ids.shape) > 1 else len(input_ids)
+    with open("/home/ubuntu/spider/debug_training_shapes.txt", "a") as f:
+        f.write(f"input_ids.shape={list(input_ids.shape)} seq_len={seq_len}\n")
+    
     outputs = model(input_ids=input_ids)
     logits = outputs.logits  # [batch, seq_len, vocab_size]
     
@@ -638,9 +643,9 @@ class FireworksTeacherContext:
         # Load tokenizer locally (small memory footprint)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         
-        # Thread pool for parallel API calls
+        # Thread pool for parallel API calls (reduced from 32 to avoid rate limits)
         from concurrent.futures import ThreadPoolExecutor
-        self._executor = ThreadPoolExecutor(max_workers=32)
+        self._executor = ThreadPoolExecutor(max_workers=16)
 
     def compute_logprobs(self, text: str) -> Tuple[List[int], List[float]]:
         """Compute logprobs for text using Fireworks completions API.
@@ -666,9 +671,24 @@ class FireworksTeacherContext:
             "Authorization": f"Bearer {self.api_key}",
         }
 
-        response = requests.post(fireworks_url, headers=headers, json=payload)
-        response.raise_for_status()
-        response_json = response.json()
+        # Retry with exponential backoff
+        max_retries = 5
+        base_delay = 1.0
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(fireworks_url, headers=headers, json=payload, timeout=120)
+                response.raise_for_status()
+                response_json = response.json()
+                break
+            except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
+                if attempt == max_retries - 1:
+                    raise  # Re-raise on final attempt
+                delay = base_delay * (2 ** attempt)  # Exponential backoff: 1, 2, 4, 8, 16 seconds
+                logger.warning(
+                    "Fireworks API error (attempt %d/%d): %s. Retrying in %.1fs...",
+                    attempt + 1, max_retries, str(e)[:100], delay
+                )
+                time.sleep(delay)
 
         # Extract logprobs from response
         lp_list = [
