@@ -16,8 +16,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenize
 from peft import LoraConfig, get_peft_model, PeftModel, TaskType
 from accelerate import Accelerator
 
-from tinker_cookbook.distillation.train_on_policy import _compute_groupwise_reverse_kl
-
 logger = logging.getLogger(__name__)
 
 
@@ -404,60 +402,6 @@ def save_checkpoint_accelerate(
     return full_dict
 
 
-def render_chat_tokens(
-    *,
-    messages: Sequence[Dict[str, object]],
-    tools: Sequence[Dict[str, object]] | None,
-    model_name: str,
-    add_generation_prompt: bool = False,
-) -> Tuple[List[int], int]:
-    """Render chat messages to tokens using the model's chat template."""
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
-    prompt_text = tokenizer.apply_chat_template(
-        messages,
-        tools=tools or None,
-        add_generation_prompt=add_generation_prompt,
-        tokenize=False,
-    )
-    tokens = tokenizer.encode(prompt_text)
-    if tokens and isinstance(tokens[0], list):
-        tokens = tokens[0]
-    prompt_len = len(tokens)
-    return tokens, prompt_len
-
-
-def compute_teacher_logprobs_direct(
-    *,
-    model: torch.nn.Module,
-    messages: Sequence[Dict[str, object]],
-    tools: Sequence[Dict[str, object]] | None,
-    teacher_model: str,
-    device: torch.device,
-) -> Tuple[List[int], int, List[float]]:
-    """Compute teacher logprobs using direct forward pass.
-
-    Args:
-        model: Teacher model
-        messages: Chat messages
-        tools: Tool definitions
-        teacher_model: Teacher model name (for tokenizer)
-        device: Device to run on
-
-    Returns:
-        Tuple of (token_ids, prompt_len, logprobs)
-    """
-    token_ids, prompt_len = render_chat_tokens(
-        messages=messages,
-        tools=tools,
-        model_name=teacher_model,
-        add_generation_prompt=False,
-    )
-
-    logprobs = compute_logprobs_for_sequence(model, token_ids, device)
-
-    return token_ids, prompt_len, logprobs
-
-
 class TransformersSamplerContext:
     """Context for generating samples using transformers generate().
 
@@ -586,30 +530,19 @@ class FireworksTeacherContext:
             fireworks_model,
         )
 
-        # Load tokenizer locally (small memory footprint)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        
         # Thread pool for parallel API calls
         from concurrent.futures import ThreadPoolExecutor
         self._executor = ThreadPoolExecutor(max_workers=32)
 
-    def compute_logprobs(self, text: str) -> Tuple[List[int], List[float]]:
-        """Compute logprobs for text using Fireworks completions API.
-
-        Args:
-            text: Full text to compute logprobs for
-
-        Returns:
-            Tuple of (token_ids, logprobs)
-        """
-
+    def compute_logprobs_for_input_ids(self, input_ids: Sequence[int]) -> List[float]:
+        """Compute logprobs for input_ids using Fireworks completions API."""
         fireworks_url = f"{self.base_url}/completions"
         payload = {
             "model": self.fireworks_model,
             "max_tokens": 1,
             "echo": True,
             "logprobs": True,
-            "prompt": text,
+            "input_ids": list(input_ids),
         }
         headers = {
             "Accept": "application/json",
@@ -622,13 +555,9 @@ class FireworksTeacherContext:
         response_json = response.json()
 
         # Extract logprobs from response
-        lp_list = [
-            item["logprob"]
-            for item in response_json["choices"][0]["logprobs"]["content"]
-        ]
-
-        # Get token IDs using local tokenizer
-        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        lp_list = []
+        for item in response_json["choices"][0]["logprobs"]["content"]:
+            lp_list.append(item.get("logprob", 0.0))
 
         # Align lengths - use prompt_tokens from usage to slice logprobs
         prompt_tokens = response_json["usage"]["prompt_tokens"]
@@ -637,139 +566,68 @@ class FireworksTeacherContext:
         # Extract completion logprobs starting after prefix_tokens
         logprobs = lp_list[:prompt_tokens]
 
-        # Align with tokenizer output
-        if len(logprobs) != len(token_ids):
+        # Log warning if Fireworks returns token_ids that don't match input_ids.
+        fw_tokens = response_json.get("choices", [{}])[0].get("logprobs", {}).get("token_ids")
+        if fw_tokens is not None:
+            if list(fw_tokens) != list(input_ids):
+                mismatch_at = None
+                for idx, (fw_id, in_id) in enumerate(zip(fw_tokens, input_ids)):
+                    if fw_id != in_id:
+                        mismatch_at = idx
+                        break
+                logger.warning(
+                    "Fireworks token_ids mismatch: input_len=%d fw_len=%d first_mismatch=%s",
+                    len(input_ids),
+                    len(fw_tokens),
+                    mismatch_at,
+                )
+
+        if len(logprobs) != len(input_ids):
             logger.warning(
-                "Token count mismatch: API returned %d, tokenizer has %d",
+                "Token count mismatch: API returned %d, input_ids has %d",
                 len(logprobs),
-                len(token_ids),
+                len(input_ids),
             )
-            if len(logprobs) < len(token_ids):
-                logprobs.extend([0.0] * (len(token_ids) - len(logprobs)))
+            if len(logprobs) < len(input_ids):
+                logprobs.extend([0.0] * (len(input_ids) - len(logprobs)))
             else:
-                logprobs = logprobs[: len(token_ids)]
+                logprobs = logprobs[: len(input_ids)]
 
-        return token_ids, [lp if lp is not None else 0.0 for lp in logprobs]
-
-    def compute_logprobs_batch(self, texts: List[str]) -> List[Tuple[List[int], List[float]]]:
-        """Compute logprobs for multiple texts in parallel.
-        
-        Args:
-            texts: List of texts to compute logprobs for
-            
-        Returns:
-            List of (token_ids, logprobs) tuples
-        """
-        from concurrent.futures import as_completed
-        
-        futures = {self._executor.submit(self.compute_logprobs, text): i 
-                  for i, text in enumerate(texts)}
-        
-        results = [None] * len(texts)
-        for future in as_completed(futures):
-            idx = futures[future]
-            try:
-                results[idx] = future.result()
-            except Exception as e:
-                logger.error(f"Error computing logprobs for text {idx}: {e}")
-                # Fallback: return empty result
-                token_ids = self.tokenizer.encode(texts[idx], add_special_tokens=False)
-                results[idx] = (token_ids, [0.0] * len(token_ids))
-        
-        return results
+        return [lp if lp is not None else 0.0 for lp in logprobs]
 
     def compute_teacher_alignment(
         self,
-        messages: Sequence[Dict[str, object]],
-        tools: Sequence[Dict[str, object]] | None,
-        student_model: str,
-        student_token_ids: Sequence[int],
+        input_ids: Sequence[int],
         student_logprobs: torch.Tensor,
-        reward_mask: Sequence[int],
-        assistant_raw_text: str,
+        completion_mask: Sequence[int],
     ) -> Dict[str, object]:
         """Compute teacher alignment for rewards using Fireworks API."""
-        if not messages or messages[-1].get("role") != "assistant":
-            raise ValueError("Messages must end with an assistant turn.")
-
-        student_tokenizer = AutoTokenizer.from_pretrained(student_model, use_fast=True, trust_remote_code=True)
-        teacher_tokenizer = self.tokenizer
-
-        prefix_msgs = list(messages[:-1])
-
-        prefix_text = teacher_tokenizer.apply_chat_template(
-            prefix_msgs,
-            tools=tools if tools else None,
-            add_generation_prompt=True,
-            tokenize=False,
-        )
-        prefix_tokens = teacher_tokenizer.encode(prefix_text, add_special_tokens=False)
-
-        if assistant_raw_text is None:
-            raise ValueError("Assistant raw text is required for teacher alignment")
-
-        completion_tokens = teacher_tokenizer.encode(
-            assistant_raw_text,
-            add_special_tokens=False,
-        )
-
-        full_text = prefix_text + assistant_raw_text
-
-        # Get logprobs from Fireworks (uses thread pool for parallelization)
-        _, full_logprobs = self.compute_logprobs(full_text)
-
-
-        completion_lp = full_logprobs[len(prefix_tokens):]
-
-        if len(completion_lp) < len(completion_tokens):
-            completion_lp.extend([0.0] * (len(completion_tokens) - len(completion_lp)))
-        elif len(completion_lp) > len(completion_tokens):
-            completion_lp = completion_lp[:len(completion_tokens)]
-
-        try:
-            start = list(reward_mask).index(1)
-            end = len(reward_mask) - list(reversed(reward_mask)).index(1)
-        except ValueError:
+        if not completion_mask or not any(completion_mask):
             return {
-                "kl_adjustments": [0.0] * len(student_token_ids),
-                "kl_mask": [0.0] * len(student_token_ids),
-                "teacher_token_ids": list(completion_tokens),
-                "teacher_logprobs": list(completion_lp),
+                "kl_adjustments": [0.0] * len(input_ids),
+                "kl_mask": [0.0] * len(input_ids),
+                "teacher_token_ids": list(input_ids),
+                "teacher_logprobs": [0.0] * len(input_ids),
             }
 
-        student_ids = list(student_token_ids)[start:end]
-        student_lp_slice = student_logprobs[start:end]
-        student_mask = torch.tensor(
-            list(reward_mask)[start:end],
-            device=student_logprobs.device,
-            dtype=student_logprobs.dtype,
-        )
+        teacher_logprobs = self.compute_logprobs_for_input_ids(input_ids)
+        if len(teacher_logprobs) != len(input_ids):
+            if len(teacher_logprobs) < len(input_ids):
+                teacher_logprobs.extend([0.0] * (len(input_ids) - len(teacher_logprobs)))
+            else:
+                teacher_logprobs = teacher_logprobs[: len(input_ids)]
 
-        teacher_lp_tensor = torch.tensor(
-            completion_lp,
-            device=student_logprobs.device,
-            dtype=student_logprobs.dtype,
-        )
-
-        kl_slice, kl_mask_slice = _compute_groupwise_reverse_kl(
-            student_tokenizer,
-            student_ids,
-            student_lp_slice,
-            teacher_tokenizer,
-            completion_tokens,
-            teacher_lp_tensor,
-            student_mask,
-        )
-
-        # Log KL and associated tensors for inspection and debugging using pickle
-        kl_adjustments = torch.zeros_like(student_logprobs)
-        kl_mask = torch.zeros_like(student_logprobs)
-        kl_adjustments[start:end] = kl_slice
-        kl_mask[start:end] = kl_mask_slice
+        kl_adjustments = [0.0] * len(input_ids)
+        kl_mask = [0.0] * len(input_ids)
+        limit = min(len(input_ids), len(student_logprobs), len(completion_mask))
+        for idx in range(limit):
+            if completion_mask[idx]:
+                kl_adjustments[idx] = float(student_logprobs[idx].item()) - teacher_logprobs[idx]
+                kl_mask[idx] = 1.0
 
         return {
-            "kl_adjustments": kl_adjustments.tolist(),
-            "kl_mask": kl_mask.tolist(),
-            "teacher_token_ids": list(completion_tokens),
-            "teacher_logprobs": list(completion_lp),
+            "kl_adjustments": kl_adjustments,
+            "kl_mask": kl_mask,
+            "teacher_token_ids": list(input_ids),
+            "teacher_logprobs": teacher_logprobs,
         }

@@ -134,12 +134,6 @@ def _create_shared_student_sampler(
     return ctx, sampler
 
 
-def _needs_gold_alignment(student_model: str, teacher_model: str) -> bool:
-    """Check if gold alignment is needed (always True for now)."""
-    _ = (student_model, teacher_model)
-    return True
-
-
 def run_on_policy_job(
     job_id: str,
     job: JobConfig,
@@ -183,14 +177,13 @@ def run_on_policy_job(
     )
     prompt_list = [row["prompt"] for row in prompt_rows]
 
-    use_gold_alignment = _needs_gold_alignment(student_model, options.teacher)
     logger.info(
         "Job %s: on-policy distillation (accelerate) for student=%s collected %d prompts, "
         "use_gold_alignment=%s, tool_rollouts=%s",
         job_id,
         student_model,
         len(prompt_list),
-        use_gold_alignment,
+        False,
         bool(tool_registry),
     )
 
@@ -242,7 +235,7 @@ def run_on_policy_job(
     payload = _base_metadata(job_id, job)
     payload["generation_mode"] = "on_policy_accelerate"
     on_policy_options = options.model_dump(exclude_none=True)
-    on_policy_options["use_gold_alignment"] = use_gold_alignment
+    on_policy_options["use_gold_alignment"] = False
     payload["on_policy"] = on_policy_options
     _write_metadata(metadata_path, payload, 0)
 
@@ -380,9 +373,7 @@ def _run_tool_on_policy_stream_accelerate(
 ):
     """Run tool-based on-policy training using Accelerate."""
     import wandb
-    from .executor import JobExecutionError, tool_descriptors
-
-    tool_defs = tool_descriptors(job.tools)
+    from .executor import JobExecutionError
 
     verbose_turns = bool(job.generation.verbose)
 
@@ -475,25 +466,6 @@ def _run_tool_on_policy_stream_accelerate(
 
     device = accelerator.device
 
-    # Helper to call teacher alignment
-    def _compute_teacher_alignment(
-        messages,
-        tools,
-        student_token_ids,
-        student_logprobs,
-        reward_mask,
-        assistant_raw_text,
-    ):
-        return teacher_ctx.compute_teacher_alignment(
-            messages=messages,
-            tools=tools,
-            student_model=job.model.name,
-            student_token_ids=student_token_ids,
-            student_logprobs=student_logprobs,
-            reward_mask=reward_mask,
-            assistant_raw_text=assistant_raw_text,
-        )
-
     def _process_batch(
         batch_index: int, trajectories: List[Dict[str, Any]]
     ) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
@@ -515,7 +487,6 @@ def _run_tool_on_policy_stream_accelerate(
         all_loss_masks = []
 
         for turn_index, turn in enumerate(trajectories):
-            messages = turn["messages"]
             token_ids = turn["token_ids"]
             logprobs = turn["logprobs"]
             reward_mask = turn["reward_mask"]
@@ -529,73 +500,11 @@ def _run_tool_on_policy_stream_accelerate(
                     f"student_logprobs={len(student_logprobs)} "
                 )
 
-            # Check if this is a combined multi-turn item
-            combined_turns = turn.get("_combined_turns")
-            if combined_turns:
-                # Compute teacher alignment for each turn separately and combine
-                kl_adjustments_combined = [0.0] * len(token_ids)
-                kl_mask_combined = [0.0] * len(token_ids)
-                teacher_logprobs_list = []
-                teacher_token_ids_list = []
-
-                for turn_info in combined_turns:
-                    turn_messages = turn_info["messages"]
-                    turn_assistant_raw_text = turn_info.get("assistant_raw_text")
-                    completion_start = turn_info["completion_start"]
-                    completion_end = turn_info["completion_end"]
-
-                    if not turn_assistant_raw_text:
-                        continue
-
-                    # Create a reward mask for just this turn's completion
-                    turn_reward_mask = [0] * len(token_ids)
-                    for idx in range(completion_start, completion_end):
-                        if idx < len(turn_reward_mask):
-                            turn_reward_mask[idx] = 1
-
-                    # Compute teacher alignment for this turn
-                    turn_alignment = _compute_teacher_alignment(
-                        messages=turn_messages,
-                        tools=tool_defs,
-                        student_token_ids=token_ids,
-                        student_logprobs=student_logprobs,
-                        reward_mask=turn_reward_mask,
-                        assistant_raw_text=turn_assistant_raw_text,
-                    )
-
-                    # Extract KL adjustments and mask for this turn's region
-                    turn_kl_adj = turn_alignment.get("kl_adjustments") or [0.0] * len(token_ids)
-                    turn_kl_mask = turn_alignment.get("kl_mask") or [0.0] * len(token_ids)
-
-                    # Combine into the full sequence
-                    for idx in range(completion_start, completion_end):
-                        if idx < len(kl_adjustments_combined):
-                            kl_adjustments_combined[idx] = turn_kl_adj[idx]
-                            if idx < len(turn_kl_mask):
-                                kl_mask_combined[idx] = turn_kl_mask[idx]
-
-                    # Collect teacher logprobs and token_ids
-                    if turn_alignment.get("teacher_logprobs"):
-                        teacher_logprobs_list = turn_alignment.get("teacher_logprobs")
-                    if turn_alignment.get("teacher_token_ids"):
-                        teacher_token_ids_list = turn_alignment.get("teacher_token_ids")
-
-                teacher_alignment = {
-                    "kl_adjustments": kl_adjustments_combined,
-                    "kl_mask": kl_mask_combined,
-                    "teacher_logprobs": teacher_logprobs_list,
-                    "teacher_token_ids": teacher_token_ids_list,
-                }
-            else:
-                # Single turn - compute teacher alignment normally
-                teacher_alignment = _compute_teacher_alignment(
-                    messages=messages,
-                    tools=tool_defs,
-                    student_token_ids=token_ids,
-                    student_logprobs=student_logprobs,
-                    reward_mask=reward_mask,
-                    assistant_raw_text=turn.get("assistant_raw_text"),
-                )
+            teacher_alignment = teacher_ctx.compute_teacher_alignment(
+                input_ids=token_ids,
+                student_logprobs=student_logprobs,
+                completion_mask=reward_mask,
+            )
 
             item = dict(turn)
             item.update(
@@ -1178,25 +1087,6 @@ def _run_tool_on_policy_vllm_accelerate(
 
         device = accelerator.device
 
-        # Helper to call teacher alignment
-        def _compute_teacher_alignment(
-            messages,
-            tools,
-            student_token_ids,
-            student_logprobs,
-            reward_mask,
-            assistant_raw_text,
-        ):
-            return teacher_ctx.compute_teacher_alignment(
-                messages=messages,
-                tools=tools,
-                student_model=student_model,
-                student_token_ids=student_token_ids,
-                student_logprobs=student_logprobs,
-                reward_mask=reward_mask,
-                assistant_raw_text=assistant_raw_text,
-            )
-
         def _process_batch(
             batch_index: int, trajectories: List[Dict[str, Any]]
         ) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
@@ -1224,61 +1114,27 @@ def _run_tool_on_policy_vllm_accelerate(
             
             alignment_tasks = []
             for turn_index, turn in enumerate(trajectories):
-                messages = turn["messages"]
                 token_ids = turn["token_ids"]
                 logprobs = turn["logprobs"]
-                reward_mask = turn["reward_mask"]
                 student_logprobs = torch.tensor(logprobs, dtype=torch.float32, device=device)
+                reward_mask = turn["reward_mask"]
 
-                # Check if this is a combined multi-turn item
-                combined_turns = turn.get("_combined_turns")
-                if combined_turns:
-                    for turn_info in combined_turns:
-                        turn_messages = turn_info["messages"]
-                        turn_assistant_raw_text = turn_info.get("assistant_raw_text")
-                        if not turn_assistant_raw_text:
-                            continue
-                        
-                        turn_reward_mask = [0] * len(token_ids)
-                        completion_start = turn_info["completion_start"]
-                        completion_end = turn_info["completion_end"]
-                        for idx in range(completion_start, completion_end):
-                            if idx < len(turn_reward_mask):
-                                turn_reward_mask[idx] = 1
-                        
-                        alignment_tasks.append({
-                            "turn_index": turn_index,
-                            "turn": turn,
-                            "turn_info": turn_info,
-                            "messages": turn_messages,
-                            "token_ids": token_ids,
-                            "student_logprobs": student_logprobs,
-                            "reward_mask": turn_reward_mask,
-                            "assistant_raw_text": turn_assistant_raw_text,
-                        })
-                else:
-                    alignment_tasks.append({
-                        "turn_index": turn_index,
-                        "turn": turn,
-                        "turn_info": None,
-                        "messages": messages,
-                        "token_ids": token_ids,
-                        "student_logprobs": student_logprobs,
-                        "reward_mask": reward_mask,
-                        "assistant_raw_text": turn.get("assistant_raw_text"),
-                    })
+                alignment_tasks.append({
+                    "turn_index": turn_index,
+                    "turn": turn,
+                    "token_ids": token_ids,
+                    "student_logprobs": student_logprobs,
+                    "reward_mask": reward_mask,
+                })
             
             # Submit all tasks in parallel
             futures = {}
             for task in alignment_tasks:
                 future = teacher_ctx._executor.submit(
-                    _compute_teacher_alignment,
-                    messages=task["messages"],
-                    tools=tool_defs,
-                    student_token_ids=task["token_ids"],
+                    teacher_ctx.compute_teacher_alignment,
+                    input_ids=task["token_ids"],
                     student_logprobs=task["student_logprobs"],
-                    reward_mask=task["reward_mask"],
-                    assistant_raw_text=task["assistant_raw_text"],
+                    completion_mask=task["reward_mask"],
                 )
                 futures[future] = task
             
@@ -1306,7 +1162,6 @@ def _run_tool_on_policy_vllm_accelerate(
             
             # Process trajectories with alignment results
             for turn_index, turn in enumerate(trajectories):
-                messages = turn["messages"]
                 token_ids = turn["token_ids"]
                 logprobs = turn["logprobs"]
                 reward_mask = turn["reward_mask"]
@@ -1314,33 +1169,7 @@ def _run_tool_on_policy_vllm_accelerate(
                 
                 # Use pre-computed alignment results
                 results = alignment_results[turn_index]
-                combined_turns = turn.get("_combined_turns")
-                if combined_turns:
-                    kl_adjustments_combined = [0.0] * len(token_ids)
-                    kl_mask_combined = [0.0] * len(token_ids)
-                    
-                    for result in results:
-                        task = result["task"]
-                        alignment = result["alignment"]
-                        turn_info = task["turn_info"]
-                        completion_start = turn_info["completion_start"]
-                        completion_end = turn_info["completion_end"]
-                        
-                        turn_kl_adj = alignment.get("kl_adjustments") or [0.0] * len(token_ids)
-                        turn_kl_mask = alignment.get("kl_mask") or [0.0] * len(token_ids)
-                        
-                        for idx in range(completion_start, completion_end):
-                            if idx < len(kl_adjustments_combined):
-                                kl_adjustments_combined[idx] = turn_kl_adj[idx]
-                                if idx < len(turn_kl_mask):
-                                    kl_mask_combined[idx] = turn_kl_mask[idx]
-                    
-                    teacher_alignment = {
-                        "kl_adjustments": kl_adjustments_combined,
-                        "kl_mask": kl_mask_combined,
-                    }
-                else:
-                    teacher_alignment = results[0]["alignment"]
+                teacher_alignment = results[0]["alignment"]
 
                 item = dict(turn)
                 item.update({
@@ -1894,7 +1723,6 @@ def _tool_rollout_stream(
                         "assistant_content": content,
                         "assistant_reasoning_content": reasoning_content,
                         "assistant_tool_calls": tool_calls,
-                        "assistant_raw_text": generated_text,
                         "prompt_token_count": prompt_token_count,
                         "parser_fallback": False,
                         "turn_index": turn_idx,
@@ -1946,7 +1774,6 @@ def _tool_rollout_stream(
         all_tool_calls = []
         all_assistant_contents = []
         all_assistant_reasoning = []
-        all_assistant_raw_texts = []
 
         for turn_item in turn_items:
             if turn_item.get("assistant_tool_calls"):
@@ -1955,8 +1782,6 @@ def _tool_rollout_stream(
                 all_assistant_contents.append(turn_item["assistant_content"])
             if turn_item.get("assistant_reasoning_content"):
                 all_assistant_reasoning.append(turn_item["assistant_reasoning_content"])
-            if turn_item.get("assistant_raw_text"):
-                all_assistant_raw_texts.append(turn_item["assistant_raw_text"])
 
         # Store turn information for teacher alignment computation
         turn_info_for_alignment = []
@@ -1964,7 +1789,6 @@ def _tool_rollout_stream(
             turn_info_for_alignment.append(
                 {
                     "messages": turn_item["messages"],
-                    "assistant_raw_text": turn_item.get("assistant_raw_text"),
                     "completion_start": turn_item["prompt_token_count"],
                     "completion_end": len(turn_item["token_ids"]),
                 }
@@ -1982,7 +1806,6 @@ def _tool_rollout_stream(
             if all_assistant_reasoning
             else None,
             "assistant_tool_calls": all_tool_calls if all_tool_calls else None,
-            "assistant_raw_text": all_assistant_raw_texts[-1] if all_assistant_raw_texts else None,
             "prompt_token_count": turn_items[0]["prompt_token_count"],
             "parser_fallback": last_turn.get("parser_fallback", False),
             "turn_index": len(turn_items) - 1,
