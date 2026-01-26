@@ -47,7 +47,7 @@ def main():
     # Run training with accelerate
     run_server_only(
         job=job,
-        workspace=Path("./workspace_accelerate"),
+        workspace=Path("/mnt/local/workspace_accelerate"),
         split="filtered",
         on_batch_start_lookahead=2,
         prefetch_max_workers=2,

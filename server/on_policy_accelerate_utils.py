@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import requests
+import threading
 import time
 from tqdm.auto import tqdm
 from dataclasses import dataclass
@@ -607,7 +608,7 @@ class FireworksTeacherContext:
         self,
         model_name: str,
         fireworks_model: str,
-        base_url: str = "https://api.fireworks.ai/inference/v1",
+        base_url: str = "http://10.234.201.144:8000/v1",
         api_key: Optional[str] = None,
     ) -> None:
         """Initialize Fireworks teacher context.
@@ -622,12 +623,7 @@ class FireworksTeacherContext:
         self.model_name = model_name
         self.fireworks_model = fireworks_model
         self.base_url = base_url
-        self.api_key = api_key or os.environ.get("FIREWORKS_API_KEY")
-
-        if not self.api_key:
-            raise ValueError(
-                "FIREWORKS_API_KEY environment variable must be set or api_key must be provided"
-            )
+        self.api_key = ""
 
         logger.info(
             "Using Fireworks API for teacher model: %s (fireworks: %s)",
@@ -638,9 +634,41 @@ class FireworksTeacherContext:
         # Load tokenizer locally (small memory footprint)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         
+        # Cache for student tokenizers (avoid reloading for every call)
+        self._student_tokenizer_cache: Dict[str, Any] = {}
+        self._tokenizer_cache_lock = threading.Lock()
+        
         # Thread pool for parallel API calls
         from concurrent.futures import ThreadPoolExecutor
-        self._executor = ThreadPoolExecutor(max_workers=32)
+        self._executor = ThreadPoolExecutor(max_workers=64)
+        
+        # HTTP session with connection pooling for Fireworks API
+        import requests
+        self._http_session = requests.Session()
+        # Configure connection pooling
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=64,
+            pool_maxsize=64,
+            max_retries=3,
+        )
+        self._http_session.mount('https://', adapter)
+        self._http_session.mount('http://', adapter)
+    
+    def _get_student_tokenizer(self, student_model: str):
+        """Get cached student tokenizer, loading if necessary."""
+        # Fast path: check without lock first
+        if student_model in self._student_tokenizer_cache:
+            return self._student_tokenizer_cache[student_model]
+        
+        # Slow path: acquire lock and load
+        with self._tokenizer_cache_lock:
+            # Double-check after acquiring lock
+            if student_model not in self._student_tokenizer_cache:
+                logger.info("Loading student tokenizer for: %s", student_model)
+                self._student_tokenizer_cache[student_model] = AutoTokenizer.from_pretrained(
+                    student_model, use_fast=True, trust_remote_code=True
+                )
+            return self._student_tokenizer_cache[student_model]
 
     def compute_logprobs(self, text: str) -> Tuple[List[int], List[float]]:
         """Compute logprobs for text using Fireworks completions API.
@@ -652,38 +680,49 @@ class FireworksTeacherContext:
             Tuple of (token_ids, logprobs)
         """
 
-        fireworks_url = f"{self.base_url}/completions"
+        api_url = f"{self.base_url}/completions"
         payload = {
             "model": self.fireworks_model,
             "max_tokens": 1,
             "echo": True,
-            "logprobs": True,
+            "logprobs": 1,  # vLLM uses integer for logprobs count
             "prompt": text,
         }
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
         }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
 
-        response = requests.post(fireworks_url, headers=headers, json=payload)
+        # Use session with connection pooling for faster requests
+        response = self._http_session.post(api_url, headers=headers, json=payload)
         response.raise_for_status()
         response_json = response.json()
 
-        # Extract logprobs from response
-        lp_list = [
-            item["logprob"]
-            for item in response_json["choices"][0]["logprobs"]["content"]
-        ]
+        # Extract logprobs from response - handle both vLLM and Fireworks formats
+        logprobs_data = response_json["choices"][0]["logprobs"]
+        
+        # vLLM format: {"tokens": [...], "token_logprobs": [...], ...}
+        # Fireworks format: {"content": [{"token": ..., "logprob": ...}, ...]}
+        if "token_logprobs" in logprobs_data:
+            # vLLM format
+            lp_list = logprobs_data["token_logprobs"]
+            # First token logprob is None in vLLM, replace with 0.0
+            lp_list = [lp if lp is not None else 0.0 for lp in lp_list]
+        elif "content" in logprobs_data:
+            # Fireworks format
+            lp_list = [item["logprob"] for item in logprobs_data["content"]]
+        else:
+            raise ValueError(f"Unknown logprobs format: {logprobs_data.keys()}")
 
         # Get token IDs using local tokenizer
         token_ids = self.tokenizer.encode(text, add_special_tokens=False)
 
-        # Align lengths - use prompt_tokens from usage to slice logprobs
-        prompt_tokens = response_json["usage"]["prompt_tokens"]
-        # Fireworks returns the prefix/completion tokens + 1 extra completion token.
-        # So we will just consider the prompt tokens (prefix/completion).
-        # Extract completion logprobs starting after prefix_tokens
+        # For vLLM with echo=True, we get logprobs for all tokens including prompt
+        # The lp_list already contains prompt tokens, just need to align with our token_ids
+        # Use length of lp_list minus 1 (the generated token) as prompt_tokens count
+        prompt_tokens = len(lp_list) - 1  # Exclude the 1 generated token
         logprobs = lp_list[:prompt_tokens]
 
         # Align with tokenizer output
@@ -741,7 +780,8 @@ class FireworksTeacherContext:
         if not messages or messages[-1].get("role") != "assistant":
             raise ValueError("Messages must end with an assistant turn.")
 
-        student_tokenizer = AutoTokenizer.from_pretrained(student_model, use_fast=True, trust_remote_code=True)
+        # Use cached tokenizer instead of loading every time
+        student_tokenizer = self._get_student_tokenizer(student_model)
         teacher_tokenizer = self.tokenizer
 
         prefix_msgs = list(messages[:-1])
@@ -768,8 +808,10 @@ class FireworksTeacherContext:
         full_text = prefix_text + assistant_raw_text
 
         # Get logprobs from Fireworks (uses thread pool for parallelization)
+        import time
+        t0 = time.perf_counter()
         _, full_logprobs = self.compute_logprobs(full_text)
-
+        t1 = time.perf_counter()
 
         completion_lp = full_logprobs[len(prefix_tokens):]
 
@@ -812,6 +854,9 @@ class FireworksTeacherContext:
             teacher_lp_tensor,
             student_mask,
         )
+        t2 = time.perf_counter()
+        
+        logging.info(f"TIMING: fireworks_api={t1-t0:.3f}s alignment={t2-t1:.3f}s total={t2-t0:.3f}s tokens={len(completion_tokens)}")
 
         # Log KL and associated tensors for inspection and debugging using pickle
         kl_adjustments = torch.zeros_like(student_logprobs)
@@ -824,4 +869,164 @@ class FireworksTeacherContext:
             "kl_mask": kl_mask.tolist(),
             "teacher_token_ids": list(completion_tokens),
             "teacher_logprobs": list(completion_lp),
+        }
+
+    def compute_teacher_alignment_full_trajectory(
+        self,
+        full_messages: Sequence[Dict[str, object]],
+        combined_turns: Sequence[Dict[str, object]],
+        tools: Sequence[Dict[str, object]] | None,
+        student_model: str,
+        student_token_ids: Sequence[int],
+        student_logprobs: torch.Tensor,
+        reward_mask: Sequence[int],
+    ) -> Dict[str, object]:
+        """Compute teacher alignment for a full multi-turn trajectory with a single API call.
+        
+        Instead of making one API call per turn, this makes a single call for the entire
+        trajectory and extracts logprobs for each assistant turn using token positions.
+        
+        Args:
+            full_messages: Complete conversation history
+            combined_turns: List of turn info dicts with completion_start, completion_end, assistant_raw_text
+            tools: Tool definitions
+            student_model: Student model name for tokenizer
+            student_token_ids: Full token sequence
+            student_logprobs: Student logprobs for full sequence
+            reward_mask: Full reward mask
+            
+        Returns:
+            Dict with kl_adjustments, kl_mask, teacher_token_ids, teacher_logprobs
+        """
+        import time
+        t0 = time.perf_counter()
+        
+        student_tokenizer = self._get_student_tokenizer(student_model)
+        teacher_tokenizer = self.tokenizer
+        
+        # Normalize tool calls for Qwen3
+        normalized_messages = _normalize_tool_calls_args_for_qwen3(list(full_messages))
+        
+        # Build full text from all messages
+        full_text = teacher_tokenizer.apply_chat_template(
+            normalized_messages,
+            tools=tools if tools else None,
+            add_generation_prompt=False,
+            tokenize=False,
+        )
+        
+        # Get logprobs for entire trajectory in ONE API call
+        t_api_start = time.perf_counter()
+        full_token_ids_teacher, full_logprobs = self.compute_logprobs(full_text)
+        t_api_end = time.perf_counter()
+        
+        # Now we need to find the token positions for each assistant turn's completion
+        # We'll use the chat template to figure out where each turn starts/ends
+        kl_adjustments = [0.0] * len(student_token_ids)
+        kl_mask = [0.0] * len(student_token_ids)
+        all_teacher_token_ids = []
+        all_teacher_logprobs = []
+        
+        for turn_info in combined_turns:
+            assistant_raw_text = turn_info.get("assistant_raw_text")
+            if not assistant_raw_text:
+                continue
+            
+            completion_start = turn_info["completion_start"]
+            completion_end = turn_info["completion_end"]
+            turn_messages = turn_info["messages"]
+            
+            # Find where this turn's assistant text appears in the full teacher tokenization
+            # Build prefix text (messages up to but not including assistant response)
+            prefix_msgs = _normalize_tool_calls_args_for_qwen3(list(turn_messages[:-1]))
+            prefix_text = teacher_tokenizer.apply_chat_template(
+                prefix_msgs,
+                tools=tools if tools else None,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            prefix_tokens = teacher_tokenizer.encode(prefix_text, add_special_tokens=False)
+            
+            # Tokenize the assistant completion
+            completion_tokens = teacher_tokenizer.encode(
+                assistant_raw_text,
+                add_special_tokens=False,
+            )
+            
+            # Extract logprobs for this turn's completion from the full logprobs
+            turn_start_idx = len(prefix_tokens)
+            turn_end_idx = turn_start_idx + len(completion_tokens)
+            
+            completion_lp = full_logprobs[turn_start_idx:turn_end_idx]
+            
+            # Pad/truncate to match completion tokens
+            if len(completion_lp) < len(completion_tokens):
+                completion_lp = list(completion_lp) + [0.0] * (len(completion_tokens) - len(completion_lp))
+            elif len(completion_lp) > len(completion_tokens):
+                completion_lp = completion_lp[:len(completion_tokens)]
+            
+            # Create turn-specific reward mask
+            turn_reward_mask = [0] * len(student_token_ids)
+            for idx in range(completion_start, completion_end):
+                if idx < len(turn_reward_mask):
+                    turn_reward_mask[idx] = 1
+            
+            # Find reward region
+            try:
+                start = turn_reward_mask.index(1)
+                end = len(turn_reward_mask) - list(reversed(turn_reward_mask)).index(1)
+            except ValueError:
+                continue
+            
+            student_ids = list(student_token_ids)[start:end]
+            student_lp_slice = student_logprobs[start:end]
+            student_mask = torch.tensor(
+                turn_reward_mask[start:end],
+                device=student_logprobs.device,
+                dtype=student_logprobs.dtype,
+            )
+            
+            teacher_lp_tensor = torch.tensor(
+                completion_lp,
+                device=student_logprobs.device,
+                dtype=student_logprobs.dtype,
+            )
+            
+            # Compute KL for this turn
+            kl_slice, kl_mask_slice = _compute_groupwise_reverse_kl(
+                student_tokenizer,
+                student_ids,
+                student_lp_slice,
+                teacher_tokenizer,
+                completion_tokens,
+                teacher_lp_tensor,
+                student_mask,
+            )
+            
+            # Fill in the KL adjustments for this turn's region
+            kl_adj_tensor = torch.zeros(len(student_token_ids), device=student_logprobs.device, dtype=student_logprobs.dtype)
+            kl_mask_tensor = torch.zeros(len(student_token_ids), device=student_logprobs.device, dtype=student_logprobs.dtype)
+            kl_adj_tensor[start:end] = kl_slice
+            kl_mask_tensor[start:end] = kl_mask_slice
+            
+            for idx in range(completion_start, completion_end):
+                if idx < len(kl_adjustments):
+                    kl_adjustments[idx] = kl_adj_tensor[idx].item()
+                    kl_mask[idx] = kl_mask_tensor[idx].item()
+            
+            all_teacher_token_ids.extend(completion_tokens)
+            all_teacher_logprobs.extend(completion_lp)
+        
+        t2 = time.perf_counter()
+        logging.info(
+            f"TIMING (full trajectory): api={t_api_end-t_api_start:.3f}s "
+            f"alignment={t2-t_api_end:.3f}s total={t2-t0:.3f}s "
+            f"turns={len(combined_turns)} tokens={len(full_token_ids_teacher)}"
+        )
+        
+        return {
+            "kl_adjustments": kl_adjustments,
+            "kl_mask": kl_mask,
+            "teacher_token_ids": all_teacher_token_ids,
+            "teacher_logprobs": all_teacher_logprobs,
         }

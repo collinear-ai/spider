@@ -19,14 +19,12 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
+from accelerate import DeepSpeedPlugin
 from peft import PeftModel
 from transformers import get_scheduler
 
 from tqdm.auto import tqdm
 
-# DISABLED: Liger kernel causes corrupted logits with Qwen3 + LoRA + gradient checkpointing
-# Symptoms: logits range from -260 to +300, predictions are garbage
-# Result: importance sampling ratio ≈ 0, gradient explosion, NaN loss
 # from liger_kernel.transformers import apply_liger_kernel_to_qwen3
 from spider.config import JobConfig
 
@@ -54,6 +52,8 @@ RolloutBatch = List[Dict[str, Any]]
 logger = logging.getLogger(__name__)
 
 
+# apply_liger_kernel_to_qwen3(fused_linear_cross_entropy=False, rope=False)
+
 class _AccelerateStudentSamplerContext:
     """Student sampler context using transformers generate()."""
 
@@ -80,21 +80,11 @@ class _AccelerateStudentSamplerContext:
                 "job.model.name must be provided to create a sampling context."
             )
 
-        # Determine torch dtype based on training precision
-        training_precision = getattr(self._job.generation.on_policy_options, "training_precision", "bf16")
-        if training_precision == "fp32":
-            model_dtype = torch.float32
-        elif training_precision == "fp16":
-            model_dtype = torch.float16
-        else:
-            model_dtype = torch.bfloat16
-
         # Load model with LoRA
         self._model, self._tokenizer = load_model_with_lora(
             model_name=model_name,
             lora_rank=lora_rank,
             checkpoint_path=checkpoint_path,
-            torch_dtype=model_dtype,
         )
 
         self._sampler = TransformersSamplerContext(
@@ -386,9 +376,52 @@ def _run_tool_on_policy_stream_accelerate(
 
     verbose_turns = bool(job.generation.verbose)
 
-    # Initialize Accelerator
+    # Initialize DeepSpeed plugin if enabled
+    use_deepspeed = getattr(options, "use_deepspeed", False)
+    deepspeed_plugin = None
+    
+    if use_deepspeed:
+        deepspeed_config_path = getattr(options, "deepspeed_config_path", None)
+        if deepspeed_config_path and Path(deepspeed_config_path).exists():
+            # Load DeepSpeed config from file
+            import json
+            with open(deepspeed_config_path) as f:
+                ds_config = json.load(f)
+            
+            zero_stage = ds_config.get("zero_optimization", {}).get("stage", 2)
+            deepspeed_plugin = DeepSpeedPlugin(
+                hf_ds_config=ds_config,
+                zero3_init_flag=zero_stage == 3,
+            )
+            logger.info(
+                "Using DeepSpeed config from file: %s (ZeRO stage %d)",
+                deepspeed_config_path,
+                zero_stage,
+            )
+        else:
+            # Create DeepSpeed plugin programmatically
+            zero_stage = getattr(options, "deepspeed_zero_stage", 2)
+            offload_optimizer = getattr(options, "deepspeed_offload_optimizer", False)
+            offload_param = getattr(options, "deepspeed_offload_param", False)
+            
+            deepspeed_plugin = DeepSpeedPlugin(
+                zero_stage=zero_stage,
+                offload_optimizer_device="cpu" if offload_optimizer else None,
+                offload_param_device="cpu" if offload_param else None,
+            )
+            logger.info(
+                "Using DeepSpeed ZeRO stage %d (optimizer offload: %s, param offload: %s)",
+                zero_stage,
+                offload_optimizer,
+                offload_param,
+            )
+
+    # Initialize Accelerator with DeepSpeed
     training_precision = getattr(options, "training_precision", "bf16")
-    accelerator = Accelerator(mixed_precision=training_precision)
+    accelerator = Accelerator(
+        mixed_precision=training_precision,
+        deepspeed_plugin=deepspeed_plugin,
+    )
     logger.info("Accelerator initialized with mixed_precision=%s", training_precision)
 
     # Get the model from sampler context
@@ -402,7 +435,7 @@ def _run_tool_on_policy_stream_accelerate(
         eps=1e-8,
     )
 
-    # LR scheduler: cosine with warmup
+    # LR scheduler: cosine with warmup ratio
     total_training_steps = max(total_batches, 1)
     warmup_ratio = float(getattr(options, "warmup_ratio", 0.1) or 0.0)
     warmup_steps = int(total_training_steps * warmup_ratio)
@@ -412,24 +445,25 @@ def _run_tool_on_policy_stream_accelerate(
         num_warmup_steps=warmup_steps,
         num_training_steps=total_training_steps,
     )
-    logger.info(
-        "LR scheduler: cosine with %d warmup steps out of %d total",
-        warmup_steps, total_training_steps,
-    )
 
     # Prepare with accelerator
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
 
-    # Load teacher model using Fireworks API
+    # Load teacher model using API
     fireworks_model = getattr(options, "fireworks_model", None)
     if not fireworks_model:
         raise ValueError("fireworks_model must be specified in options")
     
+    teacher_base_url = getattr(options, "teacher_base_url", "http://10.234.201.144:8000/v1")
+    teacher_api_key = getattr(options, "teacher_api_key", None)
+    
     teacher_ctx = FireworksTeacherContext(
         model_name=options.teacher,
         fireworks_model=fireworks_model,
+        base_url=teacher_base_url,
+        api_key=teacher_api_key,
     )
-    logger.info("Using Fireworks API for teacher: %s", fireworks_model)
+    logger.info("Using teacher API: %s at %s", fireworks_model, teacher_base_url)
 
     training_dir = workspace / "training"
     training_dir.mkdir(parents=True, exist_ok=True)
@@ -532,60 +566,16 @@ def _run_tool_on_policy_stream_accelerate(
             # Check if this is a combined multi-turn item
             combined_turns = turn.get("_combined_turns")
             if combined_turns:
-                # Compute teacher alignment for each turn separately and combine
-                kl_adjustments_combined = [0.0] * len(token_ids)
-                kl_mask_combined = [0.0] * len(token_ids)
-                teacher_logprobs_list = []
-                teacher_token_ids_list = []
-
-                for turn_info in combined_turns:
-                    turn_messages = turn_info["messages"]
-                    turn_assistant_raw_text = turn_info.get("assistant_raw_text")
-                    completion_start = turn_info["completion_start"]
-                    completion_end = turn_info["completion_end"]
-
-                    if not turn_assistant_raw_text:
-                        continue
-
-                    # Create a reward mask for just this turn's completion
-                    turn_reward_mask = [0] * len(token_ids)
-                    for idx in range(completion_start, completion_end):
-                        if idx < len(turn_reward_mask):
-                            turn_reward_mask[idx] = 1
-
-                    # Compute teacher alignment for this turn
-                    turn_alignment = _compute_teacher_alignment(
-                        messages=turn_messages,
-                        tools=tool_defs,
-                        student_token_ids=token_ids,
-                        student_logprobs=student_logprobs,
-                        reward_mask=turn_reward_mask,
-                        assistant_raw_text=turn_assistant_raw_text,
-                    )
-
-                    # Extract KL adjustments and mask for this turn's region
-                    turn_kl_adj = turn_alignment.get("kl_adjustments") or [0.0] * len(token_ids)
-                    turn_kl_mask = turn_alignment.get("kl_mask") or [0.0] * len(token_ids)
-
-                    # Combine into the full sequence
-                    for idx in range(completion_start, completion_end):
-                        if idx < len(kl_adjustments_combined):
-                            kl_adjustments_combined[idx] = turn_kl_adj[idx]
-                            if idx < len(turn_kl_mask):
-                                kl_mask_combined[idx] = turn_kl_mask[idx]
-
-                    # Collect teacher logprobs and token_ids
-                    if turn_alignment.get("teacher_logprobs"):
-                        teacher_logprobs_list = turn_alignment.get("teacher_logprobs")
-                    if turn_alignment.get("teacher_token_ids"):
-                        teacher_token_ids_list = turn_alignment.get("teacher_token_ids")
-
-                teacher_alignment = {
-                    "kl_adjustments": kl_adjustments_combined,
-                    "kl_mask": kl_mask_combined,
-                    "teacher_logprobs": teacher_logprobs_list,
-                    "teacher_token_ids": teacher_token_ids_list,
-                }
+                # Use single API call for entire trajectory instead of per-turn calls
+                teacher_alignment = teacher_ctx.compute_teacher_alignment_full_trajectory(
+                    full_messages=messages,
+                    combined_turns=combined_turns,
+                    tools=tool_defs,
+                    student_model=job.model.name,
+                    student_token_ids=token_ids,
+                    student_logprobs=student_logprobs,
+                    reward_mask=reward_mask,
+                )
             else:
                 # Single turn - compute teacher alignment normally
                 teacher_alignment = _compute_teacher_alignment(
@@ -703,6 +693,16 @@ def _run_tool_on_policy_stream_accelerate(
         # Backward pass
         optimizer.zero_grad()
         accelerator.backward(total_loss)
+        
+        # Compute gradient norm before clipping
+        grad_norm = accelerator.clip_grad_norm_(model.parameters(), float('inf'))
+        batch_metrics["grad_norm"] = grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm)
+        
+        # Gradient clipping
+        max_grad_norm = getattr(options, "max_grad_norm", 1.0)
+        if max_grad_norm > 0:
+            accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+        
         optimizer.step()
         scheduler.step()
 
@@ -745,8 +745,48 @@ def _run_tool_on_policy_stream_accelerate(
             mininterval=0.5,  # Update at least every 0.5 seconds
         )
 
+        # Log initial state to wandb at step 0
+        if wandb_run:
+            wandb_run.log({
+                "done_frac": 0.0,
+                "token_cum": 0,
+            }, step=0)
+
         for batch_index, trajectories in enumerate(rollout_stream):
             batch_start = time.time()
+            
+            # Clean up Docker images and cache asynchronously from previous batch
+            # This runs in parallel with training so it doesn't block
+            if batch_index > 0:  # Skip on first batch (nothing to clean up yet)
+                def _async_docker_cleanup(batch_idx):
+                    try:
+                        import subprocess
+                        # Remove stopped containers
+                        subprocess.run(
+                            ["docker", "container", "prune", "-f"],
+                            capture_output=True,
+                            timeout=30,
+                        )
+                        # Remove unused images
+                        subprocess.run(
+                            ["docker", "image", "prune", "-af"],
+                            capture_output=True,
+                            timeout=60,
+                        )
+                        # Remove build cache
+                        subprocess.run(
+                            ["docker", "builder", "prune", "-af"],
+                            capture_output=True,
+                            timeout=30,
+                        )
+                        logger.debug("Docker cleanup completed for batch %d", batch_idx)
+                    except Exception as e:
+                        logger.debug("Docker cleanup failed (non-fatal): %s", e)
+                
+                # Run cleanup in background thread while training proceeds
+                cleanup_thread = threading.Thread(target=_async_docker_cleanup, args=(batch_index - 1,), daemon=True)
+                cleanup_thread.start()
+            
             batch_items, batch_metrics = _process_batch(batch_index, trajectories)
             batch_time = time.time() - batch_start
             global_step += 1
@@ -781,11 +821,16 @@ def _run_tool_on_policy_stream_accelerate(
 
             # Log to wandb
             if wandb_run:
+                current_lr = (
+                    scheduler.get_last_lr()[0]
+                    if 'scheduler' in locals() and scheduler is not None
+                    else options.learning_rate
+                )
                 log_data = {
                     "progress/done_frac": (batch_index + 1) / total_batches
                     if total_batches > 0
                     else 1.0,
-                    "optim/lr": options.learning_rate,
+                    "optim/lr": current_lr,
                     "rollouts": len(trajectories),
                     "time / total_seconds": batch_time,
                     "time / per_turn_seconds": batch_time / len(trajectories),
@@ -797,6 +842,8 @@ def _run_tool_on_policy_stream_accelerate(
                     log_data["token_budget"] = token_budget
                 if batch_metrics.get("loss") is not None:
                     log_data["loss"] = batch_metrics["loss"]
+                if batch_metrics.get("grad_norm") is not None:
+                    log_data["grad_norm"] = batch_metrics["grad_norm"]
                 if batch_metrics["kl_count"] > 0:
                     log_data["kl_mean"] = batch_metrics["kl_sum"] / batch_metrics["kl_count"]
                 if batch_metrics["advantage_count"] > 0:
@@ -851,6 +898,19 @@ def _run_tool_on_policy_stream_accelerate(
                         code="tool_on_policy_accelerate.sampler_refreshed",
                         data={"batch_index": batch_index, "sampler_path": sampler_path},
                     )
+        
+        # Final Docker cleanup for last batch
+        def _async_docker_cleanup_final():
+            try:
+                import subprocess
+                subprocess.run(["docker", "container", "prune", "-f"], capture_output=True, timeout=30)
+                subprocess.run(["docker", "image", "prune", "-af"], capture_output=True, timeout=60)
+                subprocess.run(["docker", "builder", "prune", "-af"], capture_output=True, timeout=30)
+                logger.debug("Final Docker cleanup completed")
+            except Exception as e:
+                logger.debug("Final Docker cleanup failed (non-fatal): %s", e)
+        cleanup_thread = threading.Thread(target=_async_docker_cleanup_final, daemon=True)
+        cleanup_thread.start()
         
         train_pbar.close()
         logger.info("Training loop complete: total_batches=%d total_tokens=%d", total_batches, token_cum)
@@ -947,6 +1007,9 @@ def _run_tool_on_policy_vllm_accelerate(
         vllm_gpu_ids,
     )
 
+    # Save original CUDA_VISIBLE_DEVICES to restore if needed
+    original_cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+
     # CRITICAL: Ensure CUDA is not initialized before starting vLLM subprocess.
     # vLLM workers need a clean CUDA context. If torch has already initialized
     # CUDA, the subprocess workers may inherit corrupted state.
@@ -976,9 +1039,52 @@ def _run_tool_on_policy_vllm_accelerate(
             os.environ["CUDA_VISIBLE_DEVICES"],
         )
 
-        # Initialize Accelerator
+        # Initialize DeepSpeed plugin if enabled
+        use_deepspeed = getattr(options, "use_deepspeed", False)
+        deepspeed_plugin = None
+        
+        if use_deepspeed:
+            deepspeed_config_path = getattr(options, "deepspeed_config_path", None)
+            if deepspeed_config_path and Path(deepspeed_config_path).exists():
+                # Load DeepSpeed config from file
+                import json
+                with open(deepspeed_config_path) as f:
+                    ds_config = json.load(f)
+                
+                zero_stage = ds_config.get("zero_optimization", {}).get("stage", 2)
+                deepspeed_plugin = DeepSpeedPlugin(
+                    hf_ds_config=ds_config,
+                    zero3_init_flag=zero_stage == 3,
+                )
+                logger.info(
+                    "Using DeepSpeed config from file: %s (ZeRO stage %d)",
+                    deepspeed_config_path,
+                    zero_stage,
+                )
+            else:
+                # Create DeepSpeed plugin programmatically
+                zero_stage = getattr(options, "deepspeed_zero_stage", 2)
+                offload_optimizer = getattr(options, "deepspeed_offload_optimizer", False)
+                offload_param = getattr(options, "deepspeed_offload_param", False)
+                
+                deepspeed_plugin = DeepSpeedPlugin(
+                    zero_stage=zero_stage,
+                    offload_optimizer_device="cpu" if offload_optimizer else None,
+                    offload_param_device="cpu" if offload_param else None,
+                )
+                logger.info(
+                    "Using DeepSpeed ZeRO stage %d (optimizer offload: %s, param offload: %s)",
+                    zero_stage,
+                    offload_optimizer,
+                    offload_param,
+                )
+
+        # Initialize Accelerator with DeepSpeed
         training_precision = getattr(options, "training_precision", "bf16")
-        accelerator = Accelerator(mixed_precision=training_precision)
+        accelerator = Accelerator(
+            mixed_precision=training_precision,
+            deepspeed_plugin=deepspeed_plugin,
+        )
         logger.info("Accelerator initialized with mixed_precision=%s", training_precision)
 
         # Delay loading training model until first batch (for testing inference speed)
@@ -993,7 +1099,7 @@ def _run_tool_on_policy_vllm_accelerate(
         training_model_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
         def _load_training_model():
-            nonlocal model, tokenizer, optimizer, scheduler, training_model_loaded
+            nonlocal model, tokenizer, optimizer, training_model_loaded
             with training_model_lock:
                 if training_model_loaded:
                     return
@@ -1008,24 +1114,24 @@ def _run_tool_on_policy_vllm_accelerate(
                 file=sys.stderr,
                 leave=True,
             )
+            # When using DeepSpeed, don't use device_map (Accelerate/DeepSpeed will handle device placement)
+            # For ZeRO-3, load on CPU first (DeepSpeed will shard during prepare)
+            if use_deepspeed:
+                zero_stage = getattr(options, "deepspeed_zero_stage", 2)
+                if zero_stage == 3:
+                    device_map = "cpu"  # ZeRO-3 needs CPU loading
+                else:
+                    device_map = None  # ZeRO-1/2: let Accelerate/DeepSpeed handle device placement
+            else:
+                device_map = "auto"  # No DeepSpeed: use auto device mapping
 
             phase_start = time.time()
-
-            # Determine torch dtype based on training precision
-            training_precision = getattr(options, "training_precision", "bf16")
-            if training_precision == "fp32":
-                model_dtype = torch.float32
-            elif training_precision == "fp16":
-                model_dtype = torch.float16
-            else:  # bf16 or anything else
-                model_dtype = torch.bfloat16
-            logger.info("Loading model with dtype %s (training_precision=%s)", model_dtype, training_precision)
 
             model, tokenizer = load_model_with_lora(
                 model_name=student_model,
                 lora_rank=options.lora_rank,
                 checkpoint_path=student_checkpoint,
-                torch_dtype=model_dtype,
+                device_map=device_map,
             )
             pbar.update(1)
             logger.info("Training model weights loaded in %.2fs", time.time() - phase_start)
@@ -1038,31 +1144,29 @@ def _run_tool_on_policy_vllm_accelerate(
                 betas=(0.9, 0.95),
                 eps=1e-8,
             )
-            
-            # LR scheduler: cosine with warmup
+
             total_training_steps = max(total_batches, 1)
             warmup_ratio = float(getattr(options, "warmup_ratio", 0.1) or 0.0)
             warmup_steps = int(total_training_steps * warmup_ratio)
-            scheduler = get_scheduler(
+            scheduler_local = get_scheduler(
                 name="cosine",
                 optimizer=optimizer,
                 num_warmup_steps=warmup_steps,
                 num_training_steps=total_training_steps,
-            )
-            logger.info(
-                "LR scheduler: cosine with %d warmup steps out of %d total",
-                warmup_steps, total_training_steps,
             )
             pbar.update(1)
             logger.info("Training optimizer created in %.2fs", time.time() - phase_start)
 
             # Prepare with accelerator
             phase_start = time.time()
-            model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
+            model, optimizer, scheduler_prepared = accelerator.prepare(model, optimizer, scheduler_local)
             pbar.update(1)
             logger.info("Accelerator prepare completed in %.2fs", time.time() - phase_start)
             pbar.close()
 
+            scheduler_local = None
+            nonlocal scheduler
+            scheduler = scheduler_prepared
             training_model_loaded = True
             logger.info("Training model loaded and prepared in %.2fs", time.time() - load_start)
 
@@ -1097,15 +1201,12 @@ def _run_tool_on_policy_vllm_accelerate(
             vllm_backend=vllm_backend,
         )
 
-        # CRITICAL: Wait for training model to load and sync BEFORE collecting rollouts
-        # This ensures importance ratio starts at ~1.0 (same model for sampling and training)
-        logger.info("Waiting for training model to load before collecting rollouts...")
-        _ensure_training_model_loaded()
-        synchronizer.force_sync(model, accelerator, step=0)
-        initial_lora_name = synchronizer.get_lora_name()
-        logger.info("Initial weight sync completed. LoRA adapter loaded: %s", initial_lora_name)
+        # Skip initial sync - will sync after first batch when model is loaded
+        logger.info("Skipping initial weight sync (model not loaded yet). Will sync after first batch.")
 
-        # Create rollout collector with the synced LoRA adapter
+        # Create rollout collector
+        # Note: lora_name will be None initially (no LoRA adapter loaded yet)
+        # vLLM will work without LoRA for initial rollouts
         rollout_workers = getattr(options, "rollout_workers", 8)
         collector = VLLMRolloutCollector(
             vllm_base_url=vllm_backend.base_url,
@@ -1118,21 +1219,26 @@ def _run_tool_on_policy_vllm_accelerate(
             max_tool_turns=max(1, job.generation.max_tool_turns or 16),
             max_tokens=job.generation.parameters.get("max_tokens", 4096),
             temperature=job.generation.parameters.get("temperature", 1.0),
-            lora_name=initial_lora_name,  # Use synced LoRA from the start
+            lora_name=None,  # Will be set after first batch when model is loaded
             runtime_factory=runtime_factory,
             verbose=verbose_turns,
         )
 
-        # Load teacher model using Fireworks API
+        # Load teacher model using API
         fireworks_model = getattr(options, "fireworks_model", None)
         if not fireworks_model:
             raise ValueError("fireworks_model must be specified in options")
         
+        teacher_base_url = getattr(options, "teacher_base_url", "http://10.234.201.144:8000/v1")
+        teacher_api_key = getattr(options, "teacher_api_key", None)
+        
         teacher_ctx = FireworksTeacherContext(
             model_name=options.teacher,
             fireworks_model=fireworks_model,
+            base_url=teacher_base_url,
+            api_key=teacher_api_key,
         )
-        logger.info("Using Fireworks API for teacher: %s", fireworks_model)
+        logger.info("Using teacher API: %s at %s", fireworks_model, teacher_base_url)
 
         # Initialize wandb
         wandb_project = getattr(options, "wandb_project", None)
@@ -1187,19 +1293,49 @@ def _run_tool_on_policy_vllm_accelerate(
             reward_mask,
             assistant_raw_text,
         ):
-            return teacher_ctx.compute_teacher_alignment(
-                messages=messages,
-                tools=tools,
-                student_model=student_model,
-                student_token_ids=student_token_ids,
-                student_logprobs=student_logprobs,
-                reward_mask=reward_mask,
-                assistant_raw_text=assistant_raw_text,
-            )
+            # Debug: validate inputs before calling
+            try:
+                if not isinstance(messages, (list, tuple)):
+                    logger.error("messages is not a list: type=%s", type(messages))
+                    return {"kl_adjustments": [0.0] * len(student_token_ids), "kl_mask": [0.0] * len(student_token_ids)}
+                
+                for i, msg in enumerate(messages):
+                    if not isinstance(msg, dict):
+                        logger.error("Message %d is not a dict: type=%s, value=%s", i, type(msg), str(msg)[:200])
+                        return {"kl_adjustments": [0.0] * len(student_token_ids), "kl_mask": [0.0] * len(student_token_ids)}
+                
+                return teacher_ctx.compute_teacher_alignment(
+                    messages=messages,
+                    tools=tools,
+                    student_model=student_model,
+                    student_token_ids=student_token_ids,
+                    student_logprobs=student_logprobs,
+                    reward_mask=reward_mask,
+                    assistant_raw_text=assistant_raw_text,
+                )
+            except TypeError as e:
+                # Log detailed info about the inputs when TypeError occurs
+                logger.error("TypeError in compute_teacher_alignment: %s", e)
+                logger.error("  messages type: %s, len: %d", type(messages), len(messages) if hasattr(messages, '__len__') else 'N/A')
+                if messages:
+                    logger.error("  first message: %s", str(messages[0])[:500])
+                    logger.error("  last message: %s", str(messages[-1])[:500])
+                logger.error("  tools type: %s", type(tools))
+                logger.error("  assistant_raw_text type: %s, len: %d", type(assistant_raw_text), len(assistant_raw_text) if assistant_raw_text else 0)
+                raise
 
         def _process_batch(
             batch_index: int, trajectories: List[Dict[str, Any]]
         ) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
+            # Load training model lazily on first batch
+            _ensure_training_model_loaded()
+            
+            # Do initial weight sync on first batch (if not done yet)
+            if batch_index == 0:
+                synchronizer.force_sync(model, accelerator, step=0)
+                # Update collector to use the LoRA adapter after sync
+                collector.lora_name = synchronizer.get_lora_name()
+                logger.info("Initial weight sync completed after first batch. LoRA adapter loaded: %s", collector.lora_name)
             """Process a batch of trajectories and perform a training step."""
             
             items = []
@@ -1219,128 +1355,94 @@ def _run_tool_on_policy_vllm_accelerate(
             all_advantages = []
             all_loss_masks = []
 
-            # Collect all teacher alignment calls for parallelization
+            # Compute teacher alignment - use single API call per trajectory
             from concurrent.futures import as_completed
             
-            alignment_tasks = []
+            # Build alignment tasks - one per trajectory (not per turn)
+            alignment_futures = {}
+            trajectory_data = []  # Store turn data for later processing
+            
             for turn_index, turn in enumerate(trajectories):
                 messages = turn["messages"]
                 token_ids = turn["token_ids"]
                 logprobs = turn["logprobs"]
                 reward_mask = turn["reward_mask"]
                 student_logprobs = torch.tensor(logprobs, dtype=torch.float32, device=device)
+                
+                trajectory_data.append({
+                    "turn_index": turn_index,
+                    "turn": turn,
+                    "messages": messages,
+                    "token_ids": token_ids,
+                    "student_logprobs": student_logprobs,
+                    "reward_mask": reward_mask,
+                })
 
                 # Check if this is a combined multi-turn item
                 combined_turns = turn.get("_combined_turns")
                 if combined_turns:
-                    for turn_info in combined_turns:
-                        turn_messages = turn_info["messages"]
-                        turn_assistant_raw_text = turn_info.get("assistant_raw_text")
-                        if not turn_assistant_raw_text:
-                            continue
-                        
-                        turn_reward_mask = [0] * len(token_ids)
-                        completion_start = turn_info["completion_start"]
-                        completion_end = turn_info["completion_end"]
-                        for idx in range(completion_start, completion_end):
-                            if idx < len(turn_reward_mask):
-                                turn_reward_mask[idx] = 1
-                        
-                        alignment_tasks.append({
-                            "turn_index": turn_index,
-                            "turn": turn,
-                            "turn_info": turn_info,
-                            "messages": turn_messages,
-                            "token_ids": token_ids,
-                            "student_logprobs": student_logprobs,
-                            "reward_mask": turn_reward_mask,
-                            "assistant_raw_text": turn_assistant_raw_text,
-                        })
+                    # Use single API call for entire multi-turn trajectory
+                    future = teacher_ctx._executor.submit(
+                        teacher_ctx.compute_teacher_alignment_full_trajectory,
+                        full_messages=messages,
+                        combined_turns=combined_turns,
+                        tools=tool_defs,
+                        student_model=student_model,
+                        student_token_ids=token_ids,
+                        student_logprobs=student_logprobs,
+                        reward_mask=reward_mask,
+                    )
+                    alignment_futures[future] = {"turn_index": turn_index, "type": "multi"}
                 else:
-                    alignment_tasks.append({
-                        "turn_index": turn_index,
-                        "turn": turn,
-                        "turn_info": None,
-                        "messages": messages,
-                        "token_ids": token_ids,
-                        "student_logprobs": student_logprobs,
-                        "reward_mask": reward_mask,
-                        "assistant_raw_text": turn.get("assistant_raw_text"),
-                    })
+                    # Single turn - use regular alignment
+                    future = teacher_ctx._executor.submit(
+                        _compute_teacher_alignment,
+                        messages=messages,
+                        tools=tool_defs,
+                        student_token_ids=token_ids,
+                        student_logprobs=student_logprobs,
+                        reward_mask=reward_mask,
+                        assistant_raw_text=turn.get("assistant_raw_text"),
+                    )
+                    alignment_futures[future] = {"turn_index": turn_index, "type": "single"}
             
-            # Submit all tasks in parallel
-            futures = {}
-            for task in alignment_tasks:
-                future = teacher_ctx._executor.submit(
-                    _compute_teacher_alignment,
-                    messages=task["messages"],
-                    tools=tool_defs,
-                    student_token_ids=task["token_ids"],
-                    student_logprobs=task["student_logprobs"],
-                    reward_mask=task["reward_mask"],
-                    assistant_raw_text=task["assistant_raw_text"],
-                )
-                futures[future] = task
-            
-            # Collect results
+            # Collect alignment results
             alignment_results = {}
-            for future in as_completed(futures):
-                task = futures[future]
-                turn_idx = task["turn_index"]
+            for future in as_completed(alignment_futures):
+                meta = alignment_futures[future]
+                turn_idx = meta["turn_index"]
+                token_ids = trajectory_data[turn_idx]["token_ids"]
                 
                 try:
                     alignment = future.result()
+                    if not isinstance(alignment, dict):
+                        logger.error("Teacher alignment returned non-dict type: %s", type(alignment))
+                        alignment = {
+                            "kl_adjustments": [0.0] * len(token_ids),
+                            "kl_mask": [0.0] * len(token_ids),
+                        }
+                    elif "kl_adjustments" not in alignment:
+                        logger.warning("Teacher alignment missing kl_adjustments key, got keys: %s", list(alignment.keys()))
+                        alignment["kl_adjustments"] = [0.0] * len(token_ids)
+                        alignment["kl_mask"] = alignment.get("kl_mask", [0.0] * len(token_ids))
                 except Exception as e:
-                    logger.error(f"Error in parallel teacher alignment: {e}")
+                    logger.error("Error in parallel teacher alignment: %s (type: %s)", str(e), type(e).__name__)
                     alignment = {
-                        "kl_adjustments": [0.0] * len(task["token_ids"]),
-                        "kl_mask": [0.0] * len(task["token_ids"]),
+                        "kl_adjustments": [0.0] * len(token_ids),
+                        "kl_mask": [0.0] * len(token_ids),
                     }
                 
-                if turn_idx not in alignment_results:
-                    alignment_results[turn_idx] = []
-                alignment_results[turn_idx].append({
-                    "task": task,
-                    "alignment": alignment,
-                })
+                alignment_results[turn_idx] = alignment
             
             # Process trajectories with alignment results
-            for turn_index, turn in enumerate(trajectories):
-                messages = turn["messages"]
-                token_ids = turn["token_ids"]
-                logprobs = turn["logprobs"]
-                reward_mask = turn["reward_mask"]
-                student_logprobs = torch.tensor(logprobs, dtype=torch.float32, device=device)
+            for traj_data in trajectory_data:
+                turn_index = traj_data["turn_index"]
+                turn = traj_data["turn"]
+                token_ids = traj_data["token_ids"]
+                reward_mask = traj_data["reward_mask"]
+                student_logprobs = traj_data["student_logprobs"]
                 
-                # Use pre-computed alignment results
-                results = alignment_results[turn_index]
-                combined_turns = turn.get("_combined_turns")
-                if combined_turns:
-                    kl_adjustments_combined = [0.0] * len(token_ids)
-                    kl_mask_combined = [0.0] * len(token_ids)
-                    
-                    for result in results:
-                        task = result["task"]
-                        alignment = result["alignment"]
-                        turn_info = task["turn_info"]
-                        completion_start = turn_info["completion_start"]
-                        completion_end = turn_info["completion_end"]
-                        
-                        turn_kl_adj = alignment.get("kl_adjustments") or [0.0] * len(token_ids)
-                        turn_kl_mask = alignment.get("kl_mask") or [0.0] * len(token_ids)
-                        
-                        for idx in range(completion_start, completion_end):
-                            if idx < len(kl_adjustments_combined):
-                                kl_adjustments_combined[idx] = turn_kl_adj[idx]
-                                if idx < len(turn_kl_mask):
-                                    kl_mask_combined[idx] = turn_kl_mask[idx]
-                    
-                    teacher_alignment = {
-                        "kl_adjustments": kl_adjustments_combined,
-                        "kl_mask": kl_mask_combined,
-                    }
-                else:
-                    teacher_alignment = results[0]["alignment"]
+                teacher_alignment = alignment_results[turn_index]
 
                 item = dict(turn)
                 item.update({
@@ -1373,7 +1475,22 @@ def _run_tool_on_policy_vllm_accelerate(
 
                 target_tensor = torch.tensor(target_tokens, dtype=torch.long, device=device)
                 mask_tensor = torch.tensor(mask_tokens, dtype=torch.float32, device=device)
-                advantages_tokens = advantages_tokens * mask_tensor
+                try:
+                    advantages_tokens = advantages_tokens * mask_tensor
+                except Exception as e:
+                    import pickle
+                    with open("tensor_mismatch.pkl", "wb") as f:
+                        debug_save = {
+                            "token_ids": token_ids,
+                            "advantage": advantage,
+                            "kl_discount": kl_discount,
+                            "reward_mask": reward_mask,
+                            "mask_tokens": mask_tokens,
+                            "advantages_tokens": advantages_tokens.tolist(),
+                            "mask_tensor": mask_tensor.tolist(),
+                        }
+                        pickle.dump(debug_save, f)
+                    raise e
 
                 all_input_ids.append(torch.tensor(input_tokens, dtype=torch.long, device=device))
                 all_target_ids.append(target_tensor)
@@ -1410,10 +1527,17 @@ def _run_tool_on_policy_vllm_accelerate(
                     )
 
             # Perform training step with clipped importance sampling and gradient accumulation
+            # Use parallel forward passes across sequences (no padding - each sequence processed independently)
             num_trajectories = len(all_input_ids)
             gradient_accumulation_steps = getattr(options, "gradient_accumulation_steps", 1)
             if gradient_accumulation_steps is None or gradient_accumulation_steps <= 0:
                 gradient_accumulation_steps = num_trajectories  # Process all at once if not set
+            
+            # Number of parallel forward passes (limited by GPU memory)
+            # Each forward pass is independent, so we can overlap them with CUDA streams
+            parallel_forwards = getattr(options, "parallel_forwards", 4)
+            if parallel_forwards is None or parallel_forwards <= 0:
+                parallel_forwards = 1
             
             # Zero gradients at start
             optimizer.zero_grad()
@@ -1429,40 +1553,81 @@ def _run_tool_on_policy_vllm_accelerate(
                 chunk_loss = torch.tensor(0.0, device=device, requires_grad=True)
                 chunk_clip_frac = 0.0
                 
-                for idx in range(chunk_start, chunk_end):
-                    input_ids = all_input_ids[idx].unsqueeze(0)
-                    target_ids = all_target_ids[idx].unsqueeze(0)
-                    sampling_lp = all_sampling_logprobs[idx].unsqueeze(0)
-                    advantages = all_advantages[idx].unsqueeze(0)
-                    loss_mask = all_loss_masks[idx].unsqueeze(0)
-
-                    loss, _, metrics = importance_sampling_loss_with_clip(
-                        model=model,
-                        input_ids=input_ids,
-                        target_ids=target_ids,
-                        sampling_logprobs=sampling_lp,
-                        advantages=advantages,
-                        loss_mask=loss_mask,
-                        clip_ratio=clip_ratio,
-                    )
-                    chunk_loss = chunk_loss + loss
-                    chunk_clip_frac += metrics["clip_fraction"]
+                # Process sequences in parallel batches within the chunk
+                for parallel_start in range(chunk_start, chunk_end, parallel_forwards):
+                    parallel_end = min(parallel_start + parallel_forwards, chunk_end)
+                    parallel_size = parallel_end - parallel_start
                     
-                    # Clear intermediate tensors after each sequence
-                    del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss
-                    torch.cuda.empty_cache()
-                    gc.collect()
+                    if parallel_size == 1:
+                        # Single sequence - no parallelism needed
+                        idx = parallel_start
+                        input_ids = all_input_ids[idx].unsqueeze(0)
+                        target_ids = all_target_ids[idx].unsqueeze(0)
+                        sampling_lp = all_sampling_logprobs[idx].unsqueeze(0)
+                        advantages = all_advantages[idx].unsqueeze(0)
+                        loss_mask = all_loss_masks[idx].unsqueeze(0)
+
+                        loss, _, metrics = importance_sampling_loss_with_clip(
+                            model=model,
+                            input_ids=input_ids,
+                            target_ids=target_ids,
+                            sampling_logprobs=sampling_lp,
+                            advantages=advantages,
+                            loss_mask=loss_mask,
+                            clip_ratio=clip_ratio,
+                        )
+                        chunk_loss = chunk_loss + loss
+                        chunk_clip_frac += metrics["clip_fraction"]
+                        
+                        del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss
+                    else:
+                        # Multiple sequences - use CUDA streams for parallel execution
+                        # Each stream handles one forward pass independently
+                        streams = [torch.cuda.Stream(device=device) for _ in range(parallel_size)]
+                        losses = [None] * parallel_size
+                        clip_fracs = [0.0] * parallel_size
+                        
+                        # Launch forward passes in parallel streams
+                        for i, idx in enumerate(range(parallel_start, parallel_end)):
+                            with torch.cuda.stream(streams[i]):
+                                input_ids = all_input_ids[idx].unsqueeze(0)
+                                target_ids = all_target_ids[idx].unsqueeze(0)
+                                sampling_lp = all_sampling_logprobs[idx].unsqueeze(0)
+                                advantages = all_advantages[idx].unsqueeze(0)
+                                loss_mask = all_loss_masks[idx].unsqueeze(0)
+
+                                loss, _, metrics = importance_sampling_loss_with_clip(
+                                    model=model,
+                                    input_ids=input_ids,
+                                    target_ids=target_ids,
+                                    sampling_logprobs=sampling_lp,
+                                    advantages=advantages,
+                                    loss_mask=loss_mask,
+                                    clip_ratio=clip_ratio,
+                                )
+                                losses[i] = loss
+                                clip_fracs[i] = metrics["clip_fraction"]
+                                
+                                del input_ids, target_ids, sampling_lp, advantages, loss_mask
+                        
+                        # Synchronize all streams before aggregating
+                        torch.cuda.current_stream(device).wait_stream(streams[-1])
+                        for stream in streams:
+                            torch.cuda.current_stream(device).wait_stream(stream)
+                        
+                        # Aggregate losses
+                        for i in range(parallel_size):
+                            if losses[i] is not None:
+                                chunk_loss = chunk_loss + losses[i]
+                                chunk_clip_frac += clip_fracs[i]
+                        
+                        del streams, losses, clip_fracs
                 
                 # Average chunk loss and scale by number of chunks
                 chunk_loss = chunk_loss / chunk_size
                 num_chunks = (num_trajectories + gradient_accumulation_steps - 1) // gradient_accumulation_steps
                 chunk_loss = chunk_loss / num_chunks
                 
-                # Guard against NaN/Inf loss before backward
-                if not torch.isfinite(chunk_loss):
-                    logger.error("NaN/Inf loss detected at batch %d, aborting", batch_index)
-                    sys.exit(1)
-
                 # Backward on chunk (gradients accumulate)
                 accelerator.backward(chunk_loss)
                 accumulated_loss_value += chunk_loss.item() * chunk_size
@@ -1472,23 +1637,18 @@ def _run_tool_on_policy_vllm_accelerate(
                 torch.cuda.empty_cache()
                 gc.collect()
             
-            # Step optimizer once after all chunks (with gradient clipping for stability)
-            max_grad_norm = float(getattr(options, "max_grad_norm", 1.0))
+            # Compute gradient norm before clipping
+            grad_norm = accelerator.clip_grad_norm_(model.parameters(), float('inf'))
+            batch_metrics["grad_norm"] = grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm)
             
-            # Check for NaN gradients before stepping (they would corrupt weights)
-            has_nan_grad = False
-            for name, param in model.named_parameters():
-                if param.grad is not None and not torch.isfinite(param.grad).all():
-                    has_nan_grad = True
-                    logger.error("NaN gradient detected in %s before optimizer step", name)
-                    break
-            
-            if has_nan_grad:
-                logger.error("Skipping optimizer step due to NaN gradients")
-                optimizer.zero_grad()  # Clear the bad gradients
-            else:
+            # Gradient clipping
+            max_grad_norm = getattr(options, "max_grad_norm", 1.0)
+            if max_grad_norm > 0:
                 accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
-                optimizer.step()
+            
+            # Step optimizer once after all chunks
+            optimizer.step()
+            if scheduler is not None:
                 scheduler.step()
             
             # Average loss for logging
@@ -1539,6 +1699,13 @@ def _run_tool_on_policy_vllm_accelerate(
             mininterval=0.5,  # Update at least every 0.5 seconds
         )
 
+        # Log initial state to wandb at step 0
+        if wandb_run:
+            wandb_run.log({
+                "done_frac": 0.0,
+                "token_cum": 0,
+            }, step=0)
+
         for batch_index, start in enumerate(range(0, len(prompt_rows), batch_size)):
             batch_start = time.time()
 
@@ -1583,17 +1750,41 @@ def _run_tool_on_policy_vllm_accelerate(
                     "total_batches": total_batches,
                 },
             )
+            
+            # Clean up Docker images and cache asynchronously after inference, before training
+            # This runs in parallel with training so it doesn't block
+            def _async_docker_cleanup(batch_idx):
+                try:
+                    import subprocess
+                    # Remove stopped containers
+                    subprocess.run(
+                        ["docker", "container", "prune", "-f"],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    # Remove unused images
+                    subprocess.run(
+                        ["docker", "image", "prune", "-af"],
+                        capture_output=True,
+                        timeout=60,
+                    )
+                    # Remove build cache
+                    subprocess.run(
+                        ["docker", "builder", "prune", "-af"],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    logger.debug("Docker cleanup completed for batch %d", batch_idx)
+                except Exception as e:
+                    logger.debug("Docker cleanup failed (non-fatal): %s", e)
+            
+            # Run cleanup in background thread while training proceeds
+            cleanup_thread = threading.Thread(target=_async_docker_cleanup, args=(batch_index,), daemon=True)
+            cleanup_thread.start()
 
             # Process batch (training step)
             training_start = time.time()
-            try:
-                batch_items, batch_metrics = _process_batch(batch_index, trajectories)
-            except RuntimeError as e:
-                if "Non-finite loss" in str(e):
-                    logger.error("Aborting training at batch %d due to non-finite loss", batch_index)
-                    break
-                raise
-
+            batch_items, batch_metrics = _process_batch(batch_index, trajectories)
             training_time = time.time() - training_start
             batch_time = time.time() - batch_start
             global_step += 1
@@ -1631,9 +1822,14 @@ def _run_tool_on_policy_vllm_accelerate(
 
             # Log to wandb
             if wandb_run:
+                current_lr = (
+                    scheduler.get_last_lr()[0]
+                    if scheduler is not None
+                    else options.learning_rate
+                )
                 log_data = {
                     "progress/done_frac": (batch_index + 1) / total_batches if total_batches > 0 else 1.0,
-                    "optim/lr": options.learning_rate,
+                    "optim/lr": current_lr,
                     "rollouts": len(trajectories),
                     "time / total_seconds": batch_time,
                     "time / per_turn_seconds": batch_time / len(trajectories) if trajectories else 0,
@@ -1645,6 +1841,8 @@ def _run_tool_on_policy_vllm_accelerate(
                     log_data["token_budget"] = token_budget
                 if batch_metrics.get("loss") is not None:
                     log_data["loss"] = batch_metrics["loss"]
+                if batch_metrics.get("grad_norm") is not None:
+                    log_data["grad_norm"] = batch_metrics["grad_norm"]
                 if batch_metrics["kl_count"] > 0:
                     log_data["kl_mean"] = batch_metrics["kl_sum"] / batch_metrics["kl_count"]
                 if batch_metrics["advantage_count"] > 0:

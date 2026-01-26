@@ -292,15 +292,30 @@ def _student_completion_to_teacher_tokens(text: str, tokenizer: Tokenizer) -> Li
     )
 
 def _token_pieces(tokenizer: Tokenizer, token_ids: List[int]) -> List[str]:
+    """Get the string piece for each token.
+    
+    Optimized: decode each token individually instead of O(n²) cumulative decoding.
+    Uses convert_ids_to_tokens when available for speed.
+    """
+    # Fast path: use convert_ids_to_tokens if available (most tokenizers have this)
+    if hasattr(tokenizer, 'convert_ids_to_tokens'):
+        pieces = []
+        for tid in token_ids:
+            token_str = tokenizer.convert_ids_to_tokens(tid)
+            # Handle byte-level tokens (like Ġ prefix in GPT-2/Qwen)
+            if token_str is not None:
+                # Decode to get actual string representation
+                decoded = tokenizer.decode([tid], skip_special_tokens=False)
+                pieces.append(decoded)
+            else:
+                pieces.append("")
+        return pieces
+    
+    # Fallback: batch decode individual tokens (still O(n) not O(n²))
     pieces = []
-    prev = ""
-    for idx in range(len(token_ids)):
-        cur = tokenizer.decode(
-            token_ids[: idx + 1],
-            skip_special_tokens=False,
-        )
-        pieces.append(cur[len(prev):])
-        prev = cur
+    for tid in token_ids:
+        decoded = tokenizer.decode([tid], skip_special_tokens=False)
+        pieces.append(decoded)
     return pieces
 
 def _compute_groupwise_reverse_kl(
@@ -318,7 +333,7 @@ def _compute_groupwise_reverse_kl(
         teacher_tokenizer,
         teacher_token_ids,
     )
-    logger.info(
+    logger.debug(
         "GOLD alignment (post-trim): student_tokens=%d teacher_tokens=%d student_groups=%d teacher_groups=%d",
         len(student_token_ids),
         len(teacher_token_ids),
@@ -330,24 +345,6 @@ def _compute_groupwise_reverse_kl(
     mask = torch.zeros_like(base_mask)
 
     for i, (s_group, t_group) in enumerate(zip(student_groups, teacher_groups)):
-        if i < 5:
-            student_slice = student_tokenizer.decode(
-                [student_token_ids[j] for j in s_group],
-                skip_special_tokens=False,
-            )
-            teacher_slice = teacher_tokenizer.decode(
-                [teacher_token_ids[j] for j in t_group],
-                skip_special_tokens=False,
-            )
-            logger.info(
-                "GOLD group %d: student_tokens=%d teacher_tokens=%d student_text='%s', teacher_text='%s'",
-                i,
-                len(s_group),
-                len(t_group),
-                student_slice,
-                teacher_slice,
-            )
-
         teacher_indices = [idx for idx in t_group if idx < len(teacher_logprobs)]
         student_indices = [idx for idx in s_group if idx < len(student_logprobs) and base_mask[idx] > 0]
         if not teacher_indices or not student_indices:
@@ -396,19 +393,9 @@ def _build_alignment_groups(
         cur_s = []
         cur_t = []
 
-    def check_match() -> bool:
-        """Check if current groups match by comparing full decoded strings"""
-        if not cur_s or not cur_t:
-            return False
-        import unicodedata
-        s_full = unicodedata.normalize('NFC', 
-            student_tokenizer.decode([student_token_ids[idx] for idx in cur_s], skip_special_tokens=False))
-        t_full = unicodedata.normalize('NFC',
-            teacher_tokenizer.decode([teacher_token_ids[idx] for idx in cur_t], skip_special_tokens=False))
-        return s_full == t_full and s_full
-
     while i < len(student_pieces) or j < len(teacher_pieces):
-        if check_match():
+        # Check match inline for speed (avoid function call overhead)
+        if cur_s and cur_t and s_buf == t_buf and s_buf:
             flush()
             continue
         
@@ -426,7 +413,8 @@ def _build_alignment_groups(
         
         break
 
-    if check_match():
+    # Final check
+    if cur_s and cur_t and s_buf == t_buf and s_buf:
         flush()
 
     return student_groups, teacher_groups

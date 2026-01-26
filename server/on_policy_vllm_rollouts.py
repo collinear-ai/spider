@@ -216,12 +216,21 @@ class VLLMRolloutCollector:
                 except Exception as exc:
                     if self._is_context_window_error(exc):
                         logger.warning(
-                            "Prompt=`%s...` turn=%d exceeded context window; ending trajectory.",
+                            "Prompt=`%s...` turn=%d exceeded context window; ending trajectory with %d turns.",
                             prompt[:20],
                             turn_idx,
+                            len(turn_items),
                         )
-                        break
-                    raise
+                    else:
+                        # vLLM inference error - keep previous turns instead of discarding
+                        logger.warning(
+                            "Prompt=`%s...` turn=%d vLLM inference error: %s; keeping %d previous turns.",
+                            prompt[:20],
+                            turn_idx,
+                            str(exc)[:100],
+                            len(turn_items),
+                        )
+                    break
 
                 content = response["content"]
                 reasoning = response.get("reasoning")
@@ -291,17 +300,28 @@ class VLLMRolloutCollector:
                     break
 
                 # Execute tool calls (measure time to identify slow tools)
-                tool_exec_start = time.time()
-                self._execute_tool_calls(tool_calls, history)
-                tool_exec_time = time.time() - tool_exec_start
-                if tool_exec_time > 1.0:  # Log if tool execution takes > 1 second
+                try:
+                    tool_exec_start = time.time()
+                    self._execute_tool_calls(tool_calls, history)
+                    tool_exec_time = time.time() - tool_exec_start
+                except Exception as exc:
+                    # Tool execution error - keep previous turns
                     logger.warning(
-                        "Slow tool execution: prompt=`%s...` turn=%d tool_time=%.2fs num_tools=%d",
+                        "Prompt=`%s...` turn=%d tool execution error: %s; keeping %d turns.",
                         prompt[:20],
                         turn_idx,
-                        tool_exec_time,
-                        len(tool_calls),
+                        str(exc)[:100],
+                        len(turn_items),
                     )
+                    break
+                # if tool_exec_time > 1.0:  # Log if tool execution takes > 1 second
+                    # logger.warning(
+                    #     "Slow tool execution: prompt=`%s...` turn=%d tool_time=%.2fs num_tools=%d",
+                    #     prompt[:20],
+                    #     turn_idx,
+                    #     tool_exec_time,
+                    #     len(tool_calls),
+                    # )
         finally:
             if runtime is not None:
                 runtime.cleanup()
@@ -321,7 +341,7 @@ class VLLMRolloutCollector:
             # Create per-thread client with same configuration
             self._thread_local.client = httpx.Client(
                 base_url=self.vllm_base_url,
-                timeout=httpx.Timeout(480.0, connect=60.0),
+                timeout=httpx.Timeout(200.0, connect=60.0),
                 limits=httpx.Limits(
                     max_keepalive_connections=50,  # Per-thread connection pool
                     max_connections=100,  # Per-thread max connections
@@ -346,7 +366,7 @@ class VLLMRolloutCollector:
         payload = {
             "model": model_name,
             "messages": messages,
-            "max_tokens": self.max_tokens,
+            # "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "logprobs": True,
             "top_logprobs": 1,
@@ -495,19 +515,19 @@ class VLLMRolloutCollector:
         
         # Log diagnostic info
         local_prompt_count = len(prompt_token_ids)
-        logger.info(
-            "Token counts: vLLM_prompt=%d vLLM_completion=%d local_prompt=%d generated=%d logprobs=%d",
-            vllm_prompt_tokens,
-            vllm_completion_tokens,
-            local_prompt_count,
-            len(token_ids),
-            len(logprobs),
-        )
+        # logger.info(
+        #     "Token counts: vLLM_prompt=%d vLLM_completion=%d local_prompt=%d generated=%d logprobs=%d",
+        #     vllm_prompt_tokens,
+        #     vllm_completion_tokens,
+        #     local_prompt_count,
+        #     len(token_ids),
+        #     len(logprobs),
+        # )
         
         # Log first few logprobs to verify they're not all zeros
         if logprobs:
             sample_lps = logprobs[:5]
-            logger.info("First 5 generated logprobs from vLLM: %s", sample_lps)
+            # logger.info("First 5 generated logprobs from vLLM: %s", sample_lps)
         
         # Check for mismatch between local and vLLM tokenization
         if vllm_prompt_tokens > 0 and local_prompt_count != vllm_prompt_tokens:

@@ -554,7 +554,7 @@ def _drain_ready_batches(
 
 def _processing_worker_count() -> int:
     cpu_total = os.cpu_count() or 1
-    return max(1, min(4, cpu_total // 2 or 1))
+    return max(1, cpu_total // 2)
 
 def _immediate_future(result: Iterable[Dict[str, Any]]) -> Future[List[Dict[str, Any]]]:
     future = Future()
