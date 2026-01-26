@@ -12,7 +12,6 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 import httpx
@@ -190,11 +189,6 @@ class VLLMRolloutCollector:
         if self.runtime_factory:
             runtime = self.runtime_factory(row)
 
-        # Create debug log directory
-        log_dir = Path("tool_calls_log")
-        log_dir.mkdir(exist_ok=True)
-
-        turn_start_time = time.time()
         try:
             for turn_idx in range(self.max_tool_turns):
                 try:
@@ -227,14 +221,6 @@ class VLLMRolloutCollector:
                             turn_idx,
                         )
                         break
-                    # If retries failed, skip this prompt entirely
-                    if isinstance(exc, RuntimeError) and "failed after" in str(exc) and "retries" in str(exc):
-                        logger.error(
-                            "Prompt=`%s...` failed after retries, skipping: %s",
-                            prompt[:20],
-                            exc,
-                        )
-                        return []  # Skip this prompt
                     raise
 
                 content = response["content"]
@@ -316,16 +302,6 @@ class VLLMRolloutCollector:
                         tool_exec_time,
                         len(tool_calls),
                     )
-        except RuntimeError as exc:
-            # Catch RuntimeError from retry failures that escaped inner handler
-            if "failed after" in str(exc) and "retries" in str(exc):
-                logger.error(
-                    "Prompt=`%s...` failed after retries (outer catch), skipping: %s",
-                    prompt[:20],
-                    exc,
-                )
-                return []  # Skip this prompt
-            raise
         finally:
             if runtime is not None:
                 runtime.cleanup()
@@ -357,16 +333,13 @@ class VLLMRolloutCollector:
     def _generate_with_logprobs(
         self, messages: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        """Generate completion with logprobs from vLLM with retry and backoff.
+        """Generate completion with logprobs from vLLM.
 
         Args:
             messages: Chat messages
 
         Returns:
             Dict with content, tool_calls, token_ids, logprobs, raw_text
-            
-        Raises:
-            RuntimeError: If all retries fail
         """
         model_name = self.lora_name if self.lora_name else self.model_name
 
@@ -385,70 +358,15 @@ class VLLMRolloutCollector:
         # Use thread-local client to avoid contention
         client = self._get_client()
         
-        # Retry with exponential backoff
-        max_retries = 3
-        base_delay = 1.0  # Start with 1 second
+        response = client.post("/v1/chat/completions", json=payload)
         
-        last_exception = None
-        for attempt in range(max_retries):
-            try:
-                response = client.post("/v1/chat/completions", json=payload)
-                
-                if response.status_code >= 400:
-                    body = (response.text or "").strip()
-                    # Don't retry on 4xx errors (client errors)
-                    if 400 <= response.status_code < 500:
-                        raise RuntimeError(
-                            f"vLLM chat failed (status={response.status_code}): {body}"
-                        )
-                    # Retry on 5xx errors (server errors)
-                    raise httpx.HTTPStatusError(
-                        f"vLLM server error (status={response.status_code}): {body}",
-                        request=response.request,
-                        response=response,
-                    )
-                
-                # Success - break out of retry loop
-                break
-                
-            except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError, httpx.HTTPStatusError) as e:
-                last_exception = e
-                if attempt < max_retries - 1:
-                    # Exponential backoff: 1s, 2s, 4s
-                    delay = base_delay * (2 ** attempt)
-                    logger.warning(
-                        "vLLM request failed (attempt %d/%d): %s. Retrying in %.1fs...",
-                        attempt + 1, max_retries, str(e), delay
-                    )
-                    time.sleep(delay)
-                else:
-                    # Final attempt failed
-                    logger.error(
-                        "vLLM request failed after %d attempts: %s",
-                        max_retries, str(e)
-                    )
-                    raise RuntimeError(f"vLLM request failed after {max_retries} retries: {e}") from e
-            except Exception as e:
-                # Don't retry on other exceptions
-                raise
-        else:
-            # This shouldn't happen, but just in case
-            if last_exception:
-                raise RuntimeError(f"vLLM request failed after {max_retries} retries") from last_exception
+        if response.status_code >= 400:
+            body = (response.text or "").strip()
+            raise RuntimeError(
+                f"vLLM chat failed (status={response.status_code}): {body}"
+            )
 
         data = response.json()
-        
-        # Log vLLM response for debugging
-        try:
-            parser_logs_dir = Path("/home/ubuntu/spider/parser_logs")
-            parser_logs_dir.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            log_file = parser_logs_dir / f"vllm_response_{timestamp}.json"
-            with open(log_file, "w") as f:
-                json.dump(data, f, indent=2, sort_keys=True)
-            logger.debug("Saved vLLM response to %s", log_file)
-        except Exception as e:
-            logger.warning("Failed to save vLLM response log: %s", e, exc_info=True)
 
         choices = data.get("choices") or []
         if not choices:
