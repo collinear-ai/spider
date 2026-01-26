@@ -206,38 +206,8 @@ class VLLMRolloutCollector:
                 # Retry loop for parsing failures
                 max_parse_retries = 3
                 for parse_attempt in range(max_parse_retries):
-                    try:
-                        turn_gen_start = time.time()
-                        response = self._generate_with_logprobs(history)
-                        turn_gen_time = time.time() - turn_gen_start
-                        
-                        # Log slow generations to identify bottlenecks
-                        if turn_gen_time > 5.0:  # Log if generation takes > 5 seconds
-                            logger.warning(
-                                "Slow generation: prompt=`%s...` turn=%d generation_time=%.2fs tokens=%d",
-                                prompt[:20],
-                                turn_idx,
-                                turn_gen_time,
-                                len(response.get("token_ids", [])),
-                            )
-                        elif self.verbose:
-                            logger.debug(
-                                "Prompt=`%s...` turn=%d generation_time=%.2fs tokens=%d",
-                                prompt[:20],
-                                turn_idx,
-                                turn_gen_time,
-                                len(response.get("token_ids", [])),
-                            )
-                    except Exception as exc:
-                        if self._is_context_window_error(exc):
-                            logger.warning(
-                                "Prompt=`%s...` turn=%d exceeded context window; ending trajectory.",
-                                prompt[:20],
-                                turn_idx,
-                            )
-                            break
-                        raise
-                    
+                    response = self._generate_with_logprobs(history)
+
                     # Check if parsing failed - retry if so
                     parser_fallback = response.get("parser_fallback", False)
                     tool_calls = response.get("tool_calls")
@@ -268,19 +238,6 @@ class VLLMRolloutCollector:
 
                 # Full token sequence
                 full_token_ids = response["full_token_ids"]
-
-                if not (len(full_logprobs) == len(full_token_ids) == len(reward_mask)):
-                    raise ValueError(
-                        "Length mismatch: full_logprobs=%d full_token_ids=%d reward_mask=%d logprobs=%d token_ids=%d prompt_token_count=%d",
-                        len(full_logprobs), len(full_token_ids), len(reward_mask), len(logprobs), len(token_ids), prompt_token_count
-                    )
-
-                if len(full_token_ids) <= 1:
-                    logger.warning(
-                        "Token sequence too short for training: tokens=%d",
-                        len(full_token_ids),
-                    )
-                    break
 
                 # Build assistant message snapshot
                 snapshot = {
@@ -498,15 +455,11 @@ class VLLMRolloutCollector:
         reasoning = message.get("reasoning") or message.get("reasoning_content")
         tool_calls = message.get("tool_calls")
 
-
-
         # Extract logprobs and token IDs
         # CRITICAL: We must keep logprobs aligned with token_ids for importance sampling
         # vLLM returns logprobs[i] for its token[i], so we need the exact token IDs vLLM used
         logprobs_data = choice.get("logprobs") or {}
         logprobs_content = logprobs_data.get("content") or []
-
-
 
         token_strings = []
         logprobs = []
@@ -665,6 +618,7 @@ class VLLMRolloutCollector:
             logprobs=logprobs,
             raw_text=raw_text,
             prompt_token_count=prompt_token_count,
+            full_token_ids=full_token_ids,
         )
 
         return {
@@ -689,6 +643,7 @@ class VLLMRolloutCollector:
         logprobs: List[float],
         raw_text: str,
         prompt_token_count: int,
+        full_token_ids: Optional[List[int]] = None,
     ) -> None:
         """Log vLLM request/response to debug folder."""
         import pickle
@@ -713,6 +668,8 @@ class VLLMRolloutCollector:
                 "logprobs": logprobs,
                 "prompt_token_count": prompt_token_count,
                 "completion_token_count": len(token_ids),
+                "full_token_ids": full_token_ids,
+                "full_token_count": len(full_token_ids) if full_token_ids else 0,
             },
         }
         

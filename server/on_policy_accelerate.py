@@ -349,20 +349,22 @@ def _run_tool_on_policy_vllm_accelerate(
         use_fsdp = getattr(options, "use_fsdp", False)
         
         if use_fsdp:
-            # Configure FSDP plugin with speedups
+            # Configure FSDP plugin with memory optimizations
             fsdp_plugin = FullyShardedDataParallelPlugin(
-                state_dict_config=FullStateDictConfig(offload_to_cpu=False, rank0_only=False),
+                state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
                 sharding_strategy="FULL_SHARD",  # Shard parameters, gradients, and optimizer states
                 backward_prefetch=BackwardPrefetch.BACKWARD_PRE,  # Prefetch next layer during backward
                 forward_prefetch=True,  # Prefetch next layer during forward
                 limit_all_gathers=True,  # Reduce memory by limiting concurrent all-gathers
                 sync_module_states=True,  # Ensure consistent initialization across ranks
+                activation_checkpointing=True,  # Save memory by recomputing activations
+                cpu_offload=True,  # Offload params to CPU when not in use
             )
             accelerator = Accelerator(
                 mixed_precision=training_precision,
                 fsdp_plugin=fsdp_plugin,
             )
-            logger.info("Accelerator initialized with FSDP (prefetch enabled) and mixed_precision=%s", training_precision)
+            logger.info("Accelerator initialized with FSDP (activation_checkpointing, cpu_offload) and mixed_precision=%s", training_precision)
         else:
             accelerator = Accelerator(mixed_precision=training_precision)
             logger.info("Accelerator initialized with mixed_precision=%s", training_precision)
@@ -817,6 +819,12 @@ def _run_tool_on_policy_vllm_accelerate(
 
             # Perform training step with clipped importance sampling
             num_trajectories = len(all_input_ids)
+            
+            # Force memory cleanup before training loop
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            
             optimizer.zero_grad()
             
             total_loss = torch.tensor(0.0, device=device, requires_grad=True)
@@ -834,6 +842,34 @@ def _run_tool_on_policy_vllm_accelerate(
                 advantages = all_advantages[idx].unsqueeze(0)
                 loss_mask = all_loss_masks[idx].unsqueeze(0)
 
+                # Log inputs BEFORE loss function
+                import pickle
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                
+                # Log GPU memory before forward pass
+                mem_allocated = torch.cuda.memory_allocated() / 1e9
+                mem_reserved = torch.cuda.memory_reserved() / 1e9
+                logger.info(
+                    "Before loss fn: traj=%d seq_len=%d mem_allocated=%.2fGB mem_reserved=%.2fGB",
+                    idx, input_ids.shape[1], mem_allocated, mem_reserved
+                )
+                
+                input_data = {
+                    "batch_index": batch_index,
+                    "trajectory_idx": idx,
+                    "input_ids": input_ids.detach().cpu(),
+                    "target_ids": target_ids.detach().cpu(),
+                    "sampling_logprobs": sampling_lp.detach().cpu(),
+                    "advantages": advantages.detach().cpu(),
+                    "loss_mask": loss_mask.detach().cpu(),
+                    "clip_ratio": clip_ratio,
+                    "mem_allocated_gb": mem_allocated,
+                    "mem_reserved_gb": mem_reserved,
+                }
+                input_file = debug_loss_dir / f"batch{batch_index}_traj{idx}_{timestamp}_input.pkl"
+                with open(input_file, "wb") as f:
+                    pickle.dump(input_data, f)
+
                 loss, current_logprobs, metrics = importance_sampling_loss_with_clip(
                     model=model,
                     input_ids=input_ids,
@@ -844,31 +880,24 @@ def _run_tool_on_policy_vllm_accelerate(
                     clip_ratio=clip_ratio,
                 )
                 
-                # Log loss debug info to pkl
-                import pickle
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                debug_data = {
+                # Log outputs AFTER loss function
+                output_data = {
                     "batch_index": batch_index,
                     "trajectory_idx": idx,
-                    "input_ids": input_ids.detach().cpu(),
-                    "target_ids": target_ids.detach().cpu(),
-                    "sampling_logprobs": sampling_lp.detach().cpu(),
                     "current_logprobs": current_logprobs.detach().cpu(),
-                    "advantages": advantages.detach().cpu(),
-                    "loss_mask": loss_mask.detach().cpu(),
                     "loss": loss.detach().cpu().item(),
                     "metrics": metrics,
-                    "clip_ratio": clip_ratio,
                 }
-                debug_file = debug_loss_dir / f"batch{batch_index}_traj{idx}_{timestamp}.pkl"
-                with open(debug_file, "wb") as f:
-                    pickle.dump(debug_data, f)
+                output_file = debug_loss_dir / f"batch{batch_index}_traj{idx}_{timestamp}_output.pkl"
+                with open(output_file, "wb") as f:
+                    pickle.dump(output_data, f)
                 
                 total_loss = total_loss + loss
                 total_clip_fraction += metrics["clip_fraction"]
                 valid_count += 1
                 
                 del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss, current_logprobs, metrics
+                torch.cuda.empty_cache()  # Force memory release between trajectories
             
             if valid_count == 0:
                 logger.warning("No valid trajectories in batch %d, skipping", batch_index)
@@ -1018,6 +1047,16 @@ def _run_tool_on_policy_vllm_accelerate(
                 # Process batch (training step)
                 training_start = time.time()
                 try:
+                    import os
+                    import pickle
+                    from pathlib import Path
+                    debug_dir = Path("debug_traj_b4_training")
+                    debug_dir.mkdir(exist_ok=True)
+                    fname = f"trajectories_batch{batch_index}_step{global_step}.pkl"
+                    fpath = debug_dir / fname
+                    with open(fpath, "wb") as f:
+                        pickle.dump(trajectories, f)
+
                     batch_items, batch_metrics = _process_batch(batch_index, trajectories)
                 except RuntimeError as e:
                     if "Non-finite loss" in str(e):
