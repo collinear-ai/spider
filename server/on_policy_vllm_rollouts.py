@@ -10,7 +10,8 @@ import json
 import logging
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -60,6 +61,7 @@ class VLLMRolloutCollector:
     max_tool_turns: int = 16
     max_tokens: int = 4096
     temperature: float = 1.0
+    tool_timeout: float = 200.0
     lora_name: Optional[str] = None
     runtime_factory: Optional[Callable[[Dict[str, Any]], Any]] = None
     verbose: bool = False
@@ -465,7 +467,7 @@ class VLLMRolloutCollector:
         )
 
         # Use parsed content/tool_calls if parser succeeded
-        if not parsed.parser_fallback:
+        if parsed.parser_fallback:
             content = parsed.content
             tool_calls = parsed.tool_calls
             if parsed.reasoning:
@@ -525,11 +527,22 @@ class VLLMRolloutCollector:
                 result = f"Tool '{name}' not found in registry."
             else:
                 try:
-                    result = handler(**args)
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(handler, **args)
+                        result = future.result(timeout=self.tool_timeout)
+                    
                     if not isinstance(result, str):
                         result = json.dumps(result)
+                except FuturesTimeoutError:
+                    result = f"Tool '{name}' execution timed out after {self.tool_timeout}s"
+                    logger.warning(
+                        "Tool '%s' timed out after %.1fs, skipping result",
+                        name, self.tool_timeout
+                    )
                 except Exception as exc:
                     result = f"Tool execution error: {exc}"
+                    logger.warning("Tool '%s' raised exception: %s", name, exc)
+                    result = handler(**args)
 
             history.append(
                 {

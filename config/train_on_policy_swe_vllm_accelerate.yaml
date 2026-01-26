@@ -8,17 +8,19 @@ job:
     shuffle: true
   generation:
     on_policy: true
-    max_tool_turns: 100
+    max_tool_turns: 50
     parameters:
       temperature: 0.7
       top_p: 0.95
       max_tokens: 65536
       tool_choice: auto
     on_policy_options:
+
+      tool_timeout: 150.0
       # Teacher model - HF name for tokenizer
       teacher: Qwen/Qwen3-Coder-480B-A35B-Instruct
       # Fireworks model ID - set this to use Fireworks API instead of loading locally
-      fireworks_model: accounts/fireworks/models/qwen3-coder-480b-a35b-instruct
+      fireworks_model: accounts/keith-7ff28a/deployments/b7sgjwt9
 
       # Training hyperparameters
       learning_rate: 1e-4

@@ -1308,15 +1308,36 @@ def _run_tool_on_policy_vllm_accelerate(
             reward_mask,
             assistant_raw_text,
         ):
-            return teacher_ctx.compute_teacher_alignment(
-                messages=messages,
-                tools=tools,
-                student_model=student_model,
-                student_token_ids=student_token_ids,
-                student_logprobs=student_logprobs,
-                reward_mask=reward_mask,
-                assistant_raw_text=assistant_raw_text,
-            )
+            # Debug: validate inputs before calling
+            try:
+                if not isinstance(messages, (list, tuple)):
+                    logger.error("messages is not a list: type=%s", type(messages))
+                    return {"kl_adjustments": [0.0] * len(student_token_ids), "kl_mask": [0.0] * len(student_token_ids)}
+                
+                for i, msg in enumerate(messages):
+                    if not isinstance(msg, dict):
+                        logger.error("Message %d is not a dict: type=%s, value=%s", i, type(msg), str(msg)[:200])
+                        return {"kl_adjustments": [0.0] * len(student_token_ids), "kl_mask": [0.0] * len(student_token_ids)}
+                
+                return teacher_ctx.compute_teacher_alignment(
+                    messages=messages,
+                    tools=tools,
+                    student_model=student_model,
+                    student_token_ids=student_token_ids,
+                    student_logprobs=student_logprobs,
+                    reward_mask=reward_mask,
+                    assistant_raw_text=assistant_raw_text,
+                )
+            except TypeError as e:
+                # Log detailed info about the inputs when TypeError occurs
+                logger.error("TypeError in compute_teacher_alignment: %s", e)
+                logger.error("  messages type: %s, len: %d", type(messages), len(messages) if hasattr(messages, '__len__') else 'N/A')
+                if messages:
+                    logger.error("  first message: %s", str(messages[0])[:500])
+                    logger.error("  last message: %s", str(messages[-1])[:500])
+                logger.error("  tools type: %s", type(tools))
+                logger.error("  assistant_raw_text type: %s, len: %d", type(assistant_raw_text), len(assistant_raw_text) if assistant_raw_text else 0)
+                raise
 
         def _process_batch(
             batch_index: int, trajectories: List[Dict[str, Any]]
@@ -1420,8 +1441,19 @@ def _run_tool_on_policy_vllm_accelerate(
                 
                 try:
                     alignment = future.result()
+                    # Validate alignment is a dict with expected keys
+                    if not isinstance(alignment, dict):
+                        logger.error("Teacher alignment returned non-dict type: %s", type(alignment))
+                        alignment = {
+                            "kl_adjustments": [0.0] * len(task["token_ids"]),
+                            "kl_mask": [0.0] * len(task["token_ids"]),
+                        }
+                    elif "kl_adjustments" not in alignment:
+                        logger.warning("Teacher alignment missing kl_adjustments key, got keys: %s", list(alignment.keys()))
+                        alignment["kl_adjustments"] = [0.0] * len(task["token_ids"])
+                        alignment["kl_mask"] = alignment.get("kl_mask", [0.0] * len(task["token_ids"]))
                 except Exception as e:
-                    logger.error(f"Error in parallel teacher alignment: {e}")
+                    logger.error("Error in parallel teacher alignment: %s (type: %s)", str(e), type(e).__name__)
                     alignment = {
                         "kl_adjustments": [0.0] * len(task["token_ids"]),
                         "kl_mask": [0.0] * len(task["token_ids"]),

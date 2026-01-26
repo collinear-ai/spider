@@ -713,20 +713,68 @@ class FireworksTeacherContext:
         assistant_raw_text: str,
     ) -> Dict[str, object]:
         """Compute teacher alignment for rewards using Fireworks API."""
-        if not messages or messages[-1].get("role") != "assistant":
+        # Validate messages are proper dicts
+        if not messages:
+            logger.warning("Empty messages list passed to compute_teacher_alignment")
+            return {
+                "kl_adjustments": [0.0] * len(student_token_ids),
+                "kl_mask": [0.0] * len(student_token_ids),
+            }
+        
+        # Ensure all messages are dicts (not other types)
+        validated_messages = []
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                logger.error("Message %d is not a dict: type=%s value=%s", i, type(msg), str(msg)[:100])
+                return {
+                    "kl_adjustments": [0.0] * len(student_token_ids),
+                    "kl_mask": [0.0] * len(student_token_ids),
+                }
+            validated_messages.append(msg)
+        
+        if validated_messages[-1].get("role") != "assistant":
             raise ValueError("Messages must end with an assistant turn.")
 
         student_tokenizer = AutoTokenizer.from_pretrained(student_model, use_fast=True, trust_remote_code=True)
         teacher_tokenizer = self.tokenizer
 
-        prefix_msgs = list(messages[:-1])
+        prefix_msgs = list(validated_messages[:-1])
+        
+        # Fix tool_calls format for Qwen tokenizer compatibility
+        # Qwen expects arguments as dict, not JSON string
+        def _fix_message_for_template(msg):
+            """Convert message to format compatible with Qwen chat template."""
+            fixed = dict(msg)  # Shallow copy
+            
+            if "tool_calls" in fixed and fixed["tool_calls"]:
+                fixed_tool_calls = []
+                for tc in fixed["tool_calls"]:
+                    if not isinstance(tc, dict):
+                        continue
+                    fixed_tc = dict(tc)
+                    if "function" in fixed_tc and isinstance(fixed_tc["function"], dict):
+                        fixed_func = dict(fixed_tc["function"])
+                        # Convert arguments from JSON string to dict if needed
+                        if "arguments" in fixed_func and isinstance(fixed_func["arguments"], str):
+                            try:
+                                fixed_func["arguments"] = json.loads(fixed_func["arguments"])
+                            except (json.JSONDecodeError, TypeError):
+                                pass  # Keep as string if not valid JSON
+                        fixed_tc["function"] = fixed_func
+                    fixed_tool_calls.append(fixed_tc)
+                fixed["tool_calls"] = fixed_tool_calls
+            
+            return fixed
+        
+        fixed_prefix_msgs = [_fix_message_for_template(msg) for msg in prefix_msgs]
 
         prefix_text = teacher_tokenizer.apply_chat_template(
-            prefix_msgs,
+            fixed_prefix_msgs,
             tools=tools if tools else None,
             add_generation_prompt=True,
             tokenize=False,
         )
+        
         prefix_tokens = teacher_tokenizer.encode(prefix_text, add_special_tokens=False)
 
         if assistant_raw_text is None:

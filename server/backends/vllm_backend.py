@@ -536,7 +536,7 @@ def _default_tool_parser(model_name: str) -> Optional[str]:
         return "mistral"
     if "gpt-oss" in lower:
         return "openai"
-    return None
+    return "hermes"
 
 def _default_chat_template(model_name: str) -> Optional[Path]:
     lower = (model_name or "").lower()
