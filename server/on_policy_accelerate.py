@@ -449,21 +449,16 @@ def _run_tool_on_policy_stream_accelerate(
     # Prepare with accelerator
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
 
-    # Load teacher model using API
+    # Load teacher model using Fireworks API
     fireworks_model = getattr(options, "fireworks_model", None)
     if not fireworks_model:
         raise ValueError("fireworks_model must be specified in options")
     
-    teacher_base_url = getattr(options, "teacher_base_url", "http://10.234.201.144:8000/v1")
-    teacher_api_key = getattr(options, "teacher_api_key", None)
-    
     teacher_ctx = FireworksTeacherContext(
         model_name=options.teacher,
         fireworks_model=fireworks_model,
-        base_url=teacher_base_url,
-        api_key=teacher_api_key,
     )
-    logger.info("Using teacher API: %s at %s", fireworks_model, teacher_base_url)
+    logger.info("Using Fireworks API for teacher: %s", fireworks_model)
 
     training_dir = workspace / "training"
     training_dir.mkdir(parents=True, exist_ok=True)
@@ -1224,21 +1219,16 @@ def _run_tool_on_policy_vllm_accelerate(
             verbose=verbose_turns,
         )
 
-        # Load teacher model using API
+        # Load teacher model using Fireworks API
         fireworks_model = getattr(options, "fireworks_model", None)
         if not fireworks_model:
             raise ValueError("fireworks_model must be specified in options")
         
-        teacher_base_url = getattr(options, "teacher_base_url", "http://10.234.201.144:8000/v1")
-        teacher_api_key = getattr(options, "teacher_api_key", None)
-        
         teacher_ctx = FireworksTeacherContext(
             model_name=options.teacher,
             fireworks_model=fireworks_model,
-            base_url=teacher_base_url,
-            api_key=teacher_api_key,
         )
-        logger.info("Using teacher API: %s at %s", fireworks_model, teacher_base_url)
+        logger.info("Using Fireworks API for teacher: %s", fireworks_model)
 
         # Initialize wandb
         wandb_project = getattr(options, "wandb_project", None)

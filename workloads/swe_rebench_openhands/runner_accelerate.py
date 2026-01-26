@@ -92,7 +92,10 @@ def _build_tool_configs(schemas: List[Dict[str, Any]]) -> List[ToolConfig]:
 
 def _tool_wrapper(method_name: str) -> Callable[..., Any]:
     def _call(**kwargs: Any) -> Any:
-        runtime = _CURRENT_RUNTIME.get()
+        try:
+            runtime = _CURRENT_RUNTIME.get()
+        except LookupError:
+            return f"Error: No runtime available. The container may not have been initialized for this trajectory."
         registry = ToolRegistry(runtime=runtime)
         method = getattr(registry, method_name)
         return method(kwargs)

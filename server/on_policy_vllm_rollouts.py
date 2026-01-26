@@ -598,8 +598,11 @@ class VLLMRolloutCollector:
                 # Execute tool with timeout
                 try:
                     # Use ThreadPoolExecutor to enforce timeout
+                    # Copy context so ContextVars (like runtime) propagate to the new thread
+                    import contextvars
+                    ctx = contextvars.copy_context()
                     with ThreadPoolExecutor(max_workers=1) as executor:
-                        future = executor.submit(handler, **args)
+                        future = executor.submit(ctx.run, handler, **args)
                         result = future.result(timeout=self.tool_timeout)
                     
                     if not isinstance(result, str):

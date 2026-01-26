@@ -19,10 +19,8 @@ job:
       token_budget: 21516302
       # Teacher model - HF name for tokenizer
       teacher: Qwen/Qwen3-Coder-480B-A35B-Instruct
-      # Teacher API configuration
-      fireworks_model: Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8
-      teacher_base_url: http://10.234.201.144:8000/v1
-      # teacher_api_key: not needed for self-hosted
+      # Fireworks model ID - set this to use Fireworks API instead of loading locally
+      fireworks_model: accounts/keith-7ff28a/deployments/b7sgjwt9
 
       # Training hyperparameters
       learning_rate: 1e-4

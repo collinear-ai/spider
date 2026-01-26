@@ -608,7 +608,7 @@ class FireworksTeacherContext:
         self,
         model_name: str,
         fireworks_model: str,
-        base_url: str = "http://10.234.201.144:8000/v1",
+        base_url: str = "https://api.fireworks.ai/inference/v1",
         api_key: Optional[str] = None,
     ) -> None:
         """Initialize Fireworks teacher context.
@@ -623,7 +623,12 @@ class FireworksTeacherContext:
         self.model_name = model_name
         self.fireworks_model = fireworks_model
         self.base_url = base_url
-        self.api_key = ""
+        self.api_key = api_key or os.environ.get("FIREWORKS_API_KEY")
+
+        if not self.api_key:
+            raise ValueError(
+                "FIREWORKS_API_KEY environment variable must be set or api_key must be provided"
+            )
 
         logger.info(
             "Using Fireworks API for teacher model: %s (fireworks: %s)",
@@ -680,49 +685,39 @@ class FireworksTeacherContext:
             Tuple of (token_ids, logprobs)
         """
 
-        api_url = f"{self.base_url}/completions"
+        fireworks_url = f"{self.base_url}/completions"
         payload = {
             "model": self.fireworks_model,
             "max_tokens": 1,
             "echo": True,
-            "logprobs": 1,  # vLLM uses integer for logprobs count
+            "logprobs": True,
             "prompt": text,
         }
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
         }
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
 
         # Use session with connection pooling for faster requests
-        response = self._http_session.post(api_url, headers=headers, json=payload)
+        response = self._http_session.post(fireworks_url, headers=headers, json=payload)
         response.raise_for_status()
         response_json = response.json()
 
-        # Extract logprobs from response - handle both vLLM and Fireworks formats
-        logprobs_data = response_json["choices"][0]["logprobs"]
-        
-        # vLLM format: {"tokens": [...], "token_logprobs": [...], ...}
-        # Fireworks format: {"content": [{"token": ..., "logprob": ...}, ...]}
-        if "token_logprobs" in logprobs_data:
-            # vLLM format
-            lp_list = logprobs_data["token_logprobs"]
-            # First token logprob is None in vLLM, replace with 0.0
-            lp_list = [lp if lp is not None else 0.0 for lp in lp_list]
-        elif "content" in logprobs_data:
-            # Fireworks format
-            lp_list = [item["logprob"] for item in logprobs_data["content"]]
-        else:
-            raise ValueError(f"Unknown logprobs format: {logprobs_data.keys()}")
+        # Extract logprobs from response
+        lp_list = [
+            item["logprob"]
+            for item in response_json["choices"][0]["logprobs"]["content"]
+        ]
 
         # Get token IDs using local tokenizer
         token_ids = self.tokenizer.encode(text, add_special_tokens=False)
 
-        # For vLLM with echo=True, we get logprobs for all tokens including prompt
-        # The lp_list already contains prompt tokens, just need to align with our token_ids
-        # Use length of lp_list minus 1 (the generated token) as prompt_tokens count
-        prompt_tokens = len(lp_list) - 1  # Exclude the 1 generated token
+        # Align lengths - use prompt_tokens from usage to slice logprobs
+        prompt_tokens = response_json["usage"]["prompt_tokens"]
+        # Fireworks returns the prefix/completion tokens + 1 extra completion token.
+        # So we will just consider the prompt tokens (prefix/completion).
+        # Extract completion logprobs starting after prefix_tokens
         logprobs = lp_list[:prompt_tokens]
 
         # Align with tokenizer output
