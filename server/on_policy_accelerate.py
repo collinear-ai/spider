@@ -19,6 +19,11 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
+from accelerate.utils import FullyShardedDataParallelPlugin
+from torch.distributed.fsdp.fully_sharded_data_parallel import (
+    FullStateDictConfig,
+    BackwardPrefetch,
+)
 from accelerate import DeepSpeedPlugin
 from peft import PeftModel
 from transformers import get_scheduler
@@ -1076,9 +1081,19 @@ def _run_tool_on_policy_vllm_accelerate(
 
         # Initialize Accelerator with DeepSpeed
         training_precision = getattr(options, "training_precision", "bf16")
+        fsdp_plugin = FullyShardedDataParallelPlugin(
+            state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
+            sharding_strategy="FULL_SHARD",  # Shard parameters, gradients, and optimizer states
+            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,  # Prefetch next layer during backward
+            forward_prefetch=True,  # Prefetch next layer during forward
+            limit_all_gathers=True,  # Reduce memory by limiting concurrent all-gathers
+            sync_module_states=True,  # Ensure consistent initialization across ranks
+            activation_checkpointing=True,  # Save memory by recomputing activations
+            cpu_offload=True,  # Offload params to CPU when not in use
+        )
         accelerator = Accelerator(
             mixed_precision=training_precision,
-            deepspeed_plugin=deepspeed_plugin,
+            fsdp_plugin=fsdp_plugin,
         )
         logger.info("Accelerator initialized with mixed_precision=%s", training_precision)
 
@@ -1525,7 +1540,7 @@ def _run_tool_on_policy_vllm_accelerate(
             
             # Number of parallel forward passes (limited by GPU memory)
             # Each forward pass is independent, so we can overlap them with CUDA streams
-            parallel_forwards = getattr(options, "parallel_forwards", 4)
+            parallel_forwards = getattr(options, "parallel_forwards", 1)
             if parallel_forwards is None or parallel_forwards <= 0:
                 parallel_forwards = 1
             

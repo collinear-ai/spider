@@ -22,6 +22,11 @@ from .vllm_parsers import parse_assistant_turn
 logger = logging.getLogger(__name__)
 
 
+class ToolTimeoutError(Exception):
+    """Raised when tool execution times out - triggers container cleanup."""
+    pass
+
+
 @dataclass
 class RolloutResult:
     """Result from a single rollout trajectory."""
@@ -60,7 +65,7 @@ class VLLMRolloutCollector:
     max_tool_turns: int = 16
     max_tokens: int = 4096
     temperature: float = 1.0
-    tool_timeout: float = 200.0  # Timeout for tool execution in seconds
+    tool_timeout: float = 60.0  # Timeout for tool execution in seconds
     lora_name: Optional[str] = None
     runtime_factory: Optional[Callable[[Dict[str, Any]], Any]] = None
     verbose: bool = False
@@ -295,6 +300,14 @@ class VLLMRolloutCollector:
                         turn_index=turn_idx,
                     )
                 )
+
+                # Stop if token count exceeds max_tokens
+                if len(full_token_ids) >= self.max_tokens:
+                    logger.info(
+                        "Stopping trajectory: token count %d >= max_tokens %d",
+                        len(full_token_ids), self.max_tokens
+                    )
+                    break
 
                 if not tool_calls:
                     break
@@ -601,19 +614,37 @@ class VLLMRolloutCollector:
                     # Copy context so ContextVars (like runtime) propagate to the new thread
                     import contextvars
                     ctx = contextvars.copy_context()
-                    with ThreadPoolExecutor(max_workers=1) as executor:
+                    executor = ThreadPoolExecutor(max_workers=1)
+                    try:
                         future = executor.submit(ctx.run, handler, **args)
                         result = future.result(timeout=self.tool_timeout)
                     
-                    if not isinstance(result, str):
-                        result = json.dumps(result)
-                except FuturesTimeoutError:
-                    result = f"Tool '{name}' execution timed out after {self.tool_timeout}s"
-                    logger.warning(
-                        "Tool '%s' timed out after %.1fs, skipping result",
-                        name, self.tool_timeout
-                    )
+                        if not isinstance(result, str):
+                            result = json.dumps(result)
+                    except FuturesTimeoutError:
+                        # Tool timed out - kill the container FIRST so the thread exits quickly
+                        logger.warning(
+                            "Tool '%s' timed out after %.1fs, killing container and ending trajectory",
+                            name, self.tool_timeout
+                        )
+                        # Kill container immediately - this will cause the docker exec to fail
+                        # and the background thread to exit
+                        try:
+                            from workloads.swe_rebench_openhands.runner_accelerate import _CURRENT_RUNTIME
+                            runtime = _CURRENT_RUNTIME.get(None)
+                            if runtime is not None:
+                                logger.info("Killing container due to tool timeout...")
+                                runtime.cleanup()
+                        except Exception as cleanup_exc:
+                            logger.warning("Failed to cleanup runtime after timeout: %s", cleanup_exc)
+                        # Re-raise to stop further tool execution and keep previous turns
+                        raise ToolTimeoutError(f"Tool '{name}' timed out after {self.tool_timeout}s")
+                    finally:
+                        # Shutdown executor - don't wait for threads since container is killed
+                        executor.shutdown(wait=False, cancel_futures=True)
                 except Exception as exc:
+                    if isinstance(exc, ToolTimeoutError):
+                        raise
                     result = f"Tool execution error: {exc}"
                     logger.warning("Tool '%s' raised exception: %s", name, exc)
 

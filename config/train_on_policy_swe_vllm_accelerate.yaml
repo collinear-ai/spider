@@ -13,7 +13,7 @@ job:
     parameters:
       temperature: 0.7
       top_p: 0.95
-      max_tokens: 65565 # Limit completion tokens to 65565
+      max_tokens: 10000000 # Limit completion tokens to 32768
       tool_choice: auto
     on_policy_options:
       token_budget: 21516302
@@ -25,7 +25,7 @@ job:
       # Training hyperparameters
       learning_rate: 1e-4
       max_grad_norm: 1.0  # Gradient clipping (0 to disable)
-      groups_per_batch: 32
+      groups_per_batch: 8
       lora_rank: 64
       num_epochs: 1  # Number of epochs to train
       save_every: 10
@@ -55,7 +55,7 @@ job:
 
       # Parallel rollout collection
       rollout_workers: 128  # Number of concurrent HTTP requests to vLLM (increased for better throughput)
-      tool_timeout: 200  # Timeout for tool execution in seconds (prevents hanging on slow tools)
+      tool_timeout: 60  # Timeout for tool execution in seconds (prevents hanging on slow tools)
 
       # Weight synchronization between training and inference
       weight_sync_steps: 1  # Sync LoRA weights to vLLM every N training steps

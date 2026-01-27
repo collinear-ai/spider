@@ -34,9 +34,16 @@ _CURRENT_RUNTIME = contextvars.ContextVar("swe_rebench_runtime")
 class _RuntimeHandle:
     runtime: ContainerManager
     token: contextvars.Token[ContainerManager]
+    _cleaned_up: bool = False
 
     def cleanup(self) -> None:
-        _CURRENT_RUNTIME.reset(self.token)
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
+        try:
+            _CURRENT_RUNTIME.reset(self.token)
+        except ValueError:
+            pass  # Token already reset
         self.runtime.cleanup()
 
 
