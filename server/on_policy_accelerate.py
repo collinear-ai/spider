@@ -608,15 +608,6 @@ def _run_tool_on_policy_vllm_accelerate(
                 "clip_count": 0,
             }
 
-            all_input_ids = []
-            all_target_ids = []
-            all_sampling_logprobs = []
-            all_advantages = []
-            all_loss_masks = []
-
-            # Use pre-computed async teacher alignments (submitted during rollouts)
-            from concurrent.futures import as_completed
-            
             # Build trace_id -> turn_index mapping for trajectories
             trace_id_to_idx = {}
             for turn_index, turn in enumerate(trajectories):
@@ -682,52 +673,84 @@ def _run_tool_on_policy_vllm_accelerate(
                     len(pending_futures), teacher_elapsed, len(pending_futures) / teacher_elapsed if teacher_elapsed > 0 else 0
                 )
             else:
-                logger.warning("No async alignments found, falling back to sync mode")
+                logger.warning("No async alignments found, using zero KL for all")
             
-            # Process trajectories with alignment results
+            # Training setup
+            num_trajectories = len(trajectories)
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            
+            optimizer.zero_grad()
+            total_loss_value = 0.0
+            total_clip_fraction = 0.0
+            valid_count = 0
+            
+            debug_loss_dir = Path("/home/ubuntu/spider/debug_loss")
+            debug_loss_dir.mkdir(exist_ok=True)
+            
+            # Process each trajectory: build tensors -> train -> free memory (one at a time)
             for turn_index, turn in enumerate(trajectories):
-                messages = turn["messages"]
                 token_ids = turn["token_ids"]
                 logprobs = turn["logprobs"]
                 reward_mask = turn["reward_mask"]
-                student_logprobs = torch.tensor(logprobs, dtype=torch.float32, device=device)
                 
-                # Use pre-computed alignment results (fallback to zero KL if not found)
+                # Skip sequences that are too long (OOM prevention)
+                seq_len = len(token_ids) - 1  # input_ids length
+                if seq_len > 16384:
+                    logger.warning(f"Skipping traj {turn_index}: seq_len={seq_len} > 16384")
+                    continue
+                
+                # Get alignment (fallback to zero KL)
                 results = alignment_results.get(turn_index)
-                if not results:
-                    logger.warning(f"No alignment for turn_index={turn_index}, using zero KL")
-                    results = [{
-                        "task": {"turn_index": turn_index, "turn_info": None, "token_ids": token_ids},
-                        "alignment": {"kl_adjustments": [0.0] * len(token_ids), "kl_mask": [0.0] * len(token_ids)},
-                    }]
-                combined_turns = turn.get("_combined_turns")
-                if combined_turns:
-                    kl_adjustments_combined = [0.0] * len(token_ids)
-                    kl_mask_combined = [0.0] * len(token_ids)
-                    
-                    for result in results:
-                        task = result["task"]
-                        alignment = result["alignment"]
-                        turn_info = task["turn_info"]
-                        completion_start = turn_info["completion_start"]
-                        completion_end = turn_info["completion_end"]
-                        
-                        turn_kl_adj = alignment.get("kl_adjustments") or [0.0] * len(token_ids)
-                        turn_kl_mask = alignment.get("kl_mask") or [0.0] * len(token_ids)
-                        
-                        for idx in range(completion_start, completion_end):
-                            if idx < len(kl_adjustments_combined):
-                                kl_adjustments_combined[idx] = turn_kl_adj[idx]
-                                if idx < len(turn_kl_mask):
-                                    kl_mask_combined[idx] = turn_kl_mask[idx]
-                    
-                    teacher_alignment = {
-                        "kl_adjustments": kl_adjustments_combined,
-                        "kl_mask": kl_mask_combined,
-                    }
-                else:
+                if results:
                     teacher_alignment = results[0]["alignment"]
-
+                else:
+                    teacher_alignment = {"kl_adjustments": [0.0] * len(token_ids), "kl_mask": [0.0] * len(token_ids)}
+                
+                # Build tensors on CPU first
+                kl_adj = teacher_alignment.get("kl_adjustments") or [0.0] * len(token_ids)
+                kl_coef = float(getattr(options, "kl_penalty_coef", 1.0))
+                kl_discount = float(getattr(options, "kl_discount_factor", 0.0))
+                
+                kl_tensor_cpu = torch.tensor(kl_adj, dtype=torch.float32)
+                advantage_cpu = -kl_coef * kl_tensor_cpu
+                if kl_discount > 0:
+                    advantage_cpu = torch.tensor(
+                        discounted_future_sum_vectorized(advantage_cpu.numpy(), kl_discount),
+                        dtype=torch.float32,
+                    )
+                
+                input_tokens = token_ids[:-1]
+                target_tokens = token_ids[1:]
+                mask_tokens = reward_mask[1:]
+                logprobs_tokens = torch.tensor(logprobs, dtype=torch.float32)[1:]
+                advantages_tokens = advantage_cpu[1:]
+                
+                mask_tensor_cpu = torch.tensor(mask_tokens, dtype=torch.float32)
+                advantages_tokens = advantages_tokens * mask_tensor_cpu
+                
+                # Move to GPU only for this trajectory
+                input_ids = torch.tensor(input_tokens, dtype=torch.long, device=device).unsqueeze(0)
+                target_ids = torch.tensor(target_tokens, dtype=torch.long, device=device).unsqueeze(0)
+                sampling_lp = logprobs_tokens.to(device).unsqueeze(0)
+                advantages = advantages_tokens.to(device).unsqueeze(0)
+                loss_mask = mask_tensor_cpu.to(device).unsqueeze(0)
+                
+                # Metrics tracking (before GPU tensors get deleted)
+                kl_tensor = kl_tensor_cpu.to(device)
+                mask_bool = torch.tensor(reward_mask, dtype=torch.bool, device=device)
+                kl_vals = kl_tensor[mask_bool].tolist() if kl_tensor.numel() > 0 else []
+                adv_vals = advantages_tokens[mask_tensor_cpu.bool()].tolist() if advantages_tokens.numel() > 0 else []
+                
+                batch_metrics["kl_sum"] += sum(kl_vals)
+                batch_metrics["kl_count"] += len(kl_vals)
+                batch_metrics["advantage_sum"] += sum(adv_vals)
+                batch_metrics["advantage_sq_sum"] += sum(v * v for v in adv_vals)
+                batch_metrics["advantage_count"] += len(adv_vals)
+                
+                # Store item for return
+                student_logprobs = torch.tensor(logprobs, dtype=torch.float32, device=device)
                 item = dict(turn)
                 item.update({
                     "student_logprobs": student_logprobs,
@@ -735,161 +758,68 @@ def _run_tool_on_policy_vllm_accelerate(
                     "kl_mask": teacher_alignment.get("kl_mask"),
                 })
                 items.append(item)
-
-                kl_adj = teacher_alignment.get("kl_adjustments") or [0.0] * len(token_ids)
-                kl_mask = teacher_alignment.get("kl_mask") or [0.0] * len(token_ids)
-                kl_tensor = torch.tensor(kl_adj, device=device, dtype=torch.float32)
-
-                kl_coef = float(getattr(options, "kl_penalty_coef", 1.0))
-                kl_discount = float(getattr(options, "kl_discount_factor", 0.0))
-                advantage = -kl_coef * kl_tensor
-
-                if kl_discount > 0:
-                    advantage = torch.tensor(
-                        discounted_future_sum_vectorized(advantage.detach().cpu().numpy(), kl_discount),
-                        device=device,
-                        dtype=torch.float32,
-                    )
-
-                input_tokens = list(token_ids)[:-1]
-                target_tokens = list(token_ids)[1:]
-                mask_tokens = list(reward_mask)[1:]
-                logprobs_tokens = student_logprobs[1:]
-                advantages_tokens = advantage[1:]
-
-                target_tensor = torch.tensor(target_tokens, dtype=torch.long, device=device)
-                mask_tensor = torch.tensor(mask_tokens, dtype=torch.float32, device=device)
-                advantages_tokens = advantages_tokens * mask_tensor
-
-                all_input_ids.append(torch.tensor(input_tokens, dtype=torch.long, device=device))
-                all_target_ids.append(target_tensor)
-                all_sampling_logprobs.append(logprobs_tokens)
-                all_advantages.append(advantages_tokens)
-                all_loss_masks.append(mask_tensor)
-
-                n_tokens = len(token_ids)
-                n_reward = sum(reward_mask)
-                kl_vals = (
-                    kl_tensor[torch.tensor(reward_mask, dtype=torch.bool, device=device)].tolist()
-                    if kl_tensor.numel() > 0
-                    else []
-                )
-                adv_vals = (
-                    advantages_tokens[mask_tensor.bool()].tolist()
-                    if advantages_tokens.numel() > 0
-                    else []
-                )
-
-                batch_metrics["kl_sum"] += sum(kl_vals)
-                batch_metrics["kl_count"] += len(kl_vals)
-                batch_metrics["advantage_sum"] += sum(adv_vals)
-                batch_metrics["advantage_sq_sum"] += sum(v * v for v in adv_vals)
-                batch_metrics["advantage_count"] += len(adv_vals)
-
+                
                 if verbose_turns:
                     logger.info(
                         "vllm rollout batch=%d batch_item_idx=%d n_tokens=%d n_reward_tokens=%d",
-                        batch_index,
-                        turn_index,
-                        n_tokens,
-                        n_reward,
+                        batch_index, turn_index, len(token_ids), sum(reward_mask),
                     )
-
-            # Perform training step with clipped importance sampling
-            # Use micro-batching: backward pass after each trajectory to avoid OOM
-            num_trajectories = len(all_input_ids)
-            
-            # Force memory cleanup before training loop
-            gc.collect()
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            
-            optimizer.zero_grad()
-            
-            total_loss_value = 0.0  # Accumulate scalar loss values
-            total_clip_fraction = 0.0
-            valid_count = 0
-            
-            # Debug loss logging
-            debug_loss_dir = Path("/home/ubuntu/spider/debug_loss")
-            debug_loss_dir.mkdir(exist_ok=True)
-            
-            for idx in range(num_trajectories):
-                input_ids = all_input_ids[idx].unsqueeze(0)
-                target_ids = all_target_ids[idx].unsqueeze(0)
-                sampling_lp = all_sampling_logprobs[idx].unsqueeze(0)
-                advantages = all_advantages[idx].unsqueeze(0)
-                loss_mask = all_loss_masks[idx].unsqueeze(0)
-
-                # Log inputs BEFORE loss function
-                import pickle
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
                 
                 # Log GPU memory before forward pass
                 mem_allocated = torch.cuda.memory_allocated() / 1e9
                 mem_reserved = torch.cuda.memory_reserved() / 1e9
                 logger.info(
                     "Before loss fn: traj=%d/%d seq_len=%d mem_allocated=%.2fGB mem_reserved=%.2fGB",
-                    idx, num_trajectories, input_ids.shape[1], mem_allocated, mem_reserved
+                    turn_index, num_trajectories, input_ids.shape[1], mem_allocated, mem_reserved
                 )
                 
+                # Debug logging
+                import pickle
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
                 input_data = {
-                    "batch_index": batch_index,
-                    "trajectory_idx": idx,
-                    "input_ids": input_ids.detach().cpu(),
-                    "target_ids": target_ids.detach().cpu(),
-                    "sampling_logprobs": sampling_lp.detach().cpu(),
-                    "advantages": advantages.detach().cpu(),
-                    "loss_mask": loss_mask.detach().cpu(),
-                    "clip_ratio": clip_ratio,
-                    "mem_allocated_gb": mem_allocated,
-                    "mem_reserved_gb": mem_reserved,
+                    "batch_index": batch_index, "trajectory_idx": turn_index,
+                    "input_ids": input_ids.detach().cpu(), "target_ids": target_ids.detach().cpu(),
+                    "sampling_logprobs": sampling_lp.detach().cpu(), "advantages": advantages.detach().cpu(),
+                    "loss_mask": loss_mask.detach().cpu(), "clip_ratio": clip_ratio,
+                    "mem_allocated_gb": mem_allocated, "mem_reserved_gb": mem_reserved,
                 }
-                input_file = debug_loss_dir / f"batch{batch_index}_traj{idx}_{timestamp}_input.pkl"
-                with open(input_file, "wb") as f:
+                with open(debug_loss_dir / f"batch{batch_index}_traj{turn_index}_{timestamp}_input.pkl", "wb") as f:
                     pickle.dump(input_data, f)
-
+                
+                # Forward pass
                 loss, current_logprobs, metrics = importance_sampling_loss_with_clip(
-                    model=model,
-                    input_ids=input_ids,
-                    target_ids=target_ids,
-                    sampling_logprobs=sampling_lp,
-                    advantages=advantages,
-                    loss_mask=loss_mask,
-                    clip_ratio=clip_ratio,
+                    model=model, input_ids=input_ids, target_ids=target_ids,
+                    sampling_logprobs=sampling_lp, advantages=advantages,
+                    loss_mask=loss_mask, clip_ratio=clip_ratio,
                 )
                 
-                # Log outputs AFTER loss function
+                # Debug logging output
                 output_data = {
-                    "batch_index": batch_index,
-                    "trajectory_idx": idx,
+                    "batch_index": batch_index, "trajectory_idx": turn_index,
                     "current_logprobs": current_logprobs.detach().cpu(),
-                    "loss": loss.detach().cpu().item(),
-                    "metrics": metrics,
+                    "loss": loss.detach().cpu().item(), "metrics": metrics,
                 }
-                output_file = debug_loss_dir / f"batch{batch_index}_traj{idx}_{timestamp}_output.pkl"
-                with open(output_file, "wb") as f:
+                with open(debug_loss_dir / f"batch{batch_index}_traj{turn_index}_{timestamp}_output.pkl", "wb") as f:
                     pickle.dump(output_data, f)
                 
-                # Guard against NaN/Inf loss
+                # Guard against NaN/Inf
                 if not torch.isfinite(loss):
-                    logger.error("NaN/Inf loss at batch %d traj %d, skipping", batch_index, idx)
+                    logger.error("NaN/Inf loss at batch %d traj %d, skipping", batch_index, turn_index)
                     del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss, current_logprobs, metrics
                     torch.cuda.empty_cache()
                     continue
                 
-                # Micro-batching: scale loss and backward immediately
-                # This frees the computation graph after each trajectory
+                # Backward pass immediately (micro-batching)
                 scaled_loss = loss / num_trajectories
                 accelerator.backward(scaled_loss)
                 
-                # Accumulate scalar values for logging
                 total_loss_value += loss.detach().item()
                 total_clip_fraction += metrics["clip_fraction"]
                 valid_count += 1
                 
-                # Free memory immediately after backward
+                # Free GPU memory immediately
                 del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss, scaled_loss, current_logprobs, metrics
+                del kl_tensor, mask_bool, student_logprobs
                 gc.collect()
                 torch.cuda.empty_cache()
             

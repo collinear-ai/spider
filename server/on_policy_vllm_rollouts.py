@@ -39,7 +39,6 @@ class RolloutResult:
     parser_fallback: bool
     turn_index: int
     retokenize_match: bool = True
-    combined_turns: Optional[List[Dict[str, Any]]] = None
     trace_id: Optional[str] = None  # Unique ID for tracing across debug logs
 
 
@@ -868,7 +867,6 @@ def rollout_results_to_dicts(results: List[RolloutResult]) -> List[Dict[str, Any
             "parser_fallback": r.parser_fallback,
             "turn_index": r.turn_index,
             "retokenize_match": r.retokenize_match,
-            "_combined_turns": r.combined_turns,
         }
         for r in results
     ]
