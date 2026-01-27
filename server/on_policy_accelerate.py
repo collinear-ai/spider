@@ -492,6 +492,8 @@ def _run_tool_on_policy_vllm_accelerate(
 
         # Create rollout collector with the synced LoRA adapter
         rollout_workers = getattr(options, "rollout_workers", 8)
+        train_every_n_turns = int(getattr(options, "train_every_n_turns", 1))
+        logger.info("Rollout collector: train_every_n_turns=%d", train_every_n_turns)
         collector = VLLMRolloutCollector(
             vllm_base_url=vllm_backend.base_url,
             model_name=student_model,
@@ -507,6 +509,7 @@ def _run_tool_on_policy_vllm_accelerate(
             lora_name=initial_lora_name,  # Use synced LoRA from the start
             runtime_factory=runtime_factory,
             verbose=verbose_turns,
+            train_every_n_turns=train_every_n_turns,
         )
 
         # Load teacher model using Fireworks API
@@ -594,10 +597,9 @@ def _run_tool_on_policy_vllm_accelerate(
 
         def _process_batch(
             batch_index: int, trajectories: List[Dict[str, Any]]
-        ) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
+        ) -> Dict[str, float]:
             """Process a batch of trajectories and perform a training step."""
             
-            items = []
             batch_metrics = {
                 "kl_sum": 0.0,
                 "kl_count": 0,
@@ -650,6 +652,11 @@ def _run_tool_on_policy_vllm_accelerate(
                         alignment = future.result()
                     except Exception as e:
                         logger.error(f"Error in async teacher alignment: {e}")
+                        # INSERT_YOUR_CODE
+                        # Also append error details to a text file for debugging
+                        error_log_path = Path("debug_async_alignment_errors.txt")
+                        with open(error_log_path, "a") as ef:
+                            ef.write(f"trace_id={getattr(turn_result, 'trace_id', None)}, error={repr(e)}\n")
                         alignment = {
                             "kl_adjustments": [0.0] * len(turn_result.token_ids),
                             "kl_mask": [0.0] * len(turn_result.token_ids),
@@ -699,17 +706,17 @@ def _run_tool_on_policy_vllm_accelerate(
                 seq_len = len(token_ids) - 1  # input_ids length
                 if seq_len > 16384:
                     logger.warning(f"Skipping traj {turn_index}: seq_len={seq_len} > 16384")
+                    skip_log_file = debug_loss_dir / "skipped_trajectories.txt"
+                    with open(skip_log_file, "a") as f:
+                        f.write(f"Skipped traj {turn_index}: seq_len={seq_len} > 16384; token_ids={token_ids}\n")
                     continue
                 
-                # Get alignment (fallback to zero KL)
+                # Get KL adjustments from alignment (fallback to zero KL)
                 results = alignment_results.get(turn_index)
                 if results:
-                    teacher_alignment = results[0]["alignment"]
+                    kl_adj = results[0]["alignment"].get("kl_adjustments") or [0.0] * len(token_ids)
                 else:
-                    teacher_alignment = {"kl_adjustments": [0.0] * len(token_ids), "kl_mask": [0.0] * len(token_ids)}
-                
-                # Build tensors on CPU first
-                kl_adj = teacher_alignment.get("kl_adjustments") or [0.0] * len(token_ids)
+                    kl_adj = [0.0] * len(token_ids)
                 kl_coef = float(getattr(options, "kl_penalty_coef", 1.0))
                 kl_discount = float(getattr(options, "kl_discount_factor", 0.0))
                 
@@ -748,16 +755,6 @@ def _run_tool_on_policy_vllm_accelerate(
                 batch_metrics["advantage_sum"] += sum(adv_vals)
                 batch_metrics["advantage_sq_sum"] += sum(v * v for v in adv_vals)
                 batch_metrics["advantage_count"] += len(adv_vals)
-                
-                # Store item for return
-                student_logprobs = torch.tensor(logprobs, dtype=torch.float32, device=device)
-                item = dict(turn)
-                item.update({
-                    "student_logprobs": student_logprobs,
-                    "kl_adjustments": teacher_alignment.get("kl_adjustments"),
-                    "kl_mask": teacher_alignment.get("kl_mask"),
-                })
-                items.append(item)
                 
                 if verbose_turns:
                     logger.info(
@@ -819,13 +816,13 @@ def _run_tool_on_policy_vllm_accelerate(
                 
                 # Free GPU memory immediately
                 del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss, scaled_loss, current_logprobs, metrics
-                del kl_tensor, mask_bool, student_logprobs
+                del kl_tensor, mask_bool
                 gc.collect()
                 torch.cuda.empty_cache()
             
             if valid_count == 0:
                 logger.warning("No valid trajectories in batch %d, skipping", batch_index)
-                return items, batch_metrics
+                return batch_metrics
             
             # Average loss value for logging
             loss_value = total_loss_value / valid_count
@@ -870,7 +867,7 @@ def _run_tool_on_policy_vllm_accelerate(
                 data={"batch_index": batch_index},
             )
 
-            return items, batch_metrics
+            return batch_metrics
 
         # Main training loop
         save_every = max(1, getattr(options, "save_every", 1))
@@ -971,7 +968,7 @@ def _run_tool_on_policy_vllm_accelerate(
                     with open(fpath, "wb") as f:
                         pickle.dump(trajectories, f)
 
-                    batch_items, batch_metrics = _process_batch(batch_index, trajectories)
+                    batch_metrics = _process_batch(batch_index, trajectories)
                 except RuntimeError as e:
                     if "Non-finite loss" in str(e):
                         logger.error("Aborting training at batch %d due to non-finite loss", batch_index)

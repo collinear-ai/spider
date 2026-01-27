@@ -65,6 +65,7 @@ class VLLMRolloutCollector:
     runtime_factory: Optional[Callable[[Dict[str, Any]], Any]] = None
     verbose: bool = False
     on_turn_complete: Optional[Callable[[Dict[str, Any]], Any]] = None  # Callback for async teacher alignment
+    train_every_n_turns: int = 1  # Only save every Nth turn for training (1=all)
 
     _client: httpx.Client = field(init=False, default=None)
     _executor: ThreadPoolExecutor = field(init=False, default=None)
@@ -277,11 +278,13 @@ class VLLMRolloutCollector:
                     turn_index=turn_idx,
                     trace_id=trace_id,
                 )
-                turn_items.append(turn_result)
                 
-                # Submit for async teacher alignment while rollouts continue
-                if self.on_turn_complete:
-                    self.on_turn_complete(turn_result)
+                # Save every Nth turn + last turn
+                is_last_turn = turn_idx == self.max_tool_turns - 1 or not tool_calls
+                if turn_idx % self.train_every_n_turns == 0 or is_last_turn:
+                    turn_items.append(turn_result)
+                    if self.on_turn_complete:
+                        self.on_turn_complete(turn_result)
                 
                 # Track turn completion for progress reporting
                 if on_turn:
