@@ -19,11 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from accelerate.utils import FullyShardedDataParallelPlugin
-from torch.distributed.fsdp.fully_sharded_data_parallel import (
-    FullStateDictConfig,
-    BackwardPrefetch,
-)
+from accelerate.utils import DeepSpeedPlugin
 from transformers import get_scheduler
 
 from tqdm.auto import tqdm
@@ -336,6 +332,7 @@ def _run_tool_on_policy_vllm_accelerate(
     wandb_run = None
 
     try:
+        import os
         # NOW set training GPUs via environment variable after vLLM has started
         # This ensures the training model loads on the correct GPUs
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, training_gpu_ids))
@@ -344,27 +341,27 @@ def _run_tool_on_policy_vllm_accelerate(
             os.environ["CUDA_VISIBLE_DEVICES"],
         )
 
-        # Initialize Accelerator with FSDP
+        # Initialize Accelerator with DeepSpeed
         training_precision = getattr(options, "training_precision", "bf16")
-        use_fsdp = getattr(options, "use_fsdp", False)
+        deepspeed_config = getattr(options, "deepspeed_config", None)
         
-        if use_fsdp:
-            # Configure FSDP plugin with memory optimizations
-            fsdp_plugin = FullyShardedDataParallelPlugin(
-                state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
-                sharding_strategy="FULL_SHARD",  # Shard parameters, gradients, and optimizer states
-                backward_prefetch=BackwardPrefetch.BACKWARD_PRE,  # Prefetch next layer during backward
-                forward_prefetch=True,  # Prefetch next layer during forward
-                limit_all_gathers=True,  # Reduce memory by limiting concurrent all-gathers
-                sync_module_states=True,  # Ensure consistent initialization across ranks
-                activation_checkpointing=True,  # Save memory by recomputing activations
-                cpu_offload=True,  # Offload params to CPU when not in use
+        if deepspeed_config:
+            # Use DeepSpeed with config file
+            config_path = Path(deepspeed_config)
+            if not config_path.is_absolute():
+                config_path = Path("/home/ubuntu/spider") / config_path
+            
+            deepspeed_plugin = DeepSpeedPlugin(
+                hf_ds_config=str(config_path),
+                zero_stage=3,
+                gradient_accumulation_steps=1,
+                gradient_clipping=1.0,
             )
             accelerator = Accelerator(
                 mixed_precision=training_precision,
-                fsdp_plugin=fsdp_plugin,
+                deepspeed_plugin=deepspeed_plugin,
             )
-            logger.info("Accelerator initialized with FSDP (activation_checkpointing, cpu_offload) and mixed_precision=%s", training_precision)
+            logger.info("Accelerator initialized with DeepSpeed (config=%s) and mixed_precision=%s", config_path, training_precision)
         else:
             accelerator = Accelerator(mixed_precision=training_precision)
             logger.info("Accelerator initialized with mixed_precision=%s", training_precision)
@@ -522,6 +519,30 @@ def _run_tool_on_policy_vllm_accelerate(
             fireworks_model=fireworks_model,
         )
         logger.info("Using Fireworks API for teacher: %s", fireworks_model)
+        
+        # Async teacher alignment: submit turns as they complete during rollouts
+        alignment_futures = []  # Shared list for async alignment futures
+        alignment_lock = threading.Lock()
+        
+        def _on_turn_complete(turn_result):
+            """Callback to submit turn for teacher alignment while rollouts continue."""
+            # Convert logprobs list to tensor (compute_teacher_alignment expects tensor)
+            student_logprobs_tensor = torch.tensor(turn_result.logprobs, dtype=torch.float32)
+            future = teacher_ctx._executor.submit(
+                teacher_ctx.compute_teacher_alignment,
+                messages=turn_result.messages,
+                tools=tool_defs,
+                student_model=student_model,
+                student_token_ids=turn_result.token_ids,
+                student_logprobs=student_logprobs_tensor,
+                reward_mask=turn_result.reward_mask,
+                assistant_raw_text=turn_result.assistant_raw_text,
+            )
+            with alignment_lock:
+                alignment_futures.append((turn_result, future))
+        
+        # Update collector to use the callback
+        collector.on_turn_complete = _on_turn_complete
 
         # Initialize wandb
         wandb_project = getattr(options, "wandb_project", None)
@@ -608,109 +629,71 @@ def _run_tool_on_policy_vllm_accelerate(
             all_advantages = []
             all_loss_masks = []
 
-            # Collect all teacher alignment calls for parallelization
+            # Use pre-computed async teacher alignments (submitted during rollouts)
             from concurrent.futures import as_completed
             
-            alignment_tasks = []
+            # Build turn_id -> turn mapping for trajectories
+            turn_id_to_idx = {}
             for turn_index, turn in enumerate(trajectories):
-                messages = turn["messages"]
-                token_ids = turn["token_ids"]
-                logprobs = turn["logprobs"]
-                reward_mask = turn["reward_mask"]
-                student_logprobs = torch.tensor(logprobs, dtype=torch.float32, device=device)
-
-                # Check if this is a combined multi-turn item
-                combined_turns = turn.get("_combined_turns")
-                if combined_turns:
-                    for turn_info in combined_turns:
-                        turn_messages = turn_info["messages"]
-                        turn_assistant_raw_text = turn_info.get("assistant_raw_text")
-                        if not turn_assistant_raw_text:
-                            continue
-                        
-                        turn_reward_mask = [0] * len(token_ids)
-                        completion_start = turn_info["completion_start"]
-                        completion_end = turn_info["completion_end"]
-                        for idx in range(completion_start, completion_end):
-                            if idx < len(turn_reward_mask):
-                                turn_reward_mask[idx] = 1
-                        
-                        alignment_tasks.append({
-                            "turn_index": turn_index,
-                            "turn": turn,
-                            "turn_info": turn_info,
-                            "messages": turn_messages,
-                            "token_ids": token_ids,
-                            "student_logprobs": student_logprobs,
-                            "reward_mask": turn_reward_mask,
-                            "assistant_raw_text": turn_assistant_raw_text,
-                        })
-                else:
-                    alignment_tasks.append({
-                        "turn_index": turn_index,
-                        "turn": turn,
-                        "turn_info": None,
-                        "messages": messages,
-                        "token_ids": token_ids,
-                        "student_logprobs": student_logprobs,
-                        "reward_mask": reward_mask,
-                        "assistant_raw_text": turn.get("assistant_raw_text"),
-                    })
+                # Use (prompt, turn_index_in_prompt) as key
+                turn_id = (turn.get("prompt", "")[:50], turn.get("turn_index", 0))
+                turn_id_to_idx[turn_id] = turn_index
             
-            # Submit all tasks in parallel
-            logger.info("Starting teacher alignment: %d tasks", len(alignment_tasks))
-            teacher_start = time.time()
-            futures = {}
-            for task in alignment_tasks:
-                future = teacher_ctx._executor.submit(
-                    _compute_teacher_alignment,
-                    messages=task["messages"],
-                    tools=tool_defs,
-                    student_token_ids=task["token_ids"],
-                    student_logprobs=task["student_logprobs"],
-                    reward_mask=task["reward_mask"],
-                    assistant_raw_text=task["assistant_raw_text"],
-                )
-                futures[future] = task
-            
-            # Collect results with progress logging
+            # Wait for async alignment futures (submitted during rollouts)
             alignment_results = {}
-            completed_count = 0
-            last_log_time = time.time()
-            for future in as_completed(futures):
-                completed_count += 1
-                now = time.time()
-                if now - last_log_time >= 10.0:  # Log every 10 seconds
-                    logger.info(
-                        "Teacher alignment progress: %d/%d (%.0f%%), %.1fs elapsed",
-                        completed_count, len(futures), 100.0 * completed_count / len(futures),
-                        now - teacher_start
-                    )
-                    last_log_time = now
-                task = futures[future]
-                turn_idx = task["turn_index"]
-                
-                try:
-                    alignment = future.result()
-                except Exception as e:
-                    logger.error(f"Error in parallel teacher alignment: {e}")
-                    alignment = {
-                        "kl_adjustments": [0.0] * len(task["token_ids"]),
-                        "kl_mask": [0.0] * len(task["token_ids"]),
-                    }
-                
-                if turn_idx not in alignment_results:
-                    alignment_results[turn_idx] = []
-                alignment_results[turn_idx].append({
-                    "task": task,
-                    "alignment": alignment,
-                })
+            with alignment_lock:
+                pending_futures = list(alignment_futures)
+                alignment_futures.clear()  # Clear for next batch
             
-            teacher_elapsed = time.time() - teacher_start
-            logger.info(
-                "Teacher alignment complete: %d tasks in %.1fs (%.1f tasks/s)",
-                len(alignment_tasks), teacher_elapsed, len(alignment_tasks) / teacher_elapsed if teacher_elapsed > 0 else 0
-            )
+            if pending_futures:
+                logger.info("Waiting for async teacher alignment: %d tasks (started during rollouts)", len(pending_futures))
+                teacher_start = time.time()
+                completed_count = 0
+                last_log_time = time.time()
+                
+                for turn_result, future in pending_futures:
+                    completed_count += 1
+                    now = time.time()
+                    if now - last_log_time >= 10.0:
+                        logger.info(
+                            "Teacher alignment progress: %d/%d (%.0f%%), %.1fs elapsed",
+                            completed_count, len(pending_futures), 100.0 * completed_count / len(pending_futures),
+                            now - teacher_start
+                        )
+                        last_log_time = now
+                    
+                    # Find matching trajectory turn
+                    turn_id = (turn_result.prompt[:50], turn_result.turn_index)
+                    turn_idx = turn_id_to_idx.get(turn_id, -1)
+                    
+                    try:
+                        alignment = future.result()
+                    except Exception as e:
+                        logger.error(f"Error in async teacher alignment: {e}")
+                        alignment = {
+                            "kl_adjustments": [0.0] * len(turn_result.token_ids),
+                            "kl_mask": [0.0] * len(turn_result.token_ids),
+                        }
+                    
+                    if turn_idx >= 0:
+                        if turn_idx not in alignment_results:
+                            alignment_results[turn_idx] = []
+                        alignment_results[turn_idx].append({
+                            "task": {
+                                "turn_index": turn_idx,
+                                "turn_info": None,
+                                "token_ids": turn_result.token_ids,
+                            },
+                            "alignment": alignment,
+                        })
+                
+                teacher_elapsed = time.time() - teacher_start
+                logger.info(
+                    "Teacher alignment complete: %d tasks in %.1fs (%.1f tasks/s, overlapped with rollouts)",
+                    len(pending_futures), teacher_elapsed, len(pending_futures) / teacher_elapsed if teacher_elapsed > 0 else 0
+                )
+            else:
+                logger.warning("No async alignments found, falling back to sync mode")
             
             # Process trajectories with alignment results
             for turn_index, turn in enumerate(trajectories):
@@ -818,6 +801,7 @@ def _run_tool_on_policy_vllm_accelerate(
                     )
 
             # Perform training step with clipped importance sampling
+            # Use micro-batching: backward pass after each trajectory to avoid OOM
             num_trajectories = len(all_input_ids)
             
             # Force memory cleanup before training loop
@@ -827,7 +811,7 @@ def _run_tool_on_policy_vllm_accelerate(
             
             optimizer.zero_grad()
             
-            total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            total_loss_value = 0.0  # Accumulate scalar loss values
             total_clip_fraction = 0.0
             valid_count = 0
             
@@ -850,8 +834,8 @@ def _run_tool_on_policy_vllm_accelerate(
                 mem_allocated = torch.cuda.memory_allocated() / 1e9
                 mem_reserved = torch.cuda.memory_reserved() / 1e9
                 logger.info(
-                    "Before loss fn: traj=%d seq_len=%d mem_allocated=%.2fGB mem_reserved=%.2fGB",
-                    idx, input_ids.shape[1], mem_allocated, mem_reserved
+                    "Before loss fn: traj=%d/%d seq_len=%d mem_allocated=%.2fGB mem_reserved=%.2fGB",
+                    idx, num_trajectories, input_ids.shape[1], mem_allocated, mem_reserved
                 )
                 
                 input_data = {
@@ -892,29 +876,34 @@ def _run_tool_on_policy_vllm_accelerate(
                 with open(output_file, "wb") as f:
                     pickle.dump(output_data, f)
                 
-                total_loss = total_loss + loss
+                # Guard against NaN/Inf loss
+                if not torch.isfinite(loss):
+                    logger.error("NaN/Inf loss at batch %d traj %d, skipping", batch_index, idx)
+                    del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss, current_logprobs, metrics
+                    torch.cuda.empty_cache()
+                    continue
+                
+                # Micro-batching: scale loss and backward immediately
+                # This frees the computation graph after each trajectory
+                scaled_loss = loss / num_trajectories
+                accelerator.backward(scaled_loss)
+                
+                # Accumulate scalar values for logging
+                total_loss_value += loss.detach().item()
                 total_clip_fraction += metrics["clip_fraction"]
                 valid_count += 1
                 
-                del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss, current_logprobs, metrics
-                torch.cuda.empty_cache()  # Force memory release between trajectories
+                # Free memory immediately after backward
+                del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss, scaled_loss, current_logprobs, metrics
+                gc.collect()
+                torch.cuda.empty_cache()
             
             if valid_count == 0:
                 logger.warning("No valid trajectories in batch %d, skipping", batch_index)
                 return items, batch_metrics
             
-            # Average loss
-            avg_loss = total_loss / valid_count
-            
-            # Guard against NaN/Inf
-            if not torch.isfinite(avg_loss):
-                logger.error("NaN/Inf loss detected at batch %d, aborting", batch_index)
-                sys.exit(1)
-
-            # Backward pass
-            accelerator.backward(avg_loss)
-            loss_value = avg_loss.item()
-            del total_loss, avg_loss
+            # Average loss value for logging
+            loss_value = total_loss_value / valid_count
             
             # Gradient clipping and optimizer step
             max_grad_norm = float(getattr(options, "max_grad_norm", 1.0))

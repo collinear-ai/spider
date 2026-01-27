@@ -183,25 +183,15 @@ def load_model_with_lora(
             model.print_trainable_parameters()
             _finish_step(step, start, pbar)
 
-        step = "enable_gradient_checkpointing"
+        step = "configure_for_training"
         start = _timed_step(step)
-        # Enable gradient checkpointing to save VRAM during training
-        # This trades compute for memory by recomputing activations during backward pass
-        if hasattr(model, "gradient_checkpointing_enable"):
-            model.gradient_checkpointing_enable()
-            logger.info("Gradient checkpointing enabled for memory efficiency")
-        elif hasattr(model, "base_model") and hasattr(model.base_model, "gradient_checkpointing_enable"):
-            # For PEFT models, enable on the base model
-            model.base_model.gradient_checkpointing_enable()
-            logger.info("Gradient checkpointing enabled on base model for memory efficiency")
-        elif hasattr(model, "base_model") and hasattr(model.base_model, "model") and hasattr(model.base_model.model, "gradient_checkpointing_enable"):
-            # Some PEFT models have base_model.model structure
-            model.base_model.model.gradient_checkpointing_enable()
-            logger.info("Gradient checkpointing enabled on base_model.model for memory efficiency")
-        else:
-            logger.warning("Could not enable gradient checkpointing - model may not support it")
-        model.config.use_cache = False  # VERY IMPORTANT
+        # Enable input gradients for LoRA (required for gradients to flow through frozen layers)
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        # Disable KV cache (incompatible with training)
+        model.config.use_cache = False
         _finish_step(step, start, pbar)
+        # Note: Gradient/activation checkpointing handled by DeepSpeed if enabled
     
     finally:
         pbar.close()

@@ -67,8 +67,8 @@ job:
       # Use bf16 for numerical stability on Qwen3-8B
       training_precision: bf16
       
-      # Enable FSDP (Fully Sharded Data Parallel) for memory-efficient multi-GPU training
-      use_fsdp: true  # Set to true to enable FSDP
+      # DeepSpeed config for memory-efficient training (ZeRO-3 + activation checkpointing)
+      deepspeed_config: config/deepspeed_zero3_sp.json
 
       # Optional: wandb logging
       wandb_project: icml_26

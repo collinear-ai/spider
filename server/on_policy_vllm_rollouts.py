@@ -40,6 +40,7 @@ class RolloutResult:
     turn_index: int
     retokenize_match: bool = True
     combined_turns: Optional[List[Dict[str, Any]]] = None
+    trace_id: Optional[str] = None  # Unique ID for tracing across debug logs
 
 
 @dataclass
@@ -64,6 +65,7 @@ class VLLMRolloutCollector:
     lora_name: Optional[str] = None
     runtime_factory: Optional[Callable[[Dict[str, Any]], Any]] = None
     verbose: bool = False
+    on_turn_complete: Optional[Callable[[Dict[str, Any]], Any]] = None  # Callback for async teacher alignment
 
     _client: httpx.Client = field(init=False, default=None)
     _executor: ThreadPoolExecutor = field(init=False, default=None)
@@ -206,7 +208,7 @@ class VLLMRolloutCollector:
                 # Retry loop for parsing failures
                 max_parse_retries = 3
                 for parse_attempt in range(max_parse_retries):
-                    response = self._generate_with_logprobs(history)
+                    response = self._generate_with_logprobs(history, prompt_idx=prompt_idx, turn_idx=turn_idx)
 
                     # Check if parsing failed - retry if so
                     parser_fallback = response.get("parser_fallback", False)
@@ -258,22 +260,29 @@ class VLLMRolloutCollector:
 
                 full_history.append(snapshot)
 
-                turn_items.append(
-                    RolloutResult(
-                        prompt=prompt,
-                        messages=list(history) + [snapshot],  # history used for this turn + response
-                        token_ids=full_token_ids,
-                        logprobs=full_logprobs,
-                        reward_mask=reward_mask,
-                        assistant_content=content,
-                        assistant_reasoning_content=reasoning,
-                        assistant_tool_calls=tool_calls,
-                        assistant_raw_text=raw_text,
-                        prompt_token_count=prompt_token_count,
-                        parser_fallback=response.get("parser_fallback", False),
-                        turn_index=turn_idx,
-                    )
+                # Generate trace ID for debugging across vllm_calls -> chunk_history -> training
+                trace_id = f"p{prompt_idx}_t{turn_idx}_{int(time.time()*1000) % 100000}"
+                
+                turn_result = RolloutResult(
+                    prompt=prompt,
+                    messages=list(history) + [snapshot],  # history used for this turn + response
+                    token_ids=full_token_ids,
+                    logprobs=full_logprobs,
+                    reward_mask=reward_mask,
+                    assistant_content=content,
+                    assistant_reasoning_content=reasoning,
+                    assistant_tool_calls=tool_calls,
+                    assistant_raw_text=raw_text,
+                    prompt_token_count=prompt_token_count,
+                    parser_fallback=response.get("parser_fallback", False),
+                    turn_index=turn_idx,
+                    trace_id=trace_id,
                 )
+                turn_items.append(turn_result)
+                
+                # Submit for async teacher alignment while rollouts continue
+                if self.on_turn_complete:
+                    self.on_turn_complete(turn_result)
                 
                 # Track turn completion for progress reporting
                 if on_turn:
@@ -327,26 +336,41 @@ class VLLMRolloutCollector:
         if rest and rest[0].get("role") == "user":
             prefix.append(rest.pop(0))
         
+        # Log token count before turn truncation
+        tokens_before_turn_trunc = self._estimate_history_tokens(prefix + rest)
+        
         # Keep last max_turns worth of messages from rest
         # Each "turn" is roughly: assistant + tool responses
         if len(rest) > max_turns * 2:
             rest = rest[-(max_turns * 2):]
         
         truncated = prefix + rest
+        tokens_after_turn_trunc = self._estimate_history_tokens(truncated)
         
         # Check token count and trim further if needed
-        token_count = self._estimate_history_tokens(truncated)
+        token_count = tokens_after_turn_trunc
         while token_count > max_tokens and len(rest) > 2:
             rest = rest[2:]  # Remove oldest turn (assistant + tool)
             truncated = prefix + rest
             token_count = self._estimate_history_tokens(truncated)
         
+        tokens_final = token_count
+        
+        # Log truncation stats
+        with open("/home/ubuntu/spider/debug_truncation.txt", "a") as f:
+            f.write(f"before_turn_trunc={tokens_before_turn_trunc} after_turn_trunc={tokens_after_turn_trunc} final={tokens_final} msgs={len(history)}->{len(truncated)}\n")
+        
         return truncated
 
     def _estimate_history_tokens(self, history: List[Dict[str, Any]]) -> int:
-        """Rough token estimate for history (4 chars ~ 1 token)."""
-        text = json.dumps(history)
-        return len(text) // 4
+        """Count tokens in history using tokenizer."""
+        text = self._tokenizer.apply_chat_template(
+            history,
+            tools=self.tools if self.tools else None,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        return len(self._tokenizer.encode(text))
 
     def _debug_save_rollout(self, prompt_prefix: str, turn_items: List[RolloutResult]) -> None:
         """Save rollout debug info to pkl."""
@@ -356,14 +380,17 @@ class VLLMRolloutCollector:
         debug_dir.mkdir(exist_ok=True)
         
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        safe_prefix = "".join(c if c.isalnum() else "_" for c in prompt_prefix)
-        filepath = debug_dir / f"{timestamp}_{safe_prefix}.pkl"
+        # Use first turn's trace_id prefix for filename
+        trace_prefix = turn_items[0].trace_id.rsplit("_", 1)[0] if turn_items and turn_items[0].trace_id else "unknown"
+        filepath = debug_dir / f"{trace_prefix}_{timestamp}.pkl"
         
         debug_data = {
             "prompt_prefix": prompt_prefix,
             "num_turns": len(turn_items),
             "turns": [
                 {
+                    # Trace ID for correlation with vllm_calls and training
+                    "trace_id": t.trace_id,
                     # Summary stats
                     "turn_idx": t.turn_index,
                     "token_count": len(t.token_ids),
@@ -406,12 +433,14 @@ class VLLMRolloutCollector:
         return self._thread_local.client
 
     def _generate_with_logprobs(
-        self, messages: List[Dict[str, Any]]
+        self, messages: List[Dict[str, Any]], prompt_idx: int = 0, turn_idx: int = 0
     ) -> Dict[str, Any]:
         """Generate completion with logprobs from vLLM.
 
         Args:
             messages: Chat messages
+            prompt_idx: Index of prompt in batch (for tracing)
+            turn_idx: Index of turn within prompt (for tracing)
 
         Returns:
             Dict with content, tool_calls, token_ids, logprobs, raw_text
@@ -619,6 +648,8 @@ class VLLMRolloutCollector:
             raw_text=raw_text,
             prompt_token_count=prompt_token_count,
             full_token_ids=full_token_ids,
+            prompt_idx=prompt_idx,
+            turn_idx=turn_idx,
         )
 
         return {
@@ -644,14 +675,21 @@ class VLLMRolloutCollector:
         raw_text: str,
         prompt_token_count: int,
         full_token_ids: Optional[List[int]] = None,
+        prompt_idx: int = 0,
+        turn_idx: int = 0,
     ) -> None:
         """Log vLLM request/response to debug folder."""
         import pickle
         debug_dir = Path("/home/ubuntu/spider/debug_vllm_calls")
         debug_dir.mkdir(exist_ok=True)
         
-        timestamp = time.strftime("%Y%m%d_%H%M%S_%f")
+        # Generate trace_id matching the RolloutResult
+        trace_id = f"p{prompt_idx}_t{turn_idx}_{int(time.time()*1000) % 100000}"
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
         log_data = {
+            "trace_id": trace_id,
+            "prompt_idx": prompt_idx,
+            "turn_idx": turn_idx,
             "timestamp": timestamp,
             "request": {
                 "messages": messages,
@@ -673,7 +711,7 @@ class VLLMRolloutCollector:
             },
         }
         
-        log_file = debug_dir / f"vllm_call_{timestamp}.pkl"
+        log_file = debug_dir / f"{trace_id}_{timestamp}.pkl"
         try:
             with open(log_file, "wb") as f:
                 pickle.dump(log_data, f)
@@ -816,6 +854,7 @@ def rollout_results_to_dicts(results: List[RolloutResult]) -> List[Dict[str, Any
     """
     return [
         {
+            "trace_id": r.trace_id,
             "prompt": r.prompt,
             "messages": r.messages,
             "token_ids": r.token_ids,
