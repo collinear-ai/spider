@@ -526,20 +526,24 @@ def _run_tool_on_policy_vllm_accelerate(
         
         def _on_turn_complete(turn_result):
             """Callback to submit turn for teacher alignment while rollouts continue."""
-            # Convert logprobs list to tensor (compute_teacher_alignment expects tensor)
-            student_logprobs_tensor = torch.tensor(turn_result.logprobs, dtype=torch.float32)
-            future = teacher_ctx._executor.submit(
-                teacher_ctx.compute_teacher_alignment,
-                messages=turn_result.messages,
-                tools=tool_defs,
-                student_model=student_model,
-                student_token_ids=turn_result.token_ids,
-                student_logprobs=student_logprobs_tensor,
-                reward_mask=turn_result.reward_mask,
-                assistant_raw_text=turn_result.assistant_raw_text,
-            )
-            with alignment_lock:
-                alignment_futures.append((turn_result, future))
+            try:
+                # Convert logprobs list to tensor (compute_teacher_alignment expects tensor)
+                student_logprobs_tensor = torch.tensor(turn_result.logprobs, dtype=torch.float32)
+                future = teacher_ctx._executor.submit(
+                    teacher_ctx.compute_teacher_alignment,
+                    messages=turn_result.messages,
+                    tools=tool_defs,
+                    student_model=student_model,
+                    student_token_ids=turn_result.token_ids,
+                    student_logprobs=student_logprobs_tensor,
+                    reward_mask=turn_result.reward_mask,
+                    assistant_raw_text=turn_result.assistant_raw_text,
+                )
+                with alignment_lock:
+                    alignment_futures.append((turn_result, future))
+                    logger.debug(f"Queued async alignment: trace_id={turn_result.trace_id}, total_queued={len(alignment_futures)}")
+            except Exception as e:
+                logger.error(f"Error in _on_turn_complete callback: {e}")
         
         # Update collector to use the callback
         collector.on_turn_complete = _on_turn_complete
@@ -588,25 +592,6 @@ def _run_tool_on_policy_vllm_accelerate(
 
         device = accelerator.device
 
-        # Helper to call teacher alignment
-        def _compute_teacher_alignment(
-            messages,
-            tools,
-            student_token_ids,
-            student_logprobs,
-            reward_mask,
-            assistant_raw_text,
-        ):
-            return teacher_ctx.compute_teacher_alignment(
-                messages=messages,
-                tools=tools,
-                student_model=student_model,
-                student_token_ids=student_token_ids,
-                student_logprobs=student_logprobs,
-                reward_mask=reward_mask,
-                assistant_raw_text=assistant_raw_text,
-            )
-
         def _process_batch(
             batch_index: int, trajectories: List[Dict[str, Any]]
         ) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
@@ -632,18 +617,20 @@ def _run_tool_on_policy_vllm_accelerate(
             # Use pre-computed async teacher alignments (submitted during rollouts)
             from concurrent.futures import as_completed
             
-            # Build turn_id -> turn mapping for trajectories
-            turn_id_to_idx = {}
+            # Build trace_id -> turn_index mapping for trajectories
+            trace_id_to_idx = {}
             for turn_index, turn in enumerate(trajectories):
-                # Use (prompt, turn_index_in_prompt) as key
-                turn_id = (turn.get("prompt", "")[:50], turn.get("turn_index", 0))
-                turn_id_to_idx[turn_id] = turn_index
+                trace_id = turn.get("trace_id")
+                if trace_id:
+                    trace_id_to_idx[trace_id] = turn_index
             
             # Wait for async alignment futures (submitted during rollouts)
             alignment_results = {}
             with alignment_lock:
                 pending_futures = list(alignment_futures)
                 alignment_futures.clear()  # Clear for next batch
+            
+            logger.info(f"Processing batch: {len(trajectories)} trajectories, {len(pending_futures)} async alignment futures")
             
             if pending_futures:
                 logger.info("Waiting for async teacher alignment: %d tasks (started during rollouts)", len(pending_futures))
@@ -662,9 +649,11 @@ def _run_tool_on_policy_vllm_accelerate(
                         )
                         last_log_time = now
                     
-                    # Find matching trajectory turn
-                    turn_id = (turn_result.prompt[:50], turn_result.turn_index)
-                    turn_idx = turn_id_to_idx.get(turn_id, -1)
+                    # Find matching trajectory turn using trace_id
+                    turn_idx = trace_id_to_idx.get(turn_result.trace_id, -1)
+                    
+                    if turn_idx < 0:
+                        logger.warning(f"No match for trace_id={turn_result.trace_id}")
                     
                     try:
                         alignment = future.result()
@@ -703,8 +692,14 @@ def _run_tool_on_policy_vllm_accelerate(
                 reward_mask = turn["reward_mask"]
                 student_logprobs = torch.tensor(logprobs, dtype=torch.float32, device=device)
                 
-                # Use pre-computed alignment results
-                results = alignment_results[turn_index]
+                # Use pre-computed alignment results (fallback to zero KL if not found)
+                results = alignment_results.get(turn_index)
+                if not results:
+                    logger.warning(f"No alignment for turn_index={turn_index}, using zero KL")
+                    results = [{
+                        "task": {"turn_index": turn_index, "turn_info": None, "token_ids": token_ids},
+                        "alignment": {"kl_adjustments": [0.0] * len(token_ids), "kl_mask": [0.0] * len(token_ids)},
+                    }]
                 combined_turns = turn.get("_combined_turns")
                 if combined_turns:
                     kl_adjustments_combined = [0.0] * len(token_ids)

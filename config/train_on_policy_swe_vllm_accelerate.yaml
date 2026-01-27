@@ -24,7 +24,7 @@ job:
 
       # Training hyperparameters
       learning_rate: 1e-4
-      groups_per_batch: 1
+      groups_per_batch: 8
       lora_rank: 64
       num_epochs: 50  # Number of epochs to train
       save_every: 10000
