@@ -25,3 +25,12 @@ debug_vllm_calls/
 
 debug_training_shapes.txt
 debug_truncation.txt
+
+debug_chunk_history/
+debug_loss/
+debug_tool_exec/
+debug_traj_b4_training/
+debug_vllm_calls/
+debug_training_shapes.txt
+debug_truncation.txt
+error.txt
