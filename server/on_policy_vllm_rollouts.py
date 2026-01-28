@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
@@ -20,6 +21,11 @@ from tqdm.auto import tqdm
 from .vllm_parsers import parse_assistant_turn
 
 logger = logging.getLogger(__name__)
+
+
+class ToolTimeoutError(Exception):
+    """Raised when tool execution times out - triggers container cleanup and trajectory abort."""
+    pass
 
 
 @dataclass
@@ -65,7 +71,7 @@ class VLLMRolloutCollector:
     runtime_factory: Optional[Callable[[Dict[str, Any]], Any]] = None
     verbose: bool = False
     on_turn_complete: Optional[Callable[[Dict[str, Any]], Any]] = None  # Callback for async teacher alignment
-    train_every_n_turns: int = 1  # Only save every Nth turn for training (1=all)
+    max_training_turns: Optional[int] = None  # Max turns to sample per trajectory (None=all)
 
     _client: httpx.Client = field(init=False, default=None)
     _executor: ThreadPoolExecutor = field(init=False, default=None)
@@ -279,12 +285,10 @@ class VLLMRolloutCollector:
                     trace_id=trace_id,
                 )
                 
-                # Save every Nth turn + last turn
-                is_last_turn = turn_idx == self.max_tool_turns - 1 or not tool_calls
-                if turn_idx % self.train_every_n_turns == 0 or is_last_turn:
-                    turn_items.append(turn_result)
-                    if self.on_turn_complete:
-                        self.on_turn_complete(turn_result)
+                # Collect all turns (sampling happens at the end)
+                turn_items.append(turn_result)
+                if self.on_turn_complete:
+                    self.on_turn_complete(turn_result)
                 
                 # Track turn completion for progress reporting
                 if on_turn:
@@ -294,21 +298,57 @@ class VLLMRolloutCollector:
                     break
 
                 # Execute tool calls (measure time to identify slow tools)
-                tool_exec_start = time.time()
-                self._execute_tool_calls(tool_calls, full_history, prompt_idx, turn_idx)
-                tool_exec_time = time.time() - tool_exec_start
-                if tool_exec_time > 1.0:  # Log if tool execution takes > 1 second
+                try:
+                    tool_exec_start = time.time()
+                    self._execute_tool_calls(tool_calls, full_history, prompt_idx, turn_idx)
+                    tool_exec_time = time.time() - tool_exec_start
+                    if tool_exec_time > 1.0:  # Log if tool execution takes > 1 second
+                        logger.warning(
+                            "Slow tool execution: prompt=`%s...` turn=%d tool_time=%.2fs num_tools=%d",
+                            prompt[:20],
+                            turn_idx,
+                            tool_exec_time,
+                            len(tool_calls),
+                        )
+                except ToolTimeoutError as e:
+                    # Tool timed out and container was killed - keep turns collected so far
                     logger.warning(
-                        "Slow tool execution: prompt=`%s...` turn=%d tool_time=%.2fs num_tools=%d",
-                        prompt[:20],
-                        turn_idx,
-                        tool_exec_time,
-                        len(tool_calls),
+                        "Tool timeout in prompt=`%s...` turn=%d: %s. Keeping %d turns.",
+                        prompt[:20], turn_idx, e, len(turn_items)
                     )
+                    break
+                except Exception as e:
+                    # Other tool error - keep turns collected so far
+                    logger.warning(
+                        "Tool error in prompt=`%s...` turn=%d: %s. Keeping %d turns.",
+                        prompt[:20], turn_idx, e, len(turn_items)
+                    )
+                    break
         finally:
             if runtime is not None:
                 runtime.cleanup()
 
+        # Randomly sample turns if max_training_turns is set
+        # Always include the first turn (initial context) and last turn (reward signal)
+        if turn_items and self.max_training_turns and len(turn_items) > self.max_training_turns:
+            first_turn = turn_items[0]
+            last_turn = turn_items[-1]
+            middle_turns = turn_items[1:-1]
+            # Sample (max_training_turns - 2) from middle turns, keep first and last
+            num_to_sample = min(self.max_training_turns - 2, len(middle_turns))
+            if num_to_sample > 0:
+                sampled_middle = random.sample(middle_turns, num_to_sample)
+                # Sort by turn_index to maintain order
+                sampled_middle.sort(key=lambda t: t.turn_index)
+                turn_items = [first_turn] + sampled_middle + [last_turn]
+            else:
+                # Only first and last if max_training_turns <= 2
+                turn_items = [first_turn, last_turn] if first_turn != last_turn else [first_turn]
+            logger.info(
+                "prompt=`%s...` sampled %d/%d turns for training (first+last+%d middle)",
+                prompt[:8], len(turn_items), len(middle_turns) + 2, num_to_sample
+            )
+        
         # Return each turn as separate training item (no combining)
         # Each turn already has truncated history context
         if turn_items:
@@ -791,9 +831,27 @@ class VLLMRolloutCollector:
                 try:
                     if self.tool_timeout:
                         # Use ThreadPoolExecutor to enforce timeout
-                        with ThreadPoolExecutor(max_workers=1) as executor:
-                            future = executor.submit(handler, **args)
+                        # Copy context so ContextVars (like _CURRENT_RUNTIME) propagate to thread
+                        import contextvars
+                        ctx = contextvars.copy_context()
+                        executor = ThreadPoolExecutor(max_workers=1)
+                        try:
+                            future = executor.submit(ctx.run, handler, **args)
                             result = future.result(timeout=self.tool_timeout)
+                        except FuturesTimeoutError:
+                            # Kill container FIRST so the docker exec in the thread fails fast
+                            try:
+                                from workloads.swe_rebench_openhands.runner_accelerate import _CURRENT_RUNTIME
+                                runtime = _CURRENT_RUNTIME.get(None)
+                                if runtime is not None:
+                                    logger.info("Killing container due to tool timeout...")
+                                    runtime.cleanup()
+                            except Exception as cleanup_exc:
+                                logger.warning("Failed to cleanup runtime after timeout: %s", cleanup_exc)
+                            raise  # Re-raise to handle below
+                        finally:
+                            # Shutdown without waiting - container is killed so thread will exit soon
+                            executor.shutdown(wait=False, cancel_futures=True)
                     else:
                         # No timeout - execute directly
                         result = handler(**args)
@@ -804,9 +862,11 @@ class VLLMRolloutCollector:
                     result = f"Tool '{name}' execution timed out after {self.tool_timeout}s"
                     error = "timeout"
                     logger.warning(
-                        "Tool '%s' timed out after %.1fs, skipping result",
+                        "Tool '%s' timed out after %.1fs, container killed",
                         name, self.tool_timeout
                     )
+                    # Raise to abort this trajectory and keep previous turns
+                    raise ToolTimeoutError(f"Tool '{name}' timed out after {self.tool_timeout}s")
                 except Exception as exc:
                     result = f"Tool execution error: {exc}"
                     error = str(exc)

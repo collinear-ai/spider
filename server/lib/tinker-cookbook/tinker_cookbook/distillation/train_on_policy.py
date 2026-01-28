@@ -214,7 +214,7 @@ async def incorporate_kl_penalty(
                 f"GOLD: student tokens and logprobs must have matching lengths, but got {len(student_tokens)} and {int(student_logprobs.shape[0])}",
             )
 
-            group_reverse_kl_slice, group_mask_slice = _compute_groupwise_reverse_kl(
+            group_reverse_kl_slice, group_mask_slice, _ = _compute_groupwise_reverse_kl(
                 student_tokenizer,
                 student_tokens,
                 student_logprobs,
@@ -311,7 +311,14 @@ def _compute_groupwise_reverse_kl(
     teacher_token_ids: List[int],
     teacher_logprobs: torch.Tensor,
     base_mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute groupwise reverse KL and aligned teacher logprobs.
+    
+    Returns:
+        reverse_kl: Per-token reverse KL (log p_student - log p_teacher) redistributed from groups
+        mask: Mask indicating which tokens have valid KL values
+        aligned_teacher_logprobs: Teacher logprobs redistributed to align with student tokens
+    """
     student_groups, teacher_groups = _build_alignment_groups(
         student_tokenizer,
         student_token_ids,
@@ -328,6 +335,7 @@ def _compute_groupwise_reverse_kl(
 
     reverse_kl = torch.zeros_like(student_logprobs)
     mask = torch.zeros_like(base_mask)
+    aligned_teacher_logprobs = torch.zeros_like(student_logprobs)
 
     for i, (s_group, t_group) in enumerate(zip(student_groups, teacher_groups)):
         if i < 5:
@@ -362,13 +370,89 @@ def _compute_groupwise_reverse_kl(
             teacher_log_sum = teacher_log_sum + teacher_logprobs[t_idx]
 
         delta = student_log_sum - teacher_log_sum
-        share = delta / len(student_indices)
+        kl_share = delta / len(student_indices)
+        # Redistribute teacher log sum equally to student tokens for alignment
+        teacher_share = teacher_log_sum / len(student_indices)
 
         for s_idx in student_indices:
-            reverse_kl[s_idx] = share
+            reverse_kl[s_idx] = kl_share
+            mask[s_idx] = base_mask[s_idx]
+            aligned_teacher_logprobs[s_idx] = teacher_share
+
+    return reverse_kl, mask, aligned_teacher_logprobs
+
+
+def compute_aligned_teacher_logprobs(
+    student_tokenizer: Tokenizer,
+    student_token_ids: List[int],
+    teacher_tokenizer: Tokenizer,
+    teacher_token_ids: List[int],
+    teacher_logprobs: torch.Tensor,
+    base_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute aligned teacher logprobs without needing student logprobs.
+    
+    This function aligns teacher logprobs to student token positions for use
+    in computing KL divergence during training (where fresh student logprobs
+    are computed via forward pass).
+    
+    Returns:
+        aligned_teacher_logprobs: Teacher logprobs redistributed to align with student tokens
+        mask: Mask indicating which tokens have valid aligned values
+    """
+    student_groups, teacher_groups = _build_alignment_groups(
+        student_tokenizer,
+        student_token_ids,
+        teacher_tokenizer,
+        teacher_token_ids,
+    )
+    logger.info(
+        "GOLD alignment: student_tokens=%d teacher_tokens=%d student_groups=%d teacher_groups=%d",
+        len(student_token_ids),
+        len(teacher_token_ids),
+        len(student_groups),
+        len(teacher_groups)
+    )
+
+    aligned_teacher_logprobs = torch.zeros(len(student_token_ids), dtype=teacher_logprobs.dtype, device=teacher_logprobs.device)
+    mask = torch.zeros(len(student_token_ids), dtype=base_mask.dtype, device=base_mask.device)
+
+    for i, (s_group, t_group) in enumerate(zip(student_groups, teacher_groups)):
+        if i < 5:
+            student_slice = student_tokenizer.decode(
+                [student_token_ids[j] for j in s_group],
+                skip_special_tokens=False,
+            )
+            teacher_slice = teacher_tokenizer.decode(
+                [teacher_token_ids[j] for j in t_group],
+                skip_special_tokens=False,
+            )
+            logger.info(
+                "GOLD group %d: student_tokens=%d teacher_tokens=%d student_text='%s', teacher_text='%s'",
+                i,
+                len(s_group),
+                len(t_group),
+                student_slice,
+                teacher_slice,
+            )
+
+        teacher_indices = [idx for idx in t_group if idx < len(teacher_logprobs)]
+        student_indices = [idx for idx in s_group if idx < len(student_token_ids) and base_mask[idx] > 0]
+        if not teacher_indices or not student_indices:
+            continue
+            
+        teacher_log_sum = teacher_logprobs[teacher_indices[0]]
+        for t_idx in teacher_indices[1:]:
+            teacher_log_sum = teacher_log_sum + teacher_logprobs[t_idx]
+
+        # Redistribute teacher log sum equally to student tokens for alignment
+        teacher_share = teacher_log_sum / len(student_indices)
+
+        for s_idx in student_indices:
+            aligned_teacher_logprobs[s_idx] = teacher_share
             mask[s_idx] = base_mask[s_idx]
 
-    return reverse_kl, mask
+    return aligned_teacher_logprobs, mask
 
 def _build_alignment_groups(
     student_tokenizer: Tokenizer,
