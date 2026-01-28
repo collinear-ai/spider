@@ -177,10 +177,10 @@ class OnPolicyConfig(BaseModel):
         le=1.0,
         description="PPO-style clipping ratio for importance sampling loss"
     )
-    train_every_n_turns: int = Field(
-        default=1,
+    max_training_turns: Optional[int] = Field(
+        default=None,
         ge=1,
-        description="Only train on every Nth turn (1=all turns, 5=every 5th turn)"
+        description="Max turns to sample per trajectory for training. If None, uses all turns. Randomly samples from middle turns (always keeps first and last)."
     )
 
 class GenerationConfig(BaseModel):

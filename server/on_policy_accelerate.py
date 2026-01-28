@@ -491,8 +491,8 @@ def _run_tool_on_policy_vllm_accelerate(
 
         # Create rollout collector with the synced LoRA adapter
         rollout_workers = getattr(options, "rollout_workers", 8)
-        train_every_n_turns = int(getattr(options, "train_every_n_turns", 1))
-        logger.info("Rollout collector: train_every_n_turns=%d", train_every_n_turns)
+        max_training_turns = getattr(options, "max_training_turns", None)
+        logger.info("Rollout collector: max_training_turns=%s", max_training_turns)
         collector = VLLMRolloutCollector(
             vllm_base_url=vllm_backend.base_url,
             model_name=student_model,
@@ -508,7 +508,7 @@ def _run_tool_on_policy_vllm_accelerate(
             lora_name=initial_lora_name,  # Use synced LoRA from the start
             runtime_factory=runtime_factory,
             verbose=verbose_turns,
-            train_every_n_turns=train_every_n_turns,
+            max_training_turns=max_training_turns,
         )
 
         # Load teacher model using Fireworks API

@@ -53,6 +53,7 @@ job:
       # Parallel rollout collection
       rollout_workers: 128  # Number of concurrent HTTP requests to vLLM (increased for better throughput)
       # tool_timeout: 200  # Disabled - no timeout for tool execution
+      max_training_turns: 16  # Random sample up to 10 turns per trajectory (always keeps first+last, ~30% of 32)
 
       # Weight synchronization between training and inference
       weight_sync_steps: 1  # Sync LoRA weights to vLLM every N training steps
