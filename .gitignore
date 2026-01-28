@@ -16,3 +16,9 @@ CLAUDE.md
 
 wandb/
 workspace*/
+debug_traj_b4_training/
+debug_loss/
+debug_chunk_history/
+debug_tool_exec/
+*.pkl
+debug_vllm_calls/

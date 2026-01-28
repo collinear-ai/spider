@@ -1,0 +1,1 @@
+vLLM chat failed (status=400): {"error":{"message":"'max_tokens' or 'max_completion_tokens' is too large: 16384. This model's maximum context length is 40960 tokens and your request has 24780 input tokens (16384 > 40960 - 24780). None","type":"BadRequestError","param":null,"code":400}}

@@ -503,7 +503,7 @@ def _run_tool_on_policy_vllm_accelerate(
             max_tool_turns=max(1, job.generation.max_tool_turns or 16),
             max_tokens=job.generation.parameters.get("max_tokens", 16384),  # High default, let model generate freely
             temperature=job.generation.parameters.get("temperature", 1.0),
-            tool_timeout=getattr(options, "tool_timeout", None),  # None = no timeout
+            tool_timeout=getattr(options, "tool_timeout", 60.0),  # None = no timeout
             lora_name=initial_lora_name,  # Use synced LoRA from the start
             runtime_factory=runtime_factory,
             verbose=verbose_turns,
@@ -527,15 +527,12 @@ def _run_tool_on_policy_vllm_accelerate(
         def _on_turn_complete(turn_result):
             """Callback to submit turn for teacher alignment while rollouts continue."""
             try:
-                # Convert logprobs list to tensor (compute_teacher_alignment expects tensor)
-                student_logprobs_tensor = torch.tensor(turn_result.logprobs, dtype=torch.float32)
                 future = teacher_ctx._executor.submit(
                     teacher_ctx.compute_teacher_alignment,
                     messages=turn_result.messages,
                     tools=tool_defs,
                     student_model=student_model,
                     student_token_ids=turn_result.token_ids,
-                    student_logprobs=student_logprobs_tensor,
                     reward_mask=turn_result.reward_mask,
                     assistant_raw_text=turn_result.assistant_raw_text,
                 )
@@ -602,7 +599,6 @@ def _run_tool_on_policy_vllm_accelerate(
                 "kl_sum": 0.0,
                 "kl_count": 0,
                 "advantage_sum": 0.0,
-                "advantage_sq_sum": 0.0,
                 "advantage_count": 0,
                 "clip_fraction_sum": 0.0,
                 "clip_count": 0,
@@ -697,65 +693,58 @@ def _run_tool_on_policy_vllm_accelerate(
                 
                 # Skip sequences that are too long (OOM prevention)
                 seq_len = len(token_ids) - 1  # input_ids length
-                if seq_len > 16384:
+                if seq_len > 32768:
                     logger.warning(f"Skipping traj {turn_index}: seq_len={seq_len} > 16384")
                     continue
                 
-                # Get alignment (fallback to zero KL)
+                # Get alignment (fallback to zero aligned teacher logprobs)
                 results = alignment_results.get(turn_index)
                 if results:
                     teacher_alignment = results[0]["alignment"]
                 else:
-                    teacher_alignment = {"kl_adjustments": [0.0] * len(token_ids), "kl_mask": [0.0] * len(token_ids)}
+                    teacher_alignment = {
+                        "kl_adjustments": [0.0] * len(token_ids),
+                        "kl_mask": [0.0] * len(token_ids),
+                        "aligned_teacher_logprobs": [0.0] * len(token_ids),
+                    }
                 
-                # Build tensors on CPU first
-                kl_adj = teacher_alignment.get("kl_adjustments") or [0.0] * len(token_ids)
+                # Get aligned teacher logprobs for KL computation inside loss function
+                aligned_teacher_lp = teacher_alignment.get("aligned_teacher_logprobs") or [0.0] * len(token_ids)
                 kl_coef = float(getattr(options, "kl_penalty_coef", 1.0))
-                kl_discount = float(getattr(options, "kl_discount_factor", 0.0))
-                
-                kl_tensor_cpu = torch.tensor(kl_adj, dtype=torch.float32)
-                advantage_cpu = -kl_coef * kl_tensor_cpu
-                if kl_discount > 0:
-                    advantage_cpu = torch.tensor(
-                        discounted_future_sum_vectorized(advantage_cpu.numpy(), kl_discount),
-                        dtype=torch.float32,
-                    )
                 
                 input_tokens = token_ids[:-1]
                 target_tokens = token_ids[1:]
                 mask_tokens = reward_mask[1:]
                 logprobs_tokens = torch.tensor(logprobs, dtype=torch.float32)[1:]
-                advantages_tokens = advantage_cpu[1:]
+                aligned_teacher_tokens = torch.tensor(aligned_teacher_lp, dtype=torch.float32)[1:]
                 
                 mask_tensor_cpu = torch.tensor(mask_tokens, dtype=torch.float32)
-                advantages_tokens = advantages_tokens * mask_tensor_cpu
                 
                 # Move to GPU only for this trajectory
                 input_ids = torch.tensor(input_tokens, dtype=torch.long, device=device).unsqueeze(0)
                 target_ids = torch.tensor(target_tokens, dtype=torch.long, device=device).unsqueeze(0)
                 sampling_lp = logprobs_tokens.to(device).unsqueeze(0)
-                advantages = advantages_tokens.to(device).unsqueeze(0)
+                aligned_teacher_gpu = aligned_teacher_tokens.to(device).unsqueeze(0)
                 loss_mask = mask_tensor_cpu.to(device).unsqueeze(0)
                 
                 # Metrics tracking (before GPU tensors get deleted)
+                kl_adj = teacher_alignment.get("kl_adjustments") or [0.0] * len(token_ids)
+                kl_tensor_cpu = torch.tensor(kl_adj, dtype=torch.float32)
                 kl_tensor = kl_tensor_cpu.to(device)
                 mask_bool = torch.tensor(reward_mask, dtype=torch.bool, device=device)
                 kl_vals = kl_tensor[mask_bool].tolist() if kl_tensor.numel() > 0 else []
-                adv_vals = advantages_tokens[mask_tensor_cpu.bool()].tolist() if advantages_tokens.numel() > 0 else []
                 
+                # Note: advantages are now computed inside loss function from aligned_teacher_logprobs
+                # Pre-compute expected advantage for metrics (will be recomputed with fresh logprobs in loss fn)
                 batch_metrics["kl_sum"] += sum(kl_vals)
                 batch_metrics["kl_count"] += len(kl_vals)
-                batch_metrics["advantage_sum"] += sum(adv_vals)
-                batch_metrics["advantage_sq_sum"] += sum(v * v for v in adv_vals)
-                batch_metrics["advantage_count"] += len(adv_vals)
                 
-                # Store item for return
-                student_logprobs = torch.tensor(logprobs, dtype=torch.float32, device=device)
+                # Store item for return (student_logprobs no longer needed, computed fresh in loss fn)
                 item = dict(turn)
                 item.update({
-                    "student_logprobs": student_logprobs,
                     "kl_adjustments": teacher_alignment.get("kl_adjustments"),
                     "kl_mask": teacher_alignment.get("kl_mask"),
+                    "aligned_teacher_logprobs": teacher_alignment.get("aligned_teacher_logprobs"),
                 })
                 items.append(item)
                 
@@ -773,39 +762,21 @@ def _run_tool_on_policy_vllm_accelerate(
                     turn_index, num_trajectories, input_ids.shape[1], mem_allocated, mem_reserved
                 )
                 
-                # Debug logging
-                import pickle
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                input_data = {
-                    "batch_index": batch_index, "trajectory_idx": turn_index,
-                    "input_ids": input_ids.detach().cpu(), "target_ids": target_ids.detach().cpu(),
-                    "sampling_logprobs": sampling_lp.detach().cpu(), "advantages": advantages.detach().cpu(),
-                    "loss_mask": loss_mask.detach().cpu(), "clip_ratio": clip_ratio,
-                    "mem_allocated_gb": mem_allocated, "mem_reserved_gb": mem_reserved,
-                }
-                with open(debug_loss_dir / f"batch{batch_index}_traj{turn_index}_{timestamp}_input.pkl", "wb") as f:
-                    pickle.dump(input_data, f)
-                
-                # Forward pass
+                # Forward pass - KL and advantages computed inside with gradients
                 loss, current_logprobs, metrics = importance_sampling_loss_with_clip(
                     model=model, input_ids=input_ids, target_ids=target_ids,
-                    sampling_logprobs=sampling_lp, advantages=advantages,
-                    loss_mask=loss_mask, clip_ratio=clip_ratio,
+                    sampling_logprobs=sampling_lp, aligned_teacher_logprobs=aligned_teacher_gpu,
+                    loss_mask=loss_mask, clip_ratio=clip_ratio, kl_coef=kl_coef,
                 )
                 
-                # Debug logging output
-                output_data = {
-                    "batch_index": batch_index, "trajectory_idx": turn_index,
-                    "current_logprobs": current_logprobs.detach().cpu(),
-                    "loss": loss.detach().cpu().item(), "metrics": metrics,
-                }
-                with open(debug_loss_dir / f"batch{batch_index}_traj{turn_index}_{timestamp}_output.pkl", "wb") as f:
-                    pickle.dump(output_data, f)
+                # Track advantage metrics from loss function output
+                batch_metrics["advantage_sum"] += metrics.get("mean_advantage", 0.0) * loss_mask.sum().item()
+                batch_metrics["advantage_count"] += int(loss_mask.sum().item())
                 
                 # Guard against NaN/Inf
                 if not torch.isfinite(loss):
                     logger.error("NaN/Inf loss at batch %d traj %d, skipping", batch_index, turn_index)
-                    del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss, current_logprobs, metrics
+                    del input_ids, target_ids, sampling_lp, aligned_teacher_gpu, loss_mask, loss, current_logprobs, metrics
                     torch.cuda.empty_cache()
                     continue
                 
@@ -818,8 +789,8 @@ def _run_tool_on_policy_vllm_accelerate(
                 valid_count += 1
                 
                 # Free GPU memory immediately
-                del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss, scaled_loss, current_logprobs, metrics
-                del kl_tensor, mask_bool, student_logprobs
+                del input_ids, target_ids, sampling_lp, aligned_teacher_gpu, loss_mask, loss, scaled_loss, current_logprobs, metrics
+                del kl_tensor, mask_bool
                 gc.collect()
                 torch.cuda.empty_cache()
             
@@ -1038,9 +1009,7 @@ def _run_tool_on_policy_vllm_accelerate(
                         log_data["kl_mean"] = batch_metrics["kl_sum"] / batch_metrics["kl_count"]
                     if batch_metrics["advantage_count"] > 0:
                         adv_mean = batch_metrics["advantage_sum"] / batch_metrics["advantage_count"]
-                        adv_var = (batch_metrics["advantage_sq_sum"] / batch_metrics["advantage_count"]) - adv_mean**2
                         log_data["advantage_mean"] = adv_mean
-                        log_data["advantage_std"] = adv_var**0.5 if adv_var > 0 else 0.0
                     if batch_metrics["clip_count"] > 0:
                         log_data["clip_fraction"] = batch_metrics["clip_fraction_sum"] / batch_metrics["clip_count"]
 

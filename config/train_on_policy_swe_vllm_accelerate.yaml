@@ -4,19 +4,18 @@ job:
     name: "collinear-ai/TEMP_qwen3_14_stage1_icml_26"
   source:
     dataset: collinear-ai/SWE-rebench-split
-    split: stage2[:128]
-    shuffle: false
+    split: stage2
+    shuffle: true
   generation:
-    verbose: false
     on_policy: true
-    max_tool_turns: 50
+    max_tool_turns: 75
     parameters:
       temperature: 0.7
       top_p: 0.95
       # max_tokens removed - let model generate as needed per turn
       tool_choice: auto
     on_policy_options:
-      token_budget: 1605320
+      token_budget: 21516302
       # Teacher model - HF name for tokenizer
       teacher: Qwen/Qwen3-Coder-480B-A35B-Instruct
       # Fireworks model ID - set this to use Fireworks API instead of loading locally
@@ -26,8 +25,8 @@ job:
       learning_rate: 1e-4
       groups_per_batch: 8
       lora_rank: 64
-      num_epochs: 50  # Number of epochs to train
-      save_every: 10000
+      num_epochs: 1  # Number of epochs to train
+      save_every: 10
       # sort_by_tokens removed - not applicable for dynamic student rollouts
       kl_penalty_coef: 1.0
       kl_discount_factor: 0.0
@@ -66,17 +65,17 @@ job:
       # Training precision (bf16, fp16, or fp8 for H100 GPUs)
       # Use bf16 for numerical stability on Qwen3-8B
       training_precision: bf16
-      
-      # DeepSpeed config for memory-efficient training (ZeRO-3 + activation checkpointing)
+      # use_fsdp: true
+      # # DeepSpeed config for memory-efficient training (ZeRO-3 + activation checkpointing)
       deepspeed_config: config/deepspeed_zero3_sp.json
 
       # Optional: wandb logging
       wandb_project: icml_26
-      wandb_name: qwen3-14b-vincent-128subset
+      wandb_name: qwen3-14b-opd-rq1
 
 
   output:
     mode: upload_hf
     hf:
-      repo_id: collinear-ai/qwen3-14b-vincent-128subset-vllm-accelerate
+      repo_id: collinear-ai/qwen3-14b-rq1-opd-new
       repo_type: model

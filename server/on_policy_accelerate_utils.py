@@ -16,7 +16,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenize
 from peft import LoraConfig, get_peft_model, PeftModel, TaskType
 from accelerate import Accelerator
 
-from tinker_cookbook.distillation.train_on_policy import _compute_groupwise_reverse_kl
+from tinker_cookbook.distillation.train_on_policy import _compute_groupwise_reverse_kl, compute_aligned_teacher_logprobs
 
 logger = logging.getLogger(__name__)
 
@@ -312,9 +312,10 @@ def importance_sampling_loss_with_clip(
     input_ids: torch.Tensor,
     target_ids: torch.Tensor,
     sampling_logprobs: torch.Tensor,
-    advantages: torch.Tensor,
+    aligned_teacher_logprobs: torch.Tensor,
     loss_mask: torch.Tensor,
     clip_ratio: float = 0.2,
+    kl_coef: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
     """Compute importance sampling loss with PPO-style clipping.
 
@@ -322,8 +323,13 @@ def importance_sampling_loss_with_clip(
     that could destabilize training. The loss is computed as the pessimistic
     (maximum) of the clipped and unclipped objectives.
 
+    Key design: Gradients flow through the advantages (computed from reverse KL),
+    while the importance ratio is stop-graded. This allows the model to learn
+    to match the teacher's distribution.
+
     Loss = max(-ratio * advantage, -clipped_ratio * advantage) where:
-    - ratio = exp(current_logprob - sampling_logprob)
+    - ratio = exp(current_logprob - sampling_logprob).detach()  # stop-grad
+    - advantage = -kl_coef * (current_logprob - teacher_logprob)  # has gradients
     - clipped_ratio = clamp(ratio, 1 - clip_ratio, 1 + clip_ratio)
 
     Args:
@@ -331,9 +337,10 @@ def importance_sampling_loss_with_clip(
         input_ids: Input token IDs [batch, seq_len] (already shifted, excludes last token)
         target_ids: Target token IDs [batch, seq_len] (predictions for input_ids)
         sampling_logprobs: Log probs from sampling [batch, seq_len]
-        advantages: Advantage values [batch, seq_len]
+        aligned_teacher_logprobs: Teacher log probs aligned to student tokens [batch, seq_len]
         loss_mask: Mask for which tokens to include [batch, seq_len]
         clip_ratio: PPO clipping ratio (default 0.2)
+        kl_coef: Coefficient for KL penalty (default 1.0)
 
     Returns:
         Tuple of (loss, current_logprobs, metrics_dict)
@@ -348,20 +355,30 @@ def importance_sampling_loss_with_clip(
     
     log_probs = F.log_softmax(logits, dim=-1)
 
-    # Gather logprobs for target tokens
+    # Gather logprobs for target tokens (has gradients)
     current_logprobs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
     
     # Clear logits and log_probs immediately after gathering (they're large tensors)
     # These can be huge: [batch, seq_len, vocab_size] where vocab_size ~50k+
     del logits, log_probs
 
-    # Importance weight: exp(current - sampling)
-    ratio = torch.exp(current_logprobs - sampling_logprobs)
+    # Compute reverse KL: log p_student - log p_teacher (has gradients through current_logprobs)
+    reverse_kl = current_logprobs - aligned_teacher_logprobs
+    
+    # Compute advantages from KL (gradients flow through here)
+    # Negative KL means: if student > teacher, advantage is negative (discourage)
+    # if student < teacher, advantage is positive (encourage)
+    advantages = -kl_coef * reverse_kl
+
+    # Importance weight: exp(current - sampling) with STOP GRAD
+    # We don't want gradients through the ratio, only through advantages
+    ratio = torch.exp(current_logprobs - sampling_logprobs).detach()
 
     # Clip the ratio for stability
     clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
 
     # Pessimistic loss (take worse of clipped/unclipped)
+    # Gradients flow through advantages -> reverse_kl -> current_logprobs -> model
     loss_unclipped = -ratio * advantages * loss_mask
     loss_clipped = -clipped_ratio * advantages * loss_mask
 
@@ -378,15 +395,21 @@ def importance_sampling_loss_with_clip(
             clipped_low = ((ratio < 1.0 - clip_ratio) * loss_mask).sum().item()
             clipped_high = ((ratio > 1.0 + clip_ratio) * loss_mask).sum().item()
             clip_fraction = (clipped_low + clipped_high) / mask_sum
+            mean_reverse_kl = (reverse_kl * loss_mask).sum().item() / mask_sum
+            mean_advantage = (advantages * loss_mask).sum().item() / mask_sum
         else:
             mean_ratio = 1.0
             mean_clipped_ratio = 1.0
             clip_fraction = 0.0
+            mean_reverse_kl = 0.0
+            mean_advantage = 0.0
 
     metrics = {
         "mean_ratio": mean_ratio,
         "mean_clipped_ratio": mean_clipped_ratio,
         "clip_fraction": clip_fraction,
+        "mean_reverse_kl": mean_reverse_kl,
+        "mean_advantage": mean_advantage,
     }
 
     return loss, current_logprobs, metrics
@@ -743,11 +766,14 @@ class FireworksTeacherContext:
         tools: Sequence[Dict[str, object]] | None,
         student_model: str,
         student_token_ids: Sequence[int],
-        student_logprobs: torch.Tensor,
         reward_mask: Sequence[int],
         assistant_raw_text: str,
     ) -> Dict[str, object]:
-        """Compute teacher alignment for rewards using Fireworks API."""
+        """Compute teacher alignment for rewards using Fireworks API.
+        
+        Note: student_logprobs are no longer needed since KL is computed
+        in the loss function using fresh logprobs from forward pass.
+        """
         if not messages or messages[-1].get("role") != "assistant":
             raise ValueError("Messages must end with an assistant turn.")
 
@@ -780,7 +806,6 @@ class FireworksTeacherContext:
         # Get logprobs from Fireworks (uses thread pool for parallelization)
         _, full_logprobs = self.compute_logprobs(full_text)
 
-
         completion_lp = full_logprobs[len(prefix_tokens):]
 
         if len(completion_lp) < len(completion_tokens):
@@ -793,44 +818,40 @@ class FireworksTeacherContext:
             end = len(reward_mask) - list(reversed(reward_mask)).index(1)
         except ValueError:
             return {
-                "kl_adjustments": [0.0] * len(student_token_ids),
+                "aligned_teacher_logprobs": [0.0] * len(student_token_ids),
                 "kl_mask": [0.0] * len(student_token_ids),
                 "teacher_token_ids": list(completion_tokens),
                 "teacher_logprobs": list(completion_lp),
             }
 
         student_ids = list(student_token_ids)[start:end]
-        student_lp_slice = student_logprobs[start:end]
         student_mask = torch.tensor(
             list(reward_mask)[start:end],
-            device=student_logprobs.device,
-            dtype=student_logprobs.dtype,
+            dtype=torch.float32,
         )
 
         teacher_lp_tensor = torch.tensor(
             completion_lp,
-            device=student_logprobs.device,
-            dtype=student_logprobs.dtype,
+            dtype=torch.float32,
         )
 
-        kl_slice, kl_mask_slice = _compute_groupwise_reverse_kl(
+        aligned_teacher_slice, kl_mask_slice = compute_aligned_teacher_logprobs(
             student_tokenizer,
             student_ids,
-            student_lp_slice,
             teacher_tokenizer,
             completion_tokens,
             teacher_lp_tensor,
             student_mask,
         )
 
-        # Log KL and associated tensors for inspection and debugging using pickle
-        kl_adjustments = torch.zeros_like(student_logprobs)
-        kl_mask = torch.zeros_like(student_logprobs)
-        kl_adjustments[start:end] = kl_slice
+        # Pad results to full sequence length
+        aligned_teacher_logprobs = torch.zeros(len(student_token_ids), dtype=torch.float32)
+        kl_mask = torch.zeros(len(student_token_ids), dtype=torch.float32)
+        aligned_teacher_logprobs[start:end] = aligned_teacher_slice
         kl_mask[start:end] = kl_mask_slice
 
         return {
-            "kl_adjustments": kl_adjustments.tolist(),
+            "aligned_teacher_logprobs": aligned_teacher_logprobs.tolist(),
             "kl_mask": kl_mask.tolist(),
             "teacher_token_ids": list(completion_tokens),
             "teacher_logprobs": list(completion_lp),

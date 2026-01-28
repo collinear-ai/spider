@@ -22,6 +22,11 @@ from .vllm_parsers import parse_assistant_turn
 logger = logging.getLogger(__name__)
 
 
+class ToolTimeoutError(Exception):
+    """Raised when tool execution times out - triggers container cleanup and trajectory abort."""
+    pass
+
+
 @dataclass
 class RolloutResult:
     """Result from a single rollout trajectory."""
@@ -194,7 +199,7 @@ class VLLMRolloutCollector:
         turn_items: List[RolloutResult] = []
         runtime = None
         max_history_turns = 10  # Max turns to keep in sliding window
-        max_history_tokens = 16384  # Max tokens for history
+        max_history_tokens = 32768  # Max tokens for history
 
         if self.runtime_factory:
             runtime = self.runtime_factory(row)
@@ -291,17 +296,32 @@ class VLLMRolloutCollector:
                     break
 
                 # Execute tool calls (measure time to identify slow tools)
-                tool_exec_start = time.time()
-                self._execute_tool_calls(tool_calls, full_history, prompt_idx, turn_idx)
-                tool_exec_time = time.time() - tool_exec_start
-                if tool_exec_time > 1.0:  # Log if tool execution takes > 1 second
+                try:
+                    tool_exec_start = time.time()
+                    self._execute_tool_calls(tool_calls, full_history, prompt_idx, turn_idx)
+                    tool_exec_time = time.time() - tool_exec_start
+                    if tool_exec_time > 1.0:  # Log if tool execution takes > 1 second
+                        logger.warning(
+                            "Slow tool execution: prompt=`%s...` turn=%d tool_time=%.2fs num_tools=%d",
+                            prompt[:20],
+                            turn_idx,
+                            tool_exec_time,
+                            len(tool_calls),
+                        )
+                except ToolTimeoutError as e:
+                    # Tool timed out and container was killed - keep turns collected so far
                     logger.warning(
-                        "Slow tool execution: prompt=`%s...` turn=%d tool_time=%.2fs num_tools=%d",
-                        prompt[:20],
-                        turn_idx,
-                        tool_exec_time,
-                        len(tool_calls),
+                        "Tool timeout in prompt=`%s...` turn=%d: %s. Keeping %d turns.",
+                        prompt[:20], turn_idx, e, len(turn_items)
                     )
+                    break
+                except Exception as e:
+                    # Other tool error - keep turns collected so far
+                    logger.warning(
+                        "Tool error in prompt=`%s...` turn=%d: %s. Keeping %d turns.",
+                        prompt[:20], turn_idx, e, len(turn_items)
+                    )
+                    break
         finally:
             if runtime is not None:
                 runtime.cleanup()
@@ -788,9 +808,27 @@ class VLLMRolloutCollector:
                 try:
                     if self.tool_timeout:
                         # Use ThreadPoolExecutor to enforce timeout
-                        with ThreadPoolExecutor(max_workers=1) as executor:
-                            future = executor.submit(handler, **args)
+                        # Copy context so ContextVars (like _CURRENT_RUNTIME) propagate to thread
+                        import contextvars
+                        ctx = contextvars.copy_context()
+                        executor = ThreadPoolExecutor(max_workers=1)
+                        try:
+                            future = executor.submit(ctx.run, handler, **args)
                             result = future.result(timeout=self.tool_timeout)
+                        except FuturesTimeoutError:
+                            # Kill container FIRST so the docker exec in the thread fails fast
+                            try:
+                                from workloads.swe_rebench_openhands.runner_accelerate import _CURRENT_RUNTIME
+                                runtime = _CURRENT_RUNTIME.get(None)
+                                if runtime is not None:
+                                    logger.info("Killing container due to tool timeout...")
+                                    runtime.cleanup()
+                            except Exception as cleanup_exc:
+                                logger.warning("Failed to cleanup runtime after timeout: %s", cleanup_exc)
+                            raise  # Re-raise to handle below
+                        finally:
+                            # Shutdown without waiting - container is killed so thread will exit soon
+                            executor.shutdown(wait=False, cancel_futures=True)
                     else:
                         # No timeout - execute directly
                         result = handler(**args)
@@ -801,9 +839,11 @@ class VLLMRolloutCollector:
                     result = f"Tool '{name}' execution timed out after {self.tool_timeout}s"
                     error = "timeout"
                     logger.warning(
-                        "Tool '%s' timed out after %.1fs, skipping result",
+                        "Tool '%s' timed out after %.1fs, container killed",
                         name, self.tool_timeout
                     )
+                    # Raise to abort this trajectory and keep previous turns
+                    raise ToolTimeoutError(f"Tool '{name}' timed out after {self.tool_timeout}s")
                 except Exception as exc:
                     result = f"Tool execution error: {exc}"
                     error = str(exc)
