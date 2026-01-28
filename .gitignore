@@ -22,3 +22,6 @@ debug_chunk_history/
 debug_tool_exec/
 *.pkl
 debug_vllm_calls/
+
+debug_training_shapes.txt
+debug_truncation.txt

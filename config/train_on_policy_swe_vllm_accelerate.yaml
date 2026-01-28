@@ -8,14 +8,13 @@ job:
     shuffle: true
   generation:
     on_policy: true
-    max_tool_turns: 75
+    max_tool_turns: 32
     parameters:
       temperature: 0.7
       top_p: 0.95
       # max_tokens removed - let model generate as needed per turn
       tool_choice: auto
     on_policy_options:
-      token_budget: 21516302
       # Teacher model - HF name for tokenizer
       teacher: Qwen/Qwen3-Coder-480B-A35B-Instruct
       # Fireworks model ID - set this to use Fireworks API instead of loading locally
@@ -71,11 +70,11 @@ job:
 
       # Optional: wandb logging
       wandb_project: icml_26
-      wandb_name: qwen3-14b-opd-rq1
+      wandb_name: qwen3-14b-opd-rq3-partial
 
 
   output:
     mode: upload_hf
     hf:
-      repo_id: collinear-ai/qwen3-14b-rq1-opd-new
+      repo_id: collinear-ai/qwen3-14b-rq3-opd-partial
       repo_type: model

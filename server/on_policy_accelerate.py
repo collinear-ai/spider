@@ -43,7 +43,6 @@ from .writers import JSONLBatchWriter
 from .on_policy_vllm_rollouts import VLLMRolloutCollector, rollout_results_to_dicts
 from .weight_synchronizer import WeightSynchronizer
 from .backends.vllm_backend import VLLMBackend
-from .metrics import discounted_future_sum_vectorized
 
 RolloutBatch = List[Dict[str, Any]]
 
@@ -693,7 +692,7 @@ def _run_tool_on_policy_vllm_accelerate(
                 
                 # Skip sequences that are too long (OOM prevention)
                 seq_len = len(token_ids) - 1  # input_ids length
-                if seq_len > 32768:
+                if seq_len > 16384:
                     logger.warning(f"Skipping traj {turn_index}: seq_len={seq_len} > 16384")
                     continue
                 

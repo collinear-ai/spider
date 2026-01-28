@@ -199,7 +199,7 @@ class VLLMRolloutCollector:
         turn_items: List[RolloutResult] = []
         runtime = None
         max_history_turns = 10  # Max turns to keep in sliding window
-        max_history_tokens = 32768  # Max tokens for history
+        max_history_tokens = 16384  # Max tokens for history
 
         if self.runtime_factory:
             runtime = self.runtime_factory(row)
