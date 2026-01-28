@@ -370,9 +370,9 @@ def importance_sampling_loss_with_clip(
     # if student < teacher, advantage is positive (encourage)
     advantages = -kl_coef * reverse_kl
 
-    # Importance weight: exp(current - sampling) with STOP GRAD
+    # Importance weight: (current - sampling) with STOP GRAD
     # We don't want gradients through the ratio, only through advantages
-    ratio = torch.exp(current_logprobs - sampling_logprobs).detach()
+    ratio = (current_logprobs - sampling_logprobs).detach()
 
     # Clip the ratio for stability
     clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
