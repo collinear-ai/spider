@@ -14,14 +14,12 @@ import time
 import concurrent.futures
 import threading
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from accelerate.utils import FullyShardedDataParallelPlugin
-from torch.distributed.fsdp.fully_sharded_data_parallel import FullStateDictConfig, StateDictType
-from peft import PeftModel
+from accelerate.utils import DeepSpeedPlugin
 from transformers import get_scheduler
 
 from tqdm.auto import tqdm
@@ -34,106 +32,22 @@ from spider.config import JobConfig
 
 from .on_policy_accelerate_utils import (
     FireworksTeacherContext,
-    TransformersSamplerContext,
-    importance_sampling_loss,
     importance_sampling_loss_with_clip,
     load_model_with_lora,
     save_checkpoint_accelerate,
 )
-from .hf_upload import _prepare_hf_payload
+from .hf_upload import _prepare_hf_payload, publish_to_hub
 from .sources import collect_prompts
 from . import events
 from .writers import JSONLBatchWriter
 from .on_policy_vllm_rollouts import VLLMRolloutCollector, rollout_results_to_dicts
 from .weight_synchronizer import WeightSynchronizer
 from .backends.vllm_backend import VLLMBackend
-from .vllm_parsers import parse_assistant_turn
-from .backends.vllm_backend import _default_tool_parser, _default_reasoning_parser
 from .metrics import discounted_future_sum_vectorized
 
 RolloutBatch = List[Dict[str, Any]]
 
 logger = logging.getLogger(__name__)
-
-
-class _AccelerateStudentSamplerContext:
-    """Student sampler context using transformers generate()."""
-
-    def __init__(self, *, job_id: str, job: JobConfig) -> None:
-        self._job_id = job_id
-        self._job = job
-        self._model = None
-        self._tokenizer = None
-        self._sampler = None
-        self._accelerator = None
-
-    def __enter__(self) -> TransformersSamplerContext:
-        from .executor import JobExecutionError
-
-        if self._sampler is not None:
-            return self._sampler
-
-        model_name = getattr(self._job.model, "name", None)
-        checkpoint_path = getattr(self._job.model, "student_checkpoint_path", None)
-        lora_rank = getattr(self._job.generation.on_policy_options, "lora_rank", 16)
-
-        if not model_name:
-            raise JobExecutionError(
-                "job.model.name must be provided to create a sampling context."
-            )
-
-        # Determine torch dtype based on training precision
-        training_precision = getattr(self._job.generation.on_policy_options, "training_precision", "bf16")
-        if training_precision == "fp32":
-            model_dtype = torch.float32
-        elif training_precision == "fp16":
-            model_dtype = torch.float16
-        else:
-            model_dtype = torch.bfloat16
-
-        # Load model with LoRA
-        self._model, self._tokenizer = load_model_with_lora(
-            model_name=model_name,
-            lora_rank=lora_rank,
-            checkpoint_path=checkpoint_path,
-            torch_dtype=model_dtype,
-        )
-
-        self._sampler = TransformersSamplerContext(
-            model=self._model,
-            tokenizer=self._tokenizer,
-            model_name=model_name,
-        )
-
-        return self._sampler
-
-    def refresh_from_sampler_path(self, sampler_path: str) -> TransformersSamplerContext:
-        """Refresh the sampler from a checkpoint path."""
-        if self._sampler is None:
-            raise RuntimeError("Student sampler is not initialized.")
-
-        self._sampler.refresh_from_checkpoint(sampler_path)
-        return self._sampler
-
-    def get_model(self) -> PeftModel:
-        """Get the underlying model for training."""
-        return self._model
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self._model = None
-        self._tokenizer = None
-        self._sampler = None
-
-
-def _create_shared_student_sampler(
-    *,
-    job_id: str,
-    job: JobConfig,
-) -> Tuple[_AccelerateStudentSamplerContext, TransformersSamplerContext]:
-    """Create a shared student sampler context."""
-    ctx = _AccelerateStudentSamplerContext(job_id=job_id, job=job)
-    sampler = ctx.__enter__()
-    return ctx, sampler
 
 
 def _needs_gold_alignment(student_model: str, teacher_model: str) -> bool:
@@ -196,50 +110,20 @@ def run_on_policy_job(
         bool(tool_registry),
     )
 
-    sampler_ctx = None
-    student_sampler = None
-    rollout_stream = None
-
-    use_vllm_inference = getattr(options, "use_vllm_inference", False)
-
-    if tool_registry:
-        if use_vllm_inference:
-            # Use the new vLLM-based separated architecture
-            logger.info(
-                "Job %s: Using vLLM-based inference with separated training (accelerate)",
-                job_id,
-            )
-            events.emit(
-                "Using vLLM-based separated inference/training architecture.",
-                code="on_policy_accelerate.vllm_inference",
-            )
-            # We don't need sampler_ctx for vLLM-based inference
-            sampler_ctx = None
-            rollout_stream = None  # Will be created inside the training function
-        else:
-            # Use the original transformers-based architecture
-            sampler_ctx, student_sampler = _create_shared_student_sampler(job_id=job_id, job=job)
-
-            rollout_stream = _tool_rollout_stream(
-                job_id=job_id,
-                job=job,
-                student_sampler=student_sampler,
-                prompts=prompt_rows,
-                tool_registry=tool_registry,
-                runtime_factory=runtime_factory,
-                on_batch_start=on_batch_start,
-                on_batch_start_lookahead=on_batch_start_lookahead,
-                on_batch_complete=on_batch_complete,
-            )
-            events.emit(
-                "Finished Setup for tool rollouts streaming for on-policy distillation (accelerate).",
-                code="on_policy_accelerate.tool_rollouts_stream",
-            )
-    else:
+    if not tool_registry:
         raise JobExecutionError(
-            "Non-tool on-policy training not yet supported in accelerate version. "
-            "Please use tool_registry or the tinker-based on_policy.py."
+            "tool_registry is required for on-policy training (accelerate)."
         )
+
+    # Use vLLM-based separated architecture
+    logger.info(
+        "Job %s: Using vLLM-based inference with separated training (accelerate)",
+        job_id,
+    )
+    events.emit(
+        "Using vLLM-based separated inference/training architecture.",
+        code="on_policy_accelerate.vllm_inference",
+    )
 
     payload = _base_metadata(job_id, job)
     payload["generation_mode"] = "on_policy_accelerate"
@@ -259,50 +143,28 @@ def run_on_policy_job(
             level="warning",
             code="on_policy_accelerate.no_prompts",
         )
-        result = JobExecutionResult(
+        return JobExecutionResult(
             artifacts_path=artifact_path,
             metrics={"records": 0},
             messages=["No prompts found, skipped on-policy distillation."],
         )
-        if sampler_ctx:
-            sampler_ctx.__exit__(None, None, None)
-        return result
 
-    if use_vllm_inference:
-        checkpoint_info = _run_tool_on_policy_vllm_accelerate(
-            job_id=job_id,
-            job=job,
-            options=options,
-            workspace=workspace,
-            prompt_rows=prompt_rows,
-            tool_registry=tool_registry,
-            runtime_factory=runtime_factory,
-            on_batch_start=on_batch_start,
-            on_batch_start_lookahead=on_batch_start_lookahead,
-            on_batch_complete=on_batch_complete,
-            metadata_path=metadata_path,
-            artifact_path=artifact_path,
-        )
-        checkpoint = checkpoint_info["checkpoint"]
-        training_dir = checkpoint_info["training_dir"]
-    elif rollout_stream:
-        checkpoint_info = _run_tool_on_policy_stream_accelerate(
-            job_id=job_id,
-            job=job,
-            options=options,
-            workspace=workspace,
-            total_batches=_compute_batch_stats(prompt_list, options)[1],
-            rollout_stream=rollout_stream,
-            sampler_ctx=sampler_ctx,
-            metadata_path=metadata_path,
-            artifact_path=artifact_path,
-        )
-        checkpoint = checkpoint_info["checkpoint"]
-        training_dir = checkpoint_info["training_dir"]
-    else:
-        raise JobExecutionError(
-            "No rollout stream available for on-policy training."
-        )
+    checkpoint_info = _run_tool_on_policy_vllm_accelerate(
+        job_id=job_id,
+        job=job,
+        options=options,
+        workspace=workspace,
+        prompt_rows=prompt_rows,
+        tool_registry=tool_registry,
+        runtime_factory=runtime_factory,
+        on_batch_start=on_batch_start,
+        on_batch_start_lookahead=on_batch_start_lookahead,
+        on_batch_complete=on_batch_complete,
+        metadata_path=metadata_path,
+        artifact_path=artifact_path,
+    )
+    checkpoint = checkpoint_info["checkpoint"]
+    training_dir = checkpoint_info["training_dir"]
 
     hf_payload_dir, manifest, checkpoints_index_text = _prepare_hf_payload(
         training_dir=training_dir,
@@ -351,6 +213,22 @@ def run_on_policy_job(
         checkpoint.get("batch"),
         checkpoint.get("sampler_path"),
     )
+
+    # Upload to HuggingFace if configured
+    if job.output.mode == "upload_hf" and job.output.hf and job.output.hf.repo_id:
+        try:
+            logger.info("Uploading checkpoint to HuggingFace: %s", job.output.hf.repo_id)
+            hf_url = publish_to_hub(
+                job_id=job_id,
+                artifact=hf_payload_dir,
+                metadata=metadata_path,
+                config=job.output.hf,
+            )
+            logger.info("Uploaded to HuggingFace: %s", hf_url)
+        except Exception as exc:
+            logger.error("Failed to upload to HuggingFace: %s", exc)
+            # Don't fail the job, just log the error
+
     events.emit(
         "On-policy distillation (accelerate) completed.",
         code="on_policy_accelerate.completed",
@@ -363,541 +241,7 @@ def run_on_policy_job(
         metrics=metrics,
         messages=["On-policy distillation completed."],
     )
-    if sampler_ctx:
-        sampler_ctx.__exit__(None, None, None)
     return result
-
-
-def _run_tool_on_policy_stream_accelerate(
-    *,
-    job_id: str,
-    job: JobConfig,
-    options: Any,
-    workspace: Path,
-    total_batches: int,
-    rollout_stream: Iterable[List[Dict[str, Any]]],
-    sampler_ctx: _AccelerateStudentSamplerContext,
-    metadata_path: Path,
-    artifact_path: Path,
-):
-    """Run tool-based on-policy training using Accelerate."""
-    import wandb
-    from .executor import JobExecutionError, tool_descriptors
-
-    tool_defs = tool_descriptors(job.tools)
-
-    verbose_turns = bool(job.generation.verbose)
-
-    # Initialize Accelerator with FSDP
-    training_precision = getattr(options, "training_precision", "bf16")
-    use_fsdp = getattr(options, "use_fsdp", False)
-    
-    if use_fsdp:
-        # Configure FSDP plugin
-        fsdp_plugin = FullyShardedDataParallelPlugin(
-            state_dict_config=FullStateDictConfig(offload_to_cpu=False, rank0_only=False),
-            sharding_strategy="FULL_SHARD",  # Shard parameters, gradients, and optimizer states
-        )
-        accelerator = Accelerator(
-            mixed_precision=training_precision,
-            fsdp_plugin=fsdp_plugin,
-        )
-        logger.info("Accelerator initialized with FSDP and mixed_precision=%s", training_precision)
-    else:
-        accelerator = Accelerator(mixed_precision=training_precision)
-        logger.info("Accelerator initialized with mixed_precision=%s", training_precision)
-
-    # Get the model from sampler context
-    model = sampler_ctx.get_model()
-
-    # Create optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=options.learning_rate,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-    )
-
-    # LR scheduler: cosine with warmup
-    total_training_steps = max(total_batches, 1)
-    warmup_ratio = float(getattr(options, "warmup_ratio", 0.1) or 0.0)
-    warmup_steps = int(total_training_steps * warmup_ratio)
-    scheduler = get_scheduler(
-        name="cosine",
-        optimizer=optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_training_steps,
-    )
-    logger.info(
-        "LR scheduler: cosine with %d warmup steps out of %d total",
-        warmup_steps, total_training_steps,
-    )
-
-    # Prepare with accelerator
-    model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
-
-    # Load teacher model using Fireworks API
-    fireworks_model = getattr(options, "fireworks_model", None)
-    if not fireworks_model:
-        raise ValueError("fireworks_model must be specified in options")
-    
-    teacher_ctx = FireworksTeacherContext(
-        model_name=options.teacher,
-        fireworks_model=fireworks_model,
-    )
-    logger.info("Using Fireworks API for teacher: %s", fireworks_model)
-
-    training_dir = workspace / "training"
-    training_dir.mkdir(parents=True, exist_ok=True)
-
-    # Initialize wandb
-    wandb_project = getattr(options, "wandb_project", None)
-    wandb_name = getattr(options, "wandb_name", None) or f"tool-on-policy-accelerate-{job_id[:8]}"
-    token_budget = getattr(options, "token_budget", None)
-
-    wandb_run = None
-    if wandb_project:
-        wandb_run = wandb.init(
-            project=wandb_project,
-            name=wandb_name,
-            config={
-                "job_id": job_id,
-                "student_model": job.model.name,
-                "teacher_model": options.teacher,
-                "learning_rate": options.learning_rate,
-                "lora_rank": options.lora_rank,
-                "kl_penalty_coef": getattr(options, "kl_penalty_coef", 1.0),
-                "kl_discount_factor": getattr(options, "kl_discount_factor", 0.0),
-                "loss_fn": getattr(options, "loss_fn", "importance_sampling"),
-                "total_batches": total_batches,
-                "token_budget": token_budget,
-                "framework": "accelerate",
-            },
-        )
-        logger.info(
-            "Job %s: wandb initialized. project=%s name=%s url=%s",
-            job_id,
-            wandb_project,
-            wandb_name,
-            wandb_run.url,
-        )
-        events.emit(
-            "Wandb logging initialized (accelerate).",
-            code="tool_on_policy_accelerate.wandb_initialized",
-            data={"project": wandb_project, "name": wandb_name, "url": wandb_run.url},
-        )
-    else:
-        logger.info("Job %s: wandb_project not set, skipping wandb logging.", job_id)
-
-    device = accelerator.device
-
-    # Helper to call teacher alignment
-    def _compute_teacher_alignment(
-        messages,
-        tools,
-        student_token_ids,
-        student_logprobs,
-        reward_mask,
-        assistant_raw_text,
-    ):
-        return teacher_ctx.compute_teacher_alignment(
-            messages=messages,
-            tools=tools,
-            student_model=job.model.name,
-            student_token_ids=student_token_ids,
-            student_logprobs=student_logprobs,
-            reward_mask=reward_mask,
-            assistant_raw_text=assistant_raw_text,
-        )
-
-    def _process_batch(
-        batch_index: int, trajectories: List[Dict[str, Any]]
-    ) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
-        """Process a batch of trajectories and perform a training step."""
-        items = []
-        batch_metrics = {
-            "kl_sum": 0.0,
-            "kl_count": 0,
-            "advantage_sum": 0.0,
-            "advantage_sq_sum": 0.0,
-            "advantage_count": 0,
-        }
-
-        # Collect data for batch training
-        all_input_ids = []
-        all_target_ids = []
-        all_sampling_logprobs = []
-        all_advantages = []
-        all_loss_masks = []
-
-        for turn_index, turn in enumerate(trajectories):
-            messages = turn["messages"]
-            token_ids = turn["token_ids"]
-            logprobs = turn["logprobs"]
-            reward_mask = turn["reward_mask"]
-
-            student_logprobs = torch.tensor(logprobs, dtype=torch.float32, device=device)
-
-            if not len(reward_mask) == len(token_ids) == len(student_logprobs):
-                raise ValueError(
-                    f"Length mismatch: reward_mask={len(reward_mask)} "
-                    f"token_ids={len(token_ids)} "
-                    f"student_logprobs={len(student_logprobs)} "
-                )
-
-            # Check if this is a combined multi-turn item
-            combined_turns = turn.get("_combined_turns")
-            if combined_turns:
-                # Compute teacher alignment for each turn separately and combine
-                kl_adjustments_combined = [0.0] * len(token_ids)
-                kl_mask_combined = [0.0] * len(token_ids)
-                teacher_logprobs_list = []
-                teacher_token_ids_list = []
-
-                for turn_info in combined_turns:
-                    turn_messages = turn_info["messages"]
-                    turn_assistant_raw_text = turn_info.get("assistant_raw_text")
-                    completion_start = turn_info["completion_start"]
-                    completion_end = turn_info["completion_end"]
-
-                    if not turn_assistant_raw_text:
-                        continue
-
-                    # Create a reward mask for just this turn's completion
-                    turn_reward_mask = [0] * len(token_ids)
-                    for idx in range(completion_start, completion_end):
-                        if idx < len(turn_reward_mask):
-                            turn_reward_mask[idx] = 1
-
-                    # Compute teacher alignment for this turn
-                    turn_alignment = _compute_teacher_alignment(
-                        messages=turn_messages,
-                        tools=tool_defs,
-                        student_token_ids=token_ids,
-                        student_logprobs=student_logprobs,
-                        reward_mask=turn_reward_mask,
-                        assistant_raw_text=turn_assistant_raw_text,
-                    )
-
-                    # Extract KL adjustments and mask for this turn's region
-                    turn_kl_adj = turn_alignment.get("kl_adjustments") or [0.0] * len(token_ids)
-                    turn_kl_mask = turn_alignment.get("kl_mask") or [0.0] * len(token_ids)
-
-                    # Combine into the full sequence
-                    for idx in range(completion_start, completion_end):
-                        if idx < len(kl_adjustments_combined):
-                            kl_adjustments_combined[idx] = turn_kl_adj[idx]
-                            if idx < len(turn_kl_mask):
-                                kl_mask_combined[idx] = turn_kl_mask[idx]
-
-                    # Collect teacher logprobs and token_ids
-                    if turn_alignment.get("teacher_logprobs"):
-                        teacher_logprobs_list = turn_alignment.get("teacher_logprobs")
-                    if turn_alignment.get("teacher_token_ids"):
-                        teacher_token_ids_list = turn_alignment.get("teacher_token_ids")
-
-                teacher_alignment = {
-                    "kl_adjustments": kl_adjustments_combined,
-                    "kl_mask": kl_mask_combined,
-                    "teacher_logprobs": teacher_logprobs_list,
-                    "teacher_token_ids": teacher_token_ids_list,
-                }
-            else:
-                # Single turn - compute teacher alignment normally
-                teacher_alignment = _compute_teacher_alignment(
-                    messages=messages,
-                    tools=tool_defs,
-                    student_token_ids=token_ids,
-                    student_logprobs=student_logprobs,
-                    reward_mask=reward_mask,
-                    assistant_raw_text=turn.get("assistant_raw_text"),
-                )
-
-            item = dict(turn)
-            item.update(
-                {
-                    "student_logprobs": student_logprobs,
-                    "teacher_logprobs": teacher_alignment.get("teacher_logprobs"),
-                    "kl_adjustments": teacher_alignment.get("kl_adjustments"),
-                    "kl_mask": teacher_alignment.get("kl_mask"),
-                    "teacher_token_ids": teacher_alignment.get("teacher_token_ids"),
-                }
-            )
-            items.append(item)
-
-            kl_adj = teacher_alignment.get("kl_adjustments") or [0.0] * len(token_ids)
-            kl_mask = teacher_alignment.get("kl_mask") or [0.0] * len(token_ids)
-            if len(kl_mask) != len(reward_mask):
-                raise JobExecutionError("KL mask length must match reward mask length.")
-            kl_tensor = torch.tensor(kl_adj, device=device, dtype=torch.float32)
-
-            kl_coef = float(getattr(options, "kl_penalty_coef", 1.0))
-            kl_discount = float(getattr(options, "kl_discount_factor", 0.0))
-            advantage = -kl_coef * kl_tensor
-
-            if kl_discount > 0:
-                advantage = torch.tensor(
-                    discounted_future_sum_vectorized(advantage.detach().cpu().numpy(), kl_discount),
-                    device=device,
-                    dtype=torch.float32,
-                )
-
-            # Prepare shifted sequences for training
-            input_tokens = list(token_ids)[:-1]
-            target_tokens = list(token_ids)[1:]
-            mask_tokens = list(reward_mask)[1:]
-            logprobs_tokens = student_logprobs[1:]
-            advantages_tokens = advantage[1:]
-
-            target_tensor = torch.tensor(target_tokens, dtype=torch.long, device=device)
-            mask_tensor = torch.tensor(mask_tokens, dtype=torch.float32, device=device)
-            advantages_tokens = advantages_tokens * mask_tensor
-
-            all_input_ids.append(torch.tensor(input_tokens, dtype=torch.long, device=device))
-            all_target_ids.append(target_tensor)
-            all_sampling_logprobs.append(logprobs_tokens)
-            all_advantages.append(advantages_tokens)
-            all_loss_masks.append(mask_tensor)
-
-            # Compute metrics
-            n_tokens = len(token_ids)
-            n_reward = sum(reward_mask)
-            kl_vals = (
-                kl_tensor[torch.tensor(reward_mask, dtype=torch.bool, device=device)].tolist()
-                if kl_tensor.numel() > 0
-                else []
-            )
-            adv_vals = (
-                advantages_tokens[mask_tensor.bool()].tolist()
-                if advantages_tokens.numel() > 0
-                else []
-            )
-
-            batch_metrics["kl_sum"] += sum(kl_vals)
-            batch_metrics["kl_count"] += len(kl_vals)
-            batch_metrics["advantage_sum"] += sum(adv_vals)
-            batch_metrics["advantage_sq_sum"] += sum(v * v for v in adv_vals)
-            batch_metrics["advantage_count"] += len(adv_vals)
-
-            if verbose_turns:
-                logger.info(
-                    "tool rollout batch=%d batch_item_idx=%d n_tokens=%d n_reward_tokens=%d",
-                    batch_index,
-                    turn_index,
-                    n_tokens,
-                    n_reward,
-                )
-
-        # Perform training step
-        loss_token_count = sum(m.sum().item() for m in all_loss_masks)
-
-        # Accumulate loss over all items in batch
-        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
-        for input_ids, target_ids, sampling_lp, advantages, loss_mask in zip(
-            all_input_ids, all_target_ids, all_sampling_logprobs, all_advantages, all_loss_masks
-        ):
-            # Add batch dimension
-            input_ids = input_ids.unsqueeze(0)
-            target_ids = target_ids.unsqueeze(0)
-            sampling_lp = sampling_lp.unsqueeze(0)
-            advantages = advantages.unsqueeze(0)
-            loss_mask = loss_mask.unsqueeze(0)
-
-            loss, _ = importance_sampling_loss(
-                model=model,
-                input_ids=input_ids,
-                target_ids=target_ids,
-                sampling_logprobs=sampling_lp,
-                advantages=advantages,
-                loss_mask=loss_mask,
-            )
-            total_loss = total_loss + loss
-
-        # Normalize by number of items
-        total_loss = total_loss / len(trajectories)
-
-        # Backward pass
-        optimizer.zero_grad()
-        accelerator.backward(total_loss)
-        optimizer.step()
-        scheduler.step()
-
-        loss_value = total_loss.item()
-        batch_metrics["loss"] = loss_value
-
-        logger.info(
-            "tool rollout batch=%d training step complete (accelerate). loss=%s",
-            batch_index,
-            loss_value,
-        )
-        events.emit(
-            "Tool rollout batch KL training step complete (accelerate).",
-            code="tool_on_policy_accelerate.training_step_complete",
-            data={"batch_index": batch_index},
-        )
-
-        return items, batch_metrics
-
-    def _train_stream():
-        save_every = max(1, getattr(options, "save_every", 1))
-        if total_batches > 0 and save_every > total_batches:
-            save_every = total_batches
-
-        last_checkpoint = None
-        global_step = 0
-        token_cum = 0
-        
-        # Create progress bar for training batches
-        # Use position=0 and file=sys.stderr to persist at bottom of terminal
-        train_pbar = tqdm(
-            total=total_batches,
-            desc="Training",
-            unit="batch",
-            initial=0,
-            ncols=120,
-            position=0,  # Fixed position at bottom
-            file=sys.stderr,  # Use stderr so it doesn't interfere with stdout logging
-            leave=True,  # Keep visible after completion
-            mininterval=0.5,  # Update at least every 0.5 seconds
-        )
-
-        for batch_index, trajectories in enumerate(rollout_stream):
-            batch_start = time.time()
-            batch_items, batch_metrics = _process_batch(batch_index, trajectories)
-            batch_time = time.time() - batch_start
-            global_step += 1
-
-            step_tokens = sum(int(sum(turn.get("reward_mask") or [])) for turn in trajectories)
-            token_cum += step_tokens
-            
-            # Calculate throughput metrics
-            tokens_per_sec = step_tokens / batch_time if batch_time > 0 else 0
-
-            # Update progress bar
-            train_pbar.update(1)
-            train_pbar.set_postfix({
-                "loss": f"{batch_metrics.get('loss', 0):.4f}" if batch_metrics.get('loss') else "N/A",
-                "tokens": step_tokens,
-                "cum_tokens": token_cum,
-                "time": f"{batch_time:.1f}s",
-                "tokens/s": f"{tokens_per_sec:.1f}",
-            })
-
-            logger.info(
-                "tool rollout batch=%d/%d step_time=%.3fs token_step=%d token_cum=%d "
-                "tokens/s=%.1f token_budget=%s",
-                batch_index + 1,
-                total_batches,
-                batch_time,
-                step_tokens,
-                token_cum,
-                tokens_per_sec,
-                token_budget,
-            )
-
-            # Log to wandb
-            if wandb_run:
-                # Get current learning rate from scheduler
-                current_lr = scheduler.get_last_lr()[0] if scheduler else options.learning_rate
-                log_data = {
-                    "progress/done_frac": (batch_index + 1) / total_batches
-                    if total_batches > 0
-                    else 1.0,
-                    "optim/lr": current_lr,
-                    "rollouts": len(trajectories),
-                    "time / total_seconds": batch_time,
-                    "time / per_turn_seconds": batch_time / len(trajectories),
-                    "token_step": step_tokens,
-                    "token_cum": token_cum,
-                }
-
-                if token_budget is not None:
-                    log_data["token_budget"] = token_budget
-                if batch_metrics.get("loss") is not None:
-                    log_data["loss"] = batch_metrics["loss"]
-                if batch_metrics["kl_count"] > 0:
-                    log_data["kl_mean"] = batch_metrics["kl_sum"] / batch_metrics["kl_count"]
-                if batch_metrics["advantage_count"] > 0:
-                    adv_mean = batch_metrics["advantage_sum"] / batch_metrics["advantage_count"]
-                    adv_var = (
-                        batch_metrics["advantage_sq_sum"] / batch_metrics["advantage_count"]
-                    ) - adv_mean**2
-                    log_data["advantage_mean"] = adv_mean
-                    log_data["advantage_std"] = adv_var**0.5 if adv_var > 0 else 0.0
-
-                # Flatten keys
-                flat_log_data = {}
-                for k, v in log_data.items():
-                    key = k.split("/")[-1] if "/" in k else k
-                    flat_log_data[key] = v
-                wandb_run.log(flat_log_data, step=global_step)
-
-            if token_budget is not None and token_cum >= token_budget:
-                logger.info(
-                    "tool rollout token budget reached. stopping training. token_cum=%d budget=%d",
-                    token_cum,
-                    token_budget,
-                )
-                events.emit(
-                    "Tool rollout token budget reached (accelerate).",
-                    code="tool_on_policy_accelerate.token_budget_reached",
-                    data={"token_cum": token_cum, "token_budget": token_budget},
-                )
-                train_pbar.close()
-                break
-
-            if (batch_index + 1) % save_every == 0:
-                train_pbar.write(f"💾 Saving checkpoint at batch {batch_index + 1}")
-                last_checkpoint = save_checkpoint_accelerate(
-                    model=model,
-                    optimizer=optimizer,
-                    accelerator=accelerator,
-                    name=f"{batch_index:06d}",
-                    log_path=str(training_dir),
-                    loop_state={"batch": batch_index + 1},
-                )
-                sampler_path = last_checkpoint.get("sampler_path")
-                if sampler_path:
-                    sampler_ctx.refresh_from_sampler_path(sampler_path)
-                    logger.info(
-                        "Refreshed student sampler from checkpoint at batch=%d path=%s.",
-                        batch_index,
-                        sampler_path,
-                    )
-                    events.emit(
-                        "Refreshed student sampler from checkpoint (accelerate).",
-                        code="tool_on_policy_accelerate.sampler_refreshed",
-                        data={"batch_index": batch_index, "sampler_path": sampler_path},
-                    )
-        
-        train_pbar.close()
-        logger.info("Training loop complete: total_batches=%d total_tokens=%d", total_batches, token_cum)
-        
-        return last_checkpoint
-
-    try:
-        last_checkpoint = _train_stream()
-        if not last_checkpoint:
-            last_checkpoint = save_checkpoint_accelerate(
-                model=model,
-                optimizer=optimizer,
-                accelerator=accelerator,
-                name="final",
-                log_path=str(training_dir),
-                loop_state={"batch": 0},
-            )
-        if not last_checkpoint or "sampler_path" not in last_checkpoint:
-            raise JobExecutionError(
-                "Tool on-policy training (accelerate) did not produce a sampler checkpoint."
-            )
-
-        return {
-            "checkpoint": last_checkpoint,
-            "training_dir": training_dir,
-        }
-    finally:
-        if wandb_run:
-            wandb_run.finish()
 
 
 def _run_tool_on_policy_vllm_accelerate(
@@ -988,6 +332,7 @@ def _run_tool_on_policy_vllm_accelerate(
     wandb_run = None
 
     try:
+        import os
         # NOW set training GPUs via environment variable after vLLM has started
         # This ensures the training model loads on the correct GPUs
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, training_gpu_ids))
@@ -996,21 +341,27 @@ def _run_tool_on_policy_vllm_accelerate(
             os.environ["CUDA_VISIBLE_DEVICES"],
         )
 
-        # Initialize Accelerator with FSDP
+        # Initialize Accelerator with DeepSpeed
         training_precision = getattr(options, "training_precision", "bf16")
-        use_fsdp = getattr(options, "use_fsdp", False)
+        deepspeed_config = getattr(options, "deepspeed_config", None)
         
-        if use_fsdp:
-            # Configure FSDP plugin
-            fsdp_plugin = FullyShardedDataParallelPlugin(
-                state_dict_config=FullStateDictConfig(offload_to_cpu=False, rank0_only=False),
-                sharding_strategy="FULL_SHARD",  # Shard parameters, gradients, and optimizer states
+        if deepspeed_config:
+            # Use DeepSpeed with config file
+            config_path = Path(deepspeed_config)
+            if not config_path.is_absolute():
+                config_path = Path("/home/ubuntu/spider") / config_path
+            
+            deepspeed_plugin = DeepSpeedPlugin(
+                hf_ds_config=str(config_path),
+                zero_stage=3,
+                gradient_accumulation_steps=1,
+                gradient_clipping=1.0,
             )
             accelerator = Accelerator(
                 mixed_precision=training_precision,
-                fsdp_plugin=fsdp_plugin,
+                deepspeed_plugin=deepspeed_plugin,
             )
-            logger.info("Accelerator initialized with FSDP and mixed_precision=%s", training_precision)
+            logger.info("Accelerator initialized with DeepSpeed (config=%s) and mixed_precision=%s", config_path, training_precision)
         else:
             accelerator = Accelerator(mixed_precision=training_precision)
             logger.info("Accelerator initialized with mixed_precision=%s", training_precision)
@@ -1073,9 +424,8 @@ def _run_tool_on_policy_vllm_accelerate(
                 eps=1e-8,
             )
             
-            # LR scheduler: cosine with warmup (across all epochs)
-            warmup_ratio = float(getattr(options, "warmup_ratio", 0.1) or 0.0)
-            warmup_steps = int(total_training_steps * warmup_ratio)
+            # LR scheduler: cosine with warmup (fixed 10 steps)
+            warmup_steps = int(getattr(options, "warmup_steps", 10) or 10)
             scheduler = get_scheduler(
                 name="cosine",
                 optimizer=optimizer,
@@ -1083,8 +433,8 @@ def _run_tool_on_policy_vllm_accelerate(
                 num_training_steps=total_training_steps,
             )
             logger.info(
-                "LR scheduler: cosine with %d warmup steps out of %d total steps (%d batches × %d epochs)",
-                warmup_steps, total_training_steps, total_batches, num_epochs,
+                "LR scheduler: cosine with %d warmup steps out of %d total steps",
+                warmup_steps, total_training_steps,
             )
             pbar.update(1)
             logger.info("Training optimizer created in %.2fs", time.time() - phase_start)
@@ -1121,13 +471,15 @@ def _run_tool_on_policy_vllm_accelerate(
         training_dir.mkdir(parents=True, exist_ok=True)
 
         # Create weight synchronizer (will sync after model is loaded)
-        weight_sync_steps = getattr(options, "weight_sync_steps", 10)
+        weight_sync_steps = getattr(options, "weight_sync_steps", 1)
+        save_checkpoint_steps = getattr(options, "save_checkpoint_steps", 5)
         synchronizer = WeightSynchronizer(
             sync_every_n_steps=weight_sync_steps,
             checkpoint_dir=training_dir / "lora_checkpoints",
             vllm_base_url=vllm_backend.base_url,
             lora_name="student",
             vllm_backend=vllm_backend,
+            save_every_n_steps=save_checkpoint_steps,
         )
 
         # CRITICAL: Wait for training model to load and sync BEFORE collecting rollouts
@@ -1140,6 +492,8 @@ def _run_tool_on_policy_vllm_accelerate(
 
         # Create rollout collector with the synced LoRA adapter
         rollout_workers = getattr(options, "rollout_workers", 8)
+        train_every_n_turns = int(getattr(options, "train_every_n_turns", 1))
+        logger.info("Rollout collector: train_every_n_turns=%d", train_every_n_turns)
         collector = VLLMRolloutCollector(
             vllm_base_url=vllm_backend.base_url,
             model_name=student_model,
@@ -1149,12 +503,13 @@ def _run_tool_on_policy_vllm_accelerate(
             reasoning_parser_name=vllm_backend.reasoning_parser,
             max_workers=rollout_workers,
             max_tool_turns=max(1, job.generation.max_tool_turns or 16),
-            max_tokens=job.generation.parameters.get("max_tokens", 4096),
+            max_tokens=job.generation.parameters.get("max_tokens", 16384),  # High default, let model generate freely
             temperature=job.generation.parameters.get("temperature", 1.0),
-            tool_timeout=getattr(options, "tool_timeout", 200.0),  # Timeout for tool execution
+            tool_timeout=getattr(options, "tool_timeout", None),  # None = no timeout
             lora_name=initial_lora_name,  # Use synced LoRA from the start
             runtime_factory=runtime_factory,
             verbose=verbose_turns,
+            train_every_n_turns=train_every_n_turns,
         )
 
         # Load teacher model using Fireworks API
@@ -1167,6 +522,34 @@ def _run_tool_on_policy_vllm_accelerate(
             fireworks_model=fireworks_model,
         )
         logger.info("Using Fireworks API for teacher: %s", fireworks_model)
+        
+        # Async teacher alignment: submit turns as they complete during rollouts
+        alignment_futures = []  # Shared list for async alignment futures
+        alignment_lock = threading.Lock()
+        
+        def _on_turn_complete(turn_result):
+            """Callback to submit turn for teacher alignment while rollouts continue."""
+            try:
+                # Convert logprobs list to tensor (compute_teacher_alignment expects tensor)
+                student_logprobs_tensor = torch.tensor(turn_result.logprobs, dtype=torch.float32)
+                future = teacher_ctx._executor.submit(
+                    teacher_ctx.compute_teacher_alignment,
+                    messages=turn_result.messages,
+                    tools=tool_defs,
+                    student_model=student_model,
+                    student_token_ids=turn_result.token_ids,
+                    student_logprobs=student_logprobs_tensor,
+                    reward_mask=turn_result.reward_mask,
+                    assistant_raw_text=turn_result.assistant_raw_text,
+                )
+                with alignment_lock:
+                    alignment_futures.append((turn_result, future))
+                    logger.debug(f"Queued async alignment: trace_id={turn_result.trace_id}, total_queued={len(alignment_futures)}")
+            except Exception as e:
+                logger.error(f"Error in _on_turn_complete callback: {e}")
+        
+        # Update collector to use the callback
+        collector.on_turn_complete = _on_turn_complete
 
         # Initialize wandb
         wandb_project = getattr(options, "wandb_project", None)
@@ -1212,31 +595,11 @@ def _run_tool_on_policy_vllm_accelerate(
 
         device = accelerator.device
 
-        # Helper to call teacher alignment
-        def _compute_teacher_alignment(
-            messages,
-            tools,
-            student_token_ids,
-            student_logprobs,
-            reward_mask,
-            assistant_raw_text,
-        ):
-            return teacher_ctx.compute_teacher_alignment(
-                messages=messages,
-                tools=tools,
-                student_model=student_model,
-                student_token_ids=student_token_ids,
-                student_logprobs=student_logprobs,
-                reward_mask=reward_mask,
-                assistant_raw_text=assistant_raw_text,
-            )
-
         def _process_batch(
             batch_index: int, trajectories: List[Dict[str, Any]]
-        ) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
+        ) -> Dict[str, float]:
             """Process a batch of trajectories and perform a training step."""
             
-            items = []
             batch_metrics = {
                 "kl_sum": 0.0,
                 "kl_count": 0,
@@ -1247,294 +610,244 @@ def _run_tool_on_policy_vllm_accelerate(
                 "clip_count": 0,
             }
 
-            all_input_ids = []
-            all_target_ids = []
-            all_sampling_logprobs = []
-            all_advantages = []
-            all_loss_masks = []
-
-            # Collect all teacher alignment calls for parallelization
-            from concurrent.futures import as_completed
-            
-            alignment_tasks = []
+            # Build trace_id -> turn_index mapping for trajectories
+            trace_id_to_idx = {}
             for turn_index, turn in enumerate(trajectories):
-                messages = turn["messages"]
-                token_ids = turn["token_ids"]
-                logprobs = turn["logprobs"]
-                reward_mask = turn["reward_mask"]
-                student_logprobs = torch.tensor(logprobs, dtype=torch.float32, device=device)
-
-                # Check if this is a combined multi-turn item
-                combined_turns = turn.get("_combined_turns")
-                if combined_turns:
-                    for turn_info in combined_turns:
-                        turn_messages = turn_info["messages"]
-                        turn_assistant_raw_text = turn_info.get("assistant_raw_text")
-                        if not turn_assistant_raw_text:
-                            continue
-                        
-                        turn_reward_mask = [0] * len(token_ids)
-                        completion_start = turn_info["completion_start"]
-                        completion_end = turn_info["completion_end"]
-                        for idx in range(completion_start, completion_end):
-                            if idx < len(turn_reward_mask):
-                                turn_reward_mask[idx] = 1
-                        
-                        alignment_tasks.append({
-                            "turn_index": turn_index,
-                            "turn": turn,
-                            "turn_info": turn_info,
-                            "messages": turn_messages,
-                            "token_ids": token_ids,
-                            "student_logprobs": student_logprobs,
-                            "reward_mask": turn_reward_mask,
-                            "assistant_raw_text": turn_assistant_raw_text,
-                        })
-                else:
-                    alignment_tasks.append({
-                        "turn_index": turn_index,
-                        "turn": turn,
-                        "turn_info": None,
-                        "messages": messages,
-                        "token_ids": token_ids,
-                        "student_logprobs": student_logprobs,
-                        "reward_mask": reward_mask,
-                        "assistant_raw_text": turn.get("assistant_raw_text"),
-                    })
+                trace_id = turn.get("trace_id")
+                if trace_id:
+                    trace_id_to_idx[trace_id] = turn_index
             
-            # Submit all tasks in parallel
-            futures = {}
-            for task in alignment_tasks:
-                future = teacher_ctx._executor.submit(
-                    _compute_teacher_alignment,
-                    messages=task["messages"],
-                    tools=tool_defs,
-                    student_token_ids=task["token_ids"],
-                    student_logprobs=task["student_logprobs"],
-                    reward_mask=task["reward_mask"],
-                    assistant_raw_text=task["assistant_raw_text"],
-                )
-                futures[future] = task
-            
-            # Collect results
+            # Wait for async alignment futures (submitted during rollouts)
             alignment_results = {}
-            for future in as_completed(futures):
-                task = futures[future]
-                turn_idx = task["turn_index"]
-                
-                try:
-                    alignment = future.result()
-                except Exception as e:
-                    logger.error(f"Error in parallel teacher alignment: {e}")
-                    alignment = {
-                        "kl_adjustments": [0.0] * len(task["token_ids"]),
-                        "kl_mask": [0.0] * len(task["token_ids"]),
-                    }
-                
-                if turn_idx not in alignment_results:
-                    alignment_results[turn_idx] = []
-                alignment_results[turn_idx].append({
-                    "task": task,
-                    "alignment": alignment,
-                })
+            with alignment_lock:
+                pending_futures = list(alignment_futures)
+                alignment_futures.clear()  # Clear for next batch
             
-            # Process trajectories with alignment results
+            logger.info(f"Processing batch: {len(trajectories)} trajectories, {len(pending_futures)} async alignment futures")
+            
+            if pending_futures:
+                logger.info("Waiting for async teacher alignment: %d tasks (started during rollouts)", len(pending_futures))
+                teacher_start = time.time()
+                completed_count = 0
+                last_log_time = time.time()
+                
+                for turn_result, future in pending_futures:
+                    completed_count += 1
+                    now = time.time()
+                    if now - last_log_time >= 10.0:
+                        logger.info(
+                            "Teacher alignment progress: %d/%d (%.0f%%), %.1fs elapsed",
+                            completed_count, len(pending_futures), 100.0 * completed_count / len(pending_futures),
+                            now - teacher_start
+                        )
+                        last_log_time = now
+                    
+                    # Find matching trajectory turn using trace_id
+                    turn_idx = trace_id_to_idx.get(turn_result.trace_id, -1)
+                    
+                    if turn_idx < 0:
+                        logger.warning(f"No match for trace_id={turn_result.trace_id}")
+                    
+                    try:
+                        alignment = future.result()
+                    except Exception as e:
+                        logger.error(f"Error in async teacher alignment: {e}")
+                        # INSERT_YOUR_CODE
+                        # Also append error details to a text file for debugging
+                        error_log_path = Path("debug_async_alignment_errors.txt")
+                        with open(error_log_path, "a") as ef:
+                            ef.write(f"trace_id={getattr(turn_result, 'trace_id', None)}, error={repr(e)}\n")
+                        alignment = {
+                            "kl_adjustments": [0.0] * len(turn_result.token_ids),
+                            "kl_mask": [0.0] * len(turn_result.token_ids),
+                        }
+                    
+                    if turn_idx >= 0:
+                        if turn_idx not in alignment_results:
+                            alignment_results[turn_idx] = []
+                        alignment_results[turn_idx].append({
+                            "task": {
+                                "turn_index": turn_idx,
+                                "turn_info": None,
+                                "token_ids": turn_result.token_ids,
+                            },
+                            "alignment": alignment,
+                        })
+                
+                teacher_elapsed = time.time() - teacher_start
+                logger.info(
+                    "Teacher alignment complete: %d tasks in %.1fs (%.1f tasks/s, overlapped with rollouts)",
+                    len(pending_futures), teacher_elapsed, len(pending_futures) / teacher_elapsed if teacher_elapsed > 0 else 0
+                )
+            else:
+                logger.warning("No async alignments found, using zero KL for all")
+            
+            # Training setup
+            num_trajectories = len(trajectories)
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            
+            optimizer.zero_grad()
+            total_loss_value = 0.0
+            total_clip_fraction = 0.0
+            valid_count = 0
+            
+            debug_loss_dir = Path("/home/ubuntu/spider/debug_loss")
+            debug_loss_dir.mkdir(exist_ok=True)
+            
+            # Process each trajectory: build tensors -> train -> free memory (one at a time)
             for turn_index, turn in enumerate(trajectories):
-                messages = turn["messages"]
                 token_ids = turn["token_ids"]
                 logprobs = turn["logprobs"]
                 reward_mask = turn["reward_mask"]
-                student_logprobs = torch.tensor(logprobs, dtype=torch.float32, device=device)
                 
-                # Use pre-computed alignment results
-                results = alignment_results[turn_index]
-                combined_turns = turn.get("_combined_turns")
-                if combined_turns:
-                    kl_adjustments_combined = [0.0] * len(token_ids)
-                    kl_mask_combined = [0.0] * len(token_ids)
-                    
-                    for result in results:
-                        task = result["task"]
-                        alignment = result["alignment"]
-                        turn_info = task["turn_info"]
-                        completion_start = turn_info["completion_start"]
-                        completion_end = turn_info["completion_end"]
-                        
-                        turn_kl_adj = alignment.get("kl_adjustments") or [0.0] * len(token_ids)
-                        turn_kl_mask = alignment.get("kl_mask") or [0.0] * len(token_ids)
-                        
-                        for idx in range(completion_start, completion_end):
-                            if idx < len(kl_adjustments_combined):
-                                kl_adjustments_combined[idx] = turn_kl_adj[idx]
-                                if idx < len(turn_kl_mask):
-                                    kl_mask_combined[idx] = turn_kl_mask[idx]
-                    
-                    teacher_alignment = {
-                        "kl_adjustments": kl_adjustments_combined,
-                        "kl_mask": kl_mask_combined,
-                    }
+                # Skip sequences that are too long (OOM prevention)
+                seq_len = len(token_ids) - 1  # input_ids length
+                if seq_len > 16384:
+                    logger.warning(f"Skipping traj {turn_index}: seq_len={seq_len} > 16384")
+                    skip_log_file = debug_loss_dir / "skipped_trajectories.txt"
+                    with open(skip_log_file, "a") as f:
+                        f.write(f"Skipped traj {turn_index}: seq_len={seq_len} > 16384; token_ids={token_ids}\n")
+                    continue
+                
+                # Get KL adjustments from alignment (fallback to zero KL)
+                results = alignment_results.get(turn_index)
+                if results:
+                    kl_adj = results[0]["alignment"].get("kl_adjustments") or [0.0] * len(token_ids)
                 else:
-                    teacher_alignment = results[0]["alignment"]
-
-                item = dict(turn)
-                item.update({
-                    "student_logprobs": student_logprobs,
-                    "kl_adjustments": teacher_alignment.get("kl_adjustments"),
-                    "kl_mask": teacher_alignment.get("kl_mask"),
-                })
-                items.append(item)
-
-                kl_adj = teacher_alignment.get("kl_adjustments") or [0.0] * len(token_ids)
-                kl_mask = teacher_alignment.get("kl_mask") or [0.0] * len(token_ids)
-                kl_tensor = torch.tensor(kl_adj, device=device, dtype=torch.float32)
-
+                    kl_adj = [0.0] * len(token_ids)
                 kl_coef = float(getattr(options, "kl_penalty_coef", 1.0))
                 kl_discount = float(getattr(options, "kl_discount_factor", 0.0))
-                advantage = -kl_coef * kl_tensor
-
+                
+                kl_tensor_cpu = torch.tensor(kl_adj, dtype=torch.float32)
+                advantage_cpu = -kl_coef * kl_tensor_cpu
                 if kl_discount > 0:
-                    advantage = torch.tensor(
-                        discounted_future_sum_vectorized(advantage.detach().cpu().numpy(), kl_discount),
-                        device=device,
+                    advantage_cpu = torch.tensor(
+                        discounted_future_sum_vectorized(advantage_cpu.numpy(), kl_discount),
                         dtype=torch.float32,
                     )
-
-                input_tokens = list(token_ids)[:-1]
-                target_tokens = list(token_ids)[1:]
-                mask_tokens = list(reward_mask)[1:]
-                logprobs_tokens = student_logprobs[1:]
-                advantages_tokens = advantage[1:]
-
-                target_tensor = torch.tensor(target_tokens, dtype=torch.long, device=device)
-                mask_tensor = torch.tensor(mask_tokens, dtype=torch.float32, device=device)
-                advantages_tokens = advantages_tokens * mask_tensor
-
-                all_input_ids.append(torch.tensor(input_tokens, dtype=torch.long, device=device))
-                all_target_ids.append(target_tensor)
-                all_sampling_logprobs.append(logprobs_tokens)
-                all_advantages.append(advantages_tokens)
-                all_loss_masks.append(mask_tensor)
-
-                n_tokens = len(token_ids)
-                n_reward = sum(reward_mask)
-                kl_vals = (
-                    kl_tensor[torch.tensor(reward_mask, dtype=torch.bool, device=device)].tolist()
-                    if kl_tensor.numel() > 0
-                    else []
-                )
-                adv_vals = (
-                    advantages_tokens[mask_tensor.bool()].tolist()
-                    if advantages_tokens.numel() > 0
-                    else []
-                )
-
+                
+                input_tokens = token_ids[:-1]
+                target_tokens = token_ids[1:]
+                mask_tokens = reward_mask[1:]
+                logprobs_tokens = torch.tensor(logprobs, dtype=torch.float32)[1:]
+                advantages_tokens = advantage_cpu[1:]
+                
+                mask_tensor_cpu = torch.tensor(mask_tokens, dtype=torch.float32)
+                advantages_tokens = advantages_tokens * mask_tensor_cpu
+                
+                # Move to GPU only for this trajectory
+                input_ids = torch.tensor(input_tokens, dtype=torch.long, device=device).unsqueeze(0)
+                target_ids = torch.tensor(target_tokens, dtype=torch.long, device=device).unsqueeze(0)
+                sampling_lp = logprobs_tokens.to(device).unsqueeze(0)
+                advantages = advantages_tokens.to(device).unsqueeze(0)
+                loss_mask = mask_tensor_cpu.to(device).unsqueeze(0)
+                
+                # Metrics tracking (before GPU tensors get deleted)
+                kl_tensor = kl_tensor_cpu.to(device)
+                mask_bool = torch.tensor(reward_mask, dtype=torch.bool, device=device)
+                kl_vals = kl_tensor[mask_bool].tolist() if kl_tensor.numel() > 0 else []
+                adv_vals = advantages_tokens[mask_tensor_cpu.bool()].tolist() if advantages_tokens.numel() > 0 else []
+                
                 batch_metrics["kl_sum"] += sum(kl_vals)
                 batch_metrics["kl_count"] += len(kl_vals)
                 batch_metrics["advantage_sum"] += sum(adv_vals)
                 batch_metrics["advantage_sq_sum"] += sum(v * v for v in adv_vals)
                 batch_metrics["advantage_count"] += len(adv_vals)
-
+                
                 if verbose_turns:
                     logger.info(
                         "vllm rollout batch=%d batch_item_idx=%d n_tokens=%d n_reward_tokens=%d",
-                        batch_index,
-                        turn_index,
-                        n_tokens,
-                        n_reward,
+                        batch_index, turn_index, len(token_ids), sum(reward_mask),
                     )
-
-            # Perform training step with clipped importance sampling and gradient accumulation
-            num_trajectories = len(all_input_ids)
-            gradient_accumulation_steps = getattr(options, "gradient_accumulation_steps", 1)
-            if gradient_accumulation_steps is None or gradient_accumulation_steps <= 0:
-                gradient_accumulation_steps = num_trajectories  # Process all at once if not set
-            
-            # Zero gradients at start
-            optimizer.zero_grad()
-            
-            accumulated_loss_value = 0.0
-            total_clip_fraction = 0.0
-            
-            # Process trajectories in chunks for gradient accumulation
-            for chunk_start in range(0, num_trajectories, gradient_accumulation_steps):
-                chunk_end = min(chunk_start + gradient_accumulation_steps, num_trajectories)
-                chunk_size = chunk_end - chunk_start
                 
-                chunk_loss = torch.tensor(0.0, device=device, requires_grad=True)
-                chunk_clip_frac = 0.0
+                # Log GPU memory before forward pass
+                mem_allocated = torch.cuda.memory_allocated() / 1e9
+                mem_reserved = torch.cuda.memory_reserved() / 1e9
+                logger.info(
+                    "Before loss fn: traj=%d/%d seq_len=%d mem_allocated=%.2fGB mem_reserved=%.2fGB",
+                    turn_index, num_trajectories, input_ids.shape[1], mem_allocated, mem_reserved
+                )
                 
-                for idx in range(chunk_start, chunk_end):
-                    input_ids = all_input_ids[idx].unsqueeze(0)
-                    target_ids = all_target_ids[idx].unsqueeze(0)
-                    sampling_lp = all_sampling_logprobs[idx].unsqueeze(0)
-                    advantages = all_advantages[idx].unsqueeze(0)
-                    loss_mask = all_loss_masks[idx].unsqueeze(0)
-
-                    # Skip this trajectory if its length exceeds 16384 tokens (too long)
-                    if input_ids.shape[1] > 16384:
-                        logger.warning(
-                            "Skipping trajectory idx=%d with seq_len=%d (>16384 tokens)", idx, input_ids.shape[1]
-                        )
-                        continue
-
-                    loss, _, metrics = importance_sampling_loss_with_clip(
-                        model=model,
-                        input_ids=input_ids,
-                        target_ids=target_ids,
-                        sampling_logprobs=sampling_lp,
-                        advantages=advantages,
-                        loss_mask=loss_mask,
-                        clip_ratio=clip_ratio,
-                    )
-                    chunk_loss = chunk_loss + loss
-                    chunk_clip_frac += metrics["clip_fraction"]
-                    
-                    # Clear intermediate tensors after each sequence
-                    del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss, metrics
+                # Debug logging
+                import pickle
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                input_data = {
+                    "batch_index": batch_index, "trajectory_idx": turn_index,
+                    "input_ids": input_ids.detach().cpu(), "target_ids": target_ids.detach().cpu(),
+                    "sampling_logprobs": sampling_lp.detach().cpu(), "advantages": advantages.detach().cpu(),
+                    "loss_mask": loss_mask.detach().cpu(), "clip_ratio": clip_ratio,
+                    "mem_allocated_gb": mem_allocated, "mem_reserved_gb": mem_reserved,
+                }
+                with open(debug_loss_dir / f"batch{batch_index}_traj{turn_index}_{timestamp}_input.pkl", "wb") as f:
+                    pickle.dump(input_data, f)
                 
-                # Average chunk loss and scale by number of chunks
-                chunk_loss = chunk_loss / chunk_size
-                num_chunks = (num_trajectories + gradient_accumulation_steps - 1) // gradient_accumulation_steps
-                chunk_loss = chunk_loss / num_chunks
+                # Forward pass
+                loss, current_logprobs, metrics = importance_sampling_loss_with_clip(
+                    model=model, input_ids=input_ids, target_ids=target_ids,
+                    sampling_logprobs=sampling_lp, advantages=advantages,
+                    loss_mask=loss_mask, clip_ratio=clip_ratio,
+                )
                 
-                # Guard against NaN/Inf loss before backward
-                if not torch.isfinite(chunk_loss):
-                    logger.error("NaN/Inf loss detected at batch %d, aborting", batch_index)
-                    sys.exit(1)
-
-                # Backward on chunk (gradients accumulate)
-                accelerator.backward(chunk_loss)
-                accumulated_loss_value += chunk_loss.item() * chunk_size
-                total_clip_fraction += chunk_clip_frac
+                # Debug logging output
+                output_data = {
+                    "batch_index": batch_index, "trajectory_idx": turn_index,
+                    "current_logprobs": current_logprobs.detach().cpu(),
+                    "loss": loss.detach().cpu().item(), "metrics": metrics,
+                }
+                with open(debug_loss_dir / f"batch{batch_index}_traj{turn_index}_{timestamp}_output.pkl", "wb") as f:
+                    pickle.dump(output_data, f)
                 
-                # Clear chunk_loss and free memory immediately after backward
-                del chunk_loss
-                if torch.cuda.is_available():
+                # Guard against NaN/Inf
+                if not torch.isfinite(loss):
+                    logger.error("NaN/Inf loss at batch %d traj %d, skipping", batch_index, turn_index)
+                    del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss, current_logprobs, metrics
                     torch.cuda.empty_cache()
+                    continue
+                
+                # Backward pass immediately (micro-batching)
+                scaled_loss = loss / num_trajectories
+                accelerator.backward(scaled_loss)
+                
+                total_loss_value += loss.detach().item()
+                total_clip_fraction += metrics["clip_fraction"]
+                valid_count += 1
+                
+                # Free GPU memory immediately
+                del input_ids, target_ids, sampling_lp, advantages, loss_mask, loss, scaled_loss, current_logprobs, metrics
+                del kl_tensor, mask_bool
+                gc.collect()
+                torch.cuda.empty_cache()
             
-            # Step optimizer once after all chunks (with gradient clipping for stability)
+            if valid_count == 0:
+                logger.warning("No valid trajectories in batch %d, skipping", batch_index)
+                return batch_metrics
+            
+            # Average loss value for logging
+            loss_value = total_loss_value / valid_count
+            
+            # Gradient clipping and optimizer step
             max_grad_norm = float(getattr(options, "max_grad_norm", 1.0))
             
-            # Check for NaN gradients before stepping (they would corrupt weights)
             has_nan_grad = False
             for name, param in model.named_parameters():
                 if param.grad is not None and not torch.isfinite(param.grad).all():
                     has_nan_grad = True
-                    logger.error("NaN gradient detected in %s before optimizer step", name)
+                    logger.error("NaN gradient in %s", name)
                     break
             
             if has_nan_grad:
-                logger.error("Skipping optimizer step due to NaN gradients")
-                optimizer.zero_grad()  # Clear the bad gradients
+                logger.error("NaN gradient encountered at batch %d, aborting", batch_index)
+                optimizer.zero_grad()
+                sys.exit(1)
             else:
                 accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
                 scheduler.step()
             
-            # Average loss for logging
-            loss_value = accumulated_loss_value / num_trajectories if num_trajectories > 0 else 0.0
             batch_metrics["clip_fraction_sum"] += total_clip_fraction
-            batch_metrics["clip_count"] += num_trajectories
+            batch_metrics["clip_count"] += valid_count
             
             # Aggressive memory cleanup after backward pass
             torch.cuda.empty_cache()
@@ -1554,7 +867,7 @@ def _run_tool_on_policy_vllm_accelerate(
                 data={"batch_index": batch_index},
             )
 
-            return items, batch_metrics
+            return batch_metrics
 
         # Main training loop
         save_every = max(1, getattr(options, "save_every", 1))
@@ -1645,7 +958,17 @@ def _run_tool_on_policy_vllm_accelerate(
                 # Process batch (training step)
                 training_start = time.time()
                 try:
-                    batch_items, batch_metrics = _process_batch(batch_index, trajectories)
+                    import os
+                    import pickle
+                    from pathlib import Path
+                    debug_dir = Path("debug_traj_b4_training")
+                    debug_dir.mkdir(exist_ok=True)
+                    fname = f"trajectories_batch{batch_index}_step{global_step}.pkl"
+                    fpath = debug_dir / fname
+                    with open(fpath, "wb") as f:
+                        pickle.dump(trajectories, f)
+
+                    batch_metrics = _process_batch(batch_index, trajectories)
                 except RuntimeError as e:
                     if "Non-finite loss" in str(e):
                         logger.error("Aborting training at batch %d due to non-finite loss", batch_index)
@@ -1661,7 +984,6 @@ def _run_tool_on_policy_vllm_accelerate(
                 
                 # Calculate throughput metrics
                 tokens_per_sec = step_tokens / batch_time if batch_time > 0 else 0
-                rollout_throughput = len(chunk) / rollout_time if rollout_time > 0 else 0
 
                 # Update progress bar
                 train_pbar.update(1)
@@ -1807,319 +1129,6 @@ def _run_tool_on_policy_vllm_accelerate(
         vllm_backend.close()
 
 
-def _tool_rollout_stream(
-    *,
-    job_id: str,
-    job: JobConfig,
-    student_sampler: TransformersSamplerContext,
-    prompts: List[Dict[str, Any]],
-    tool_registry: Dict[str, Callable[..., Any]],
-    runtime_factory: Optional[Callable[[Dict[str, Any]], Any]] = None,
-    on_batch_start: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
-    on_batch_start_lookahead: int = 0,
-    on_batch_complete: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
-) -> Iterable[List[Dict[str, Any]]]:
-    """Generate tool rollouts using transformers generate().
-
-    This is the accelerate version of _tool_rollout_stream from on_policy.py.
-    It uses TransformersSamplerContext instead of tinker.SamplingClient.
-    """
-    import threading
-    from concurrent.futures import ThreadPoolExecutor
-
-    from .executor import (
-        _initial_chat_history,
-        _execute_tool_calls,
-        tool_descriptors,
-        JobExecutionError,
-    )
-
-    tool_defs = tool_descriptors(job.tools)
-    turn_limit = max(1, job.generation.max_tool_turns or 16)
-    verbose_turns = bool(job.generation.verbose)
-
-    batch_size, total_batches = _compute_batch_stats(prompts, job.generation.on_policy_options)
-
-    tokenizer = student_sampler.tokenizer
-    model = student_sampler.model
-    model_name = student_sampler.model_name
-    device = next(model.parameters()).device
-
-    def _run_prompt(row: Dict[str, Any]) -> List[Dict[str, Any]]:
-        prompt = row["prompt"]
-        history = _initial_chat_history(prompt, row.get("system_prompt"))
-        turn_items = []
-        runtime = None
-
-        if runtime_factory:
-            runtime = runtime_factory(row)
-
-        try:
-            for turn_idx in range(turn_limit):
-                # try:
-                # Generate using transformers
-                messages = list(history)
-                max_tokens = job.generation.parameters.get("max_tokens", 4096)
-                temperature = job.generation.parameters.get("temperature", 1.0)
-
-                # Apply chat template and generate
-                input_text = tokenizer.apply_chat_template(
-                    messages,
-                    tools=tool_defs if tool_defs else None,
-                    add_generation_prompt=True,
-                    tokenize=False,
-                )
-                input_ids = tokenizer.encode(input_text, return_tensors="pt").to(device)
-                prompt_token_count = input_ids.shape[1]
-                
-                # Early stopping if input_ids exceeds 15k tokens
-                if prompt_token_count > 15000:
-                    logger.warning(
-                        "Prompt token count (%d) exceeds 15k limit at turn %d. Stopping early.",
-                        prompt_token_count,
-                        turn_idx,
-                    )
-                    break
-
-                with torch.no_grad():
-                    output = model.generate(
-                        input_ids,
-                        max_new_tokens=max_tokens,
-                        do_sample=True,
-                        temperature=temperature,
-                        return_dict_in_generate=True,
-                        output_scores=True,
-                        pad_token_id=tokenizer.pad_token_id,
-                    )
-
-                full_ids = output.sequences[0].tolist()
-                generated_ids = full_ids[prompt_token_count:]
-                
-                # Early stopping if full sequence exceeds 15k tokens
-                if len(full_ids) > 15000:
-                    logger.warning(
-                        "Full sequence length (%d) exceeds 15k limit at turn %d. Stopping early.",
-                        len(full_ids),
-                        turn_idx,
-                    )
-                    break
-
-                # Compute logprobs for generated tokens
-                scores = output.scores
-                gen_logprobs = []
-                for i, score in enumerate(scores):
-                    log_probs = F.log_softmax(score, dim=-1)
-                    token_id = generated_ids[i] if i < len(generated_ids) else 0
-                    gen_logprobs.append(log_probs[0, token_id].item())
-
-                # Full sequence logprobs (0 for prompt tokens)
-                all_logprobs = [0.0] * prompt_token_count + gen_logprobs
-
-                # Decode generated text
-                generated_text = tokenizer.decode(generated_ids, skip_special_tokens=False)
-
-            
-                # Parse response for tool calls using vLLM parsers
-                tool_parser_name = _default_tool_parser(model_name)
-                reasoning_parser_name = _default_reasoning_parser(model_name)
-                parsed = parse_assistant_turn(
-                    messages=messages,
-                    assistant_text=generated_text,
-                    tools=tool_defs if tool_defs else None,
-                    tool_choice="auto" if tool_defs else None,
-                    tool_parser_name=tool_parser_name,
-                    reasoning_parser_name=reasoning_parser_name,
-                    tokenizer=tokenizer,
-                    token_ids=generated_ids,
-                    chat_template_kwargs=None,
-                )
-
-                content = parsed.content
-                tool_calls = parsed.tool_calls
-                reasoning_content = parsed.reasoning
-
-                # Build reward mask (1 for generated tokens, 0 for prompt)
-                reward_mask = [0] * prompt_token_count + [1] * len(generated_ids)
-
-                # except Exception as exc:
-                #     if _is_context_window_error(exc):
-                #         logger.warning(
-                #             "Prompt=`%s...` turn=%d exceeded context window; ending trajectory.",
-                #             prompt[:20],
-                #             turn_idx,
-                #         )
-                #         break
-                #     raise
-
-                if len(full_ids) <= 1:
-                    raise JobExecutionError(
-                        f"token_ids too short for shifted training: tokens={len(full_ids)}"
-                    )
-
-                snapshot = {
-                    "role": "assistant",
-                    "content": content,
-                    "tool_calls": tool_calls,
-                }
-                if reasoning_content:
-                    snapshot["reasoning_content"] = reasoning_content
-
-                if verbose_turns:
-                    logger.info(
-                        "prompt=`%s...` turn=%d tool_returned=%s",
-                        prompt[:8],
-                        turn_idx,
-                        bool(tool_calls),
-                    )
-
-                history.append(snapshot)
-                turn_items.append(
-                    {
-                        "prompt": prompt,
-                        "messages": list(history),
-                        "token_ids": full_ids,
-                        "logprobs": all_logprobs,
-                        "reward_mask": reward_mask,
-                        "assistant_content": content,
-                        "assistant_reasoning_content": reasoning_content,
-                        "assistant_tool_calls": tool_calls,
-                        "assistant_raw_text": generated_text,
-                        "prompt_token_count": prompt_token_count,
-                        "parser_fallback": False,
-                        "turn_index": turn_idx,
-                        "retokenize_match": True,
-                    }
-                )
-
-                if not tool_calls:
-                    break
-
-                _execute_tool_calls(
-                    tool_calls=tool_calls,
-                    tool_registry=tool_registry,
-                    history=history,
-                )
-
-        finally:
-            if runtime is not None:
-                runtime.cleanup()
-
-        # Combine all turns into a single item for batch training
-        if len(turn_items) == 0:
-            return []
-
-        if len(turn_items) == 1:
-            return turn_items
-
-        # Use the last turn's full sequence
-        last_turn = turn_items[-1]
-        combined_token_ids = list(last_turn["token_ids"])
-        combined_logprobs = list(last_turn["logprobs"])
-
-        # Initialize reward_mask (all masked)
-        combined_reward_mask = [0] * len(combined_token_ids)
-
-        # For each turn, unmask its completion region
-        for turn_item in turn_items:
-            prompt_count = turn_item["prompt_token_count"]
-            turn_token_count = len(turn_item["token_ids"])
-
-            completion_start = prompt_count
-            completion_end = turn_token_count
-
-            for idx in range(completion_start, completion_end):
-                if idx < len(combined_reward_mask):
-                    combined_reward_mask[idx] = 1
-
-        # Combine metadata
-        all_tool_calls = []
-        all_assistant_contents = []
-        all_assistant_reasoning = []
-        all_assistant_raw_texts = []
-
-        for turn_item in turn_items:
-            if turn_item.get("assistant_tool_calls"):
-                all_tool_calls.extend(turn_item["assistant_tool_calls"])
-            if turn_item.get("assistant_content"):
-                all_assistant_contents.append(turn_item["assistant_content"])
-            if turn_item.get("assistant_reasoning_content"):
-                all_assistant_reasoning.append(turn_item["assistant_reasoning_content"])
-            if turn_item.get("assistant_raw_text"):
-                all_assistant_raw_texts.append(turn_item["assistant_raw_text"])
-
-        # Store turn information for teacher alignment computation
-        turn_info_for_alignment = []
-        for turn_item in turn_items:
-            turn_info_for_alignment.append(
-                {
-                    "messages": turn_item["messages"],
-                    "assistant_raw_text": turn_item.get("assistant_raw_text"),
-                    "completion_start": turn_item["prompt_token_count"],
-                    "completion_end": len(turn_item["token_ids"]),
-                }
-            )
-
-        # Create combined item
-        combined_item = {
-            "prompt": turn_items[0]["prompt"],
-            "messages": last_turn["messages"],
-            "token_ids": combined_token_ids,
-            "logprobs": combined_logprobs,
-            "reward_mask": combined_reward_mask,
-            "assistant_content": all_assistant_contents[-1] if all_assistant_contents else "",
-            "assistant_reasoning_content": all_assistant_reasoning[-1]
-            if all_assistant_reasoning
-            else None,
-            "assistant_tool_calls": all_tool_calls if all_tool_calls else None,
-            "assistant_raw_text": all_assistant_raw_texts[-1] if all_assistant_raw_texts else None,
-            "prompt_token_count": turn_items[0]["prompt_token_count"],
-            "parser_fallback": last_turn.get("parser_fallback", False),
-            "turn_index": len(turn_items) - 1,
-            "retokenize_match": True,
-            "_combined_turns": turn_info_for_alignment,
-        }
-
-        logger.info(
-            "prompt=`%s...` combined %d turns into single item: total_tokens=%d reward_tokens=%d",
-            prompt[:8],
-            len(turn_items),
-            len(combined_token_ids),
-            sum(combined_reward_mask),
-        )
-
-        return [combined_item]
-
-    for batch_index, start in enumerate(range(0, len(prompts), batch_size)):
-        if on_batch_start and on_batch_start_lookahead > 0:
-            for ahead in range(1, on_batch_start_lookahead + 1):
-                next_start = start + ahead * batch_size
-                if next_start >= len(prompts):
-                    break
-                next_chunk = prompts[next_start : next_start + batch_size]
-                on_batch_start(next_chunk)
-
-        chunk = prompts[start : start + batch_size]
-
-        # Note: Using single-threaded execution for transformers generation
-        # as the model is not thread-safe without additional synchronization
-        results = [_run_prompt(row) for row in chunk]
-
-        if on_batch_complete is not None:
-            on_batch_complete(chunk)
-
-        turns = [turn for per_prompt in results for turn in per_prompt]
-        events.emit(
-            "Tool rollout batch ready (accelerate).",
-            code="tool_on_policy_accelerate.batch_ready",
-            data={
-                "batch_index": batch_index,
-                "batch_size": len(chunk),
-                "total_batches": total_batches,
-            },
-        )
-        if turns:
-            yield turns
-
 def _compute_batch_stats(prompts: List[Any], options: Any) -> Tuple[int, int]:
     """Compute batch size and total batches."""
     batch_size = max(1, getattr(options, "groups_per_batch", 64))
@@ -2127,7 +1136,3 @@ def _compute_batch_stats(prompts: List[Any], options: Any) -> Tuple[int, int]:
     return batch_size, total_batches
 
 
-def _is_context_window_error(exc: Exception) -> bool:
-    """Check if exception is a context window error."""
-    text = str(exc).lower()
-    return "context window" in text or "max_tokens" in text
