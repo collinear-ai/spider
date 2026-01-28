@@ -75,11 +75,6 @@ class SourceConfig(BaseModel):
 
 class OnPolicyConfig(BaseModel):
     teacher: str = Field(..., description="Teacher model to compute KL (HF model name for tokenizer)")
-    fireworks_model: Optional[str] = Field(
-        default=None,
-        description="Fireworks model ID for teacher logprobs (e.g. 'accounts/fireworks/models/qwen3-235b-a22b'). "
-                    "If set, uses Fireworks API instead of loading teacher locally."
-    )
     learning_rate: float = Field(default=1e-4, gt=0.0)
     groups_per_batch: int = Field(default=512, ge=1)
     group_size: int = Field(default=4, ge=1)
@@ -104,45 +99,6 @@ class OnPolicyConfig(BaseModel):
     wandb_project: Optional[str] = Field(default=None, description="Wandb project name for logging")
     wandb_name: Optional[str] = Field(default=None, description="Wandb run name")
 
-    # Separated inference/training configuration
-    use_vllm_inference: bool = Field(
-        default=False,
-        description="Use vLLM server for inference instead of transformers generate()"
-    )
-    vllm_tensor_parallel_size: int = Field(
-        default=1,
-        ge=1,
-        description="Tensor parallel size for vLLM inference server"
-    )
-    vllm_gpu_memory_utilization: float = Field(
-        default=0.9,
-        gt=0.0,
-        le=1.0,
-        description="GPU memory utilization for vLLM server"
-    )
-    vllm_max_num_batched_tokens: Optional[int] = Field(
-        default=None,
-        ge=1,
-        description="Maximum number of batched tokens for vLLM (default: 4096, increase for larger batches)"
-    )
-    vllm_max_num_seqs: Optional[int] = Field(
-        default=None,
-        ge=1,
-        description="Maximum number of concurrent sequences for vLLM (default: 256, increase for more parallelism)"
-    )
-    vllm_gpu_ids: List[int] = Field(
-        default_factory=lambda: [0],
-        description="GPU IDs for vLLM inference server (e.g. [0, 1] for TP=2)"
-    )
-    training_gpu_ids: List[int] = Field(
-        default_factory=lambda: [1],
-        description="GPU IDs for training (e.g. [2, 3] for multi-GPU training)"
-    )
-    rollout_workers: int = Field(
-        default=8,
-        ge=1,
-        description="Number of parallel workers for rollout collection"
-    )
     # DeepSpeed configuration
     use_deepspeed: bool = Field(
         default=False,
@@ -165,17 +121,6 @@ class OnPolicyConfig(BaseModel):
     deepspeed_offload_param: bool = Field(
         default=False,
         description="Offload parameters to CPU (ZeRO-3 only, saves more memory)"
-    )
-    weight_sync_steps: int = Field(
-        default=10,
-        ge=1,
-        description="Sync LoRA weights to vLLM server every N training steps"
-    )
-    importance_sampling_clip: float = Field(
-        default=0.2,
-        ge=0.0,
-        le=1.0,
-        description="PPO-style clipping ratio for importance sampling loss"
     )
 
 class GenerationConfig(BaseModel):
