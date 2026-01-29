@@ -149,6 +149,14 @@ class GenerationConfig(BaseModel):
         default=None,
         description="System prompt(s) prepended to each chat history",
     )
+    tokenize: bool = Field(
+        default=False,
+        description="If true, tokenize each trajectory and attach token count"
+    )
+    tokenizer: Optional[str] = Field(
+        default=None,
+        description="HF tokenizer model id"
+    )
     on_policy: bool = Field(
         default=False,
         description="Enable on-policy training"
@@ -174,9 +182,11 @@ class GenerationConfig(BaseModel):
         raise ValueError("`system_prompt` must be a string or a list of strings")
 
     @model_validator(mode="after")
-    def validate_on_policy(self) -> "GenerationConfig":
+    def validate_generation_config(self) -> "GenerationConfig":
         if self.on_policy and not self.on_policy_options:
             raise ValueError("`on_policy_options` is required when `on_policy` is true")
+        if self.tokenize and not self.tokenizer:
+            raise ValueError("`tokenizer` is required when `tokenize` is true")
         return self
 
 class ModelConfig(BaseModel):

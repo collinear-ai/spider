@@ -259,6 +259,17 @@ def _job_env_context(job_env: Dict[str, str]):
             else:
                 os.environ[key] = value
 
+def _load_generation_tokenizer(job: JobConfig) -> Any | None:
+    if not job.generation.tokenize:
+        return None
+    tokenizer_id = job.generation.tokenizer
+
+    try:
+        from transformers import AutoTokenizer
+        return AutoTokenizer.from_pretrained(tokenizer_id)
+    except Exception as exc:
+        raise JobExecutionError(f"Failed to load tokenizer `{tokenizer_id}`: {exc}") from exc
+
 def _run_batched_generation(
     *,
     job_id: str,
@@ -270,7 +281,10 @@ def _run_batched_generation(
 ) -> JobExecutionResult:
     aggregated_metrics = {}
     records_written = 0
+
     payload = _base_metadata(job_id, job)
+    tokenizer = _load_generation_tokenizer(job)
+
     if job.runtime and job.runtime.packages:
         payload.setdefault("runtime", {})["packages"] = list(job.runtime.packages)
     _write_metadata(metadata_path, payload, records_written)
@@ -306,6 +320,7 @@ def _run_batched_generation(
                         aggregated_metrics, 
                         payload,
                         metadata_path, 
+                        tokenizer=tokenizer,
                         block=False,
                         batch_started=batch_index,
                         job_id=job_id,
@@ -317,6 +332,7 @@ def _run_batched_generation(
                     aggregated_metrics, 
                     payload,
                     metadata_path, 
+                    tokenizer=tokenizer,
                     block=True,
                     batch_started=batch_index,
                     job_id=job_id,
@@ -400,6 +416,57 @@ def _build_batch_worker(
         dict(backend.metrics() or {})
     )
 
+def _build_single_turn_trajectory(
+    row: Dict[str, Any],
+    *,
+    content: str,
+    reasoning: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    history = []
+    system_prompt = row.get("system_prompt")
+    if system_prompt:
+        history.append({"role": "system", "content": system_prompt})
+    history.append({"role": "user", "content": row["prompt"]})
+    assistant_msg = {"role": "assistant", "content": content}
+    if reasoning:
+        assistant_msg["reasoning"] = reasoning
+    history.append(assistant_msg)
+    return history
+
+def _tools_for_tokenization(record: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    tools = record.get("tools")
+    if tools is None:
+        return None
+    if isinstance(tools, str):
+        tools = json.loads(tools)
+    if not isinstance(tools, list):
+        raise ValueError("`tools` must be a list.")
+    return tools
+
+def _attach_token_counts(
+    records: List[Dict[str, Any]],
+    *,
+    tokenizer: Any,
+) -> None:
+    for record in records:
+        if not record:
+            continue
+        trajectory = record.get("trajectory")
+        tools = _tools_for_tokenization(record)
+        tokens = tokenizer.apply_chat_template(
+            trajectory,
+            tools=tools,
+            add_generation_prompt=False,
+            tokenize=True,
+        )
+
+        if isinstance(tokens, list) and tokens and isinstance(tokens[0], list):
+            token_count = len(tokens[0])
+        else:
+            token_count = len(tokens)
+            
+        record["token_count"] = token_count
+
 def _pair_records(
     prompts: Iterable[Dict[str, Any]], 
     generations: Iterable[Dict[str, Any]]
@@ -408,7 +475,12 @@ def _pair_records(
     for row, gen in zip(prompts, generations):
         content = gen.get("content", "")
         reasoning = gen.get("reasoning") or None
-        record = _build_generation_record(row, content=content, reasoning=reasoning)
+        trajectory = _build_single_turn_trajectory(
+            row,
+            content=content,
+            reasoning=reasoning,
+        )
+        record = _build_generation_record(row, trajectory=trajectory)
         paired.append(record)
     return paired
 
@@ -500,7 +572,12 @@ def _process_batch(
     for row, gen in zip(prompts, generations):
         content = gen.get("content", "")
         reasoning = gen.get("reasoning") or None
-        record = _build_generation_record(row, content=content, reasoning=reasoning)
+        trajectory = _build_single_turn_trajectory(
+            row,
+            content=content,
+            reasoning=reasoning,
+        )
+        record = _build_generation_record(row, trajectory=trajectory)
 
         result = processor(record)
         if result is None:
@@ -517,6 +594,7 @@ def _drain_ready_batches(
     aggregated_metrics: Dict[str, float],
     payload: Dict[str, Any], 
     metadata_path: Path, 
+    tokenizer: Any | None,
     *, 
     block: bool, 
     batch_started: Optional[int],
@@ -530,6 +608,10 @@ def _drain_ready_batches(
             records = future.result()
         except Exception as exc:
             raise JobExecutionError(f"Processor failed: {exc}") from exc
+
+        if tokenizer:
+            _attach_token_counts(records, tokenizer=tokenizer)
+
         writer.write_records(records)
         events.emit(
             "Batch completed.",
