@@ -15,6 +15,7 @@ from spider.config import ToolConfig
 _SOURCE_TEMPLATE = """
 import os 
 import anyio
+from anyio import fail_after
 import json
 import httpx
 from mcp.client.session import ClientSession
@@ -32,6 +33,19 @@ def _load_mcp_headers():
         raise ValueError("MCP_HEADERS_JSON must decode to an object.")
     return headers
 
+async def _call_tool_with_retry(session, name, arguments, *, timeout_s=120, max_attempts=3, backoff_s=1.0):
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with fail_after(timeout_s):
+                return await session.call_tool(name, arguments)
+        except (TimeoutError, httpx.HTTPError) as exc:
+            last_exc = exc
+            if attempt == max_attempts:
+                raise
+            await anyio.sleep(backoff_s * attempt)
+    raise last_exc
+
 def call_mcp_tool(server_url, tool_name, arguments):
     async def _run():
         headers = _load_mcp_headers()
@@ -39,7 +53,7 @@ def call_mcp_tool(server_url, tool_name, arguments):
             async with streamable_http_client(server_url, http_client=http_client) as (read_stream, write_stream, _):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
-                    result = await session.call_tool(tool_name, arguments)
+                    result = await _call_tool_with_retry(session, tool_name, arguments, timeout_s=120, max_attempts=3)
                     return result.model_dump()
     return anyio.run(_run)
 
