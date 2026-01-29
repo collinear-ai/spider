@@ -1,0 +1,32 @@
+server:
+  base_url: http://127.0.0.1:9000
+  request_timeout: 120
+job:
+  model: 
+    provider: openai
+    name: gpt-5.2
+  source:
+    dataset: "collinear-ai/zoho-1f-tool-finance"
+    max_examples: 50
+    shuffle: true
+    multi_turn: true
+    user_simulation_prompt: |
+      You are a user prompt generator. 
+      You are given a conversation history where the assistant answers a financial question(s) by going through financial data via tools.
+      Given the history, generate the next most plausible question that builds on the previous requests and tasks.
+      Your prompt should ask exactly ONE question that can be answered in a single number, sentence, table, or json.
+      Only generate the user prompt, no explanation needed.
+    user_model:
+      name: "gpt-5.2"
+      provider: openai
+  generation:
+    max_tool_turns: 16
+    max_user_turns: 3
+    parameters:
+      temperature: 0.7
+      top_p: 0.9
+  output:
+    mode: "upload_hf"
+    hf:
+      repo_id: collinear-ai/zoho-1f-tool-finance-gpt-5.2
+      private: true

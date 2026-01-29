@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import re
+import os
+import json
 
 import anyio
 import httpx
@@ -13,13 +15,27 @@ from spider.config import ToolConfig
 _SOURCE_TEMPLATE = """
 import os 
 import anyio
+import json
 import httpx
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+def _load_mcp_headers():
+    raw = os.environ.get("MCP_HEADERS_JSON", "").strip()
+    if not raw:
+        return None
+    try:
+        headers = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("MCP_HEADERS_JSON must be valid JSON.") from exc
+    if not isinstance(headers, dict):
+        raise ValueError("MCP_HEADERS_JSON must decode to an object.")
+    return headers
+
 def call_mcp_tool(server_url, tool_name, arguments):
     async def _run():
-        async with httpx.AsyncClient() as http_client:
+        headers = _load_mcp_headers()
+        async with httpx.AsyncClient(headers=headers) as http_client:
             async with streamable_http_client(server_url, http_client=http_client) as (read_stream, write_stream, _):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
@@ -30,6 +46,18 @@ def call_mcp_tool(server_url, tool_name, arguments):
 def {func_name}(**kwargs):
     return call_mcp_tool(os.environ["{mcp_url_env}"], "{tool_name}", kwargs)
 """
+
+def _load_mcp_headers() -> Optional[Dict[str, str]]:
+    raw = os.environ.get("MCP_HEADERS_JSON", "").strip()
+    if not raw:
+        return None
+    try:
+        headers = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("MCP_HEADERS_JSON must be valid JSON.") from exc
+    if not isinstance(headers, dict):
+        raise ValueError("MCP_HEADERS_JSON must decode to an object.")
+    return headers
 
 def _sanitize_tool_name(name: str) -> str:
     cleaned = re.sub(r"[^0-9a-zA-Z_]", "_", name).strip("_")
@@ -46,9 +74,10 @@ def tool_config_from_server(
 ) -> List[ToolConfig]:
     if not server_url:
         raise ValueError("server_url is required to query MCP tools.")
+    headers = _load_mcp_headers()
         
     async def _run() -> List[ToolConfig]:
-        async with httpx.AsyncClient() as http_client:
+        async with httpx.AsyncClient(headers=headers) as http_client:
             async with streamable_http_client(server_url, http_client=http_client) as (
                 read_stream,
                 write_stream,

@@ -66,10 +66,15 @@ def _start_server(spec: MCPServerSpec) -> MCPServerHandle:
         _wait_for_port(spec.port, timeout_s=spec.startup_timeout_s)
     return MCPServerHandle(spec=spec, proc=proc)
 
-def _require_env(env: Dict[str, str], required: Sequence[str], name: str) -> None:
-    missing = [key for key in required if not env.get(key)]
-    if missing:
-        raise ValueError(f"{name} missing env vars: {', '.join(missing)}")
+def use_mcp_remote_url(
+    *,
+    mcp_url_env: str,
+    remote_url: str,
+) -> Tuple[Optional[MCPServerHandle], str]:
+    if not remote_url:
+        raise ValueError("remote_url is required for direct MCP access.")
+    os.environ[mcp_url_env] = remote_url
+    return None, remote_url
 
 def start_mcp_remote_proxy(
     *,
