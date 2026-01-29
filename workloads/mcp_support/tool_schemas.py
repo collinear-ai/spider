@@ -33,28 +33,25 @@ def _load_mcp_headers():
         raise ValueError("MCP_HEADERS_JSON must decode to an object.")
     return headers
 
-async def _call_tool_with_retry(session, name, arguments, *, timeout_s=120, max_attempts=3, backoff_s=1.0):
-    last_exc = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            with fail_after(timeout_s):
-                return await session.call_tool(name, arguments)
-        except (TimeoutError, httpx.HTTPError) as exc:
-            last_exc = exc
-            if attempt == max_attempts:
-                raise
-            await anyio.sleep(backoff_s * attempt)
-    raise last_exc
-
 def call_mcp_tool(server_url, tool_name, arguments):
     async def _run():
         headers = _load_mcp_headers()
-        async with httpx.AsyncClient(headers=headers) as http_client:
-            async with streamable_http_client(server_url, http_client=http_client) as (read_stream, write_stream, _):
-                async with ClientSession(read_stream, write_stream) as session:
-                    await session.initialize()
-                    result = await _call_tool_with_retry(session, tool_name, arguments, timeout_s=120, max_attempts=3)
-                    return result.model_dump()
+        last_exc = None
+        for attempt in range(1, 4):
+            try:
+                with fail_after(120):
+                    async with httpx.AsyncClient(headers=headers) as http_client:
+                        async with streamable_http_client(server_url, http_client=http_client) as (read_stream, write_stream, _):
+                            async with ClientSession(read_stream, write_stream) as session:
+                                await session.initialize()
+                                result = await session.call_tool(tool_name, arguments)
+                                return result.model_dump()
+            except (TimeoutError, httpx.HTTPError) as exc:
+                last_exc = exc
+                if attempt == 3:
+                    raise
+                await anyio.sleep(1.0 * attempt)
+        raise last_exc
     return anyio.run(_run)
 
 def {func_name}(**kwargs):
