@@ -53,10 +53,11 @@ class OpenRouterBackend:
             **payload,
         )
         content = _extract_content(response)
+        reasoning = _extract_reasoning(response)
 
         return {
             "content": content or "",
-            "reasoning": None,
+            "reasoning": reasoning or None,
             "tool_calls": None,
         }
 
@@ -105,3 +106,17 @@ def _extract_content(response: Any) -> str:
     if isinstance(message, dict):
         return message.get("content") or ""
     return getattr(message, "content", None) or ""
+
+def _extract_reasoning(response: Any) -> str:
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return ""
+    choice = choices[0]
+    message = getattr(choice, "message", None)
+    if isinstance(message, dict):
+        return message.get("reasoning") or message.get("reasoning_content") or ""
+    return (
+        getattr(message, "reasoning", None)
+        or getattr(message, "reasoning_content", None)
+        or ""
+    )
