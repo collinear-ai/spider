@@ -38,10 +38,7 @@ class OpenRouterBackend:
         payload["model"] = self._config.name
 
         if tools:
-            logger.info(
-                "OpenRouter backend ignoring %d tool(s) (tool calls disabled).",
-                len(tools),
-            )
+            payload["tools"] = [_as_dict(tool) for tool in tools]
 
         logger.info(
             "OpenRouter chat called with %d message(s)",
@@ -54,11 +51,12 @@ class OpenRouterBackend:
         )
         content = _extract_content(response)
         reasoning = _extract_reasoning(response)
+        tool_calls = _extract_tool_calls(response)
 
         return {
             "content": content or "",
             "reasoning": reasoning or None,
-            "tool_calls": None,
+            "tool_calls": tool_calls,
         }
 
     def chat_batch(
@@ -127,3 +125,39 @@ def _extract_reasoning(response: Any) -> str:
         or getattr(message, "reasoning_content", None)
         or ""
     )
+
+def _extract_tool_calls(response: Any) -> Optional[List[Dict[str, Any]]]:
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return None
+    choice = choices[0]
+    message = getattr(choice, "message", None)
+    if isinstance(message, dict):
+        tool_calls = message.get("tool_calls") or []
+    else:
+        tool_calls = getattr(message, "tool_calls", None) or []
+
+    normalized = []
+    for call in tool_calls:
+        call = _as_dict(call)
+        function = _as_dict(call.get("function") or {})
+        normalized.append(
+            {
+                "id": call.get("id"),
+                "type": call.get("type") or "function",
+                "function": {
+                    "name": function.get("name") or "",
+                    "arguments": function.get("arguments") or "",
+                },
+            }
+        )
+    return normalized or None
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if hasattr(value, "dict"):
+        return value.dict()
+    return dict(value)
