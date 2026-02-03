@@ -5,6 +5,7 @@ import os
 import logging
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import sys
 
 from tqdm.auto import tqdm
 
@@ -76,6 +77,9 @@ class OpenRouterBackend:
             total=len(prompts),
             desc="OpenRouter batch",
             leave=False,
+            disable=False,
+            file=sys.stderr,
+            dynamic_ncols=True,
         )
         progress_lock = threading.Lock()
 
