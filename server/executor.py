@@ -473,6 +473,8 @@ def _pair_records(
 ) -> List[Dict[str, Any]]:
     paired = []
     for row, gen in zip(prompts, generations):
+        if not gen:
+            continue
         content = gen.get("content", "")
         reasoning = gen.get("reasoning") or None
         trajectory = _build_single_turn_trajectory(
@@ -570,6 +572,8 @@ def _process_batch(
 ) -> List[Dict[str, Any]]:
     processed = []
     for row, gen in zip(prompts, generations):
+        if not gen:
+            continue
         content = gen.get("content", "")
         reasoning = gen.get("reasoning") or None
         trajectory = _build_single_turn_trajectory(

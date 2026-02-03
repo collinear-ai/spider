@@ -71,13 +71,20 @@ class OpenRouterBackend:
         if not prompts:
             return []
 
-        def run_one(args: Any) -> tuple[int, Dict[str, Any]]:
+        def run_one(args: Any) -> tuple[int, Optional[Dict[str, Any]]]:
             idx, prompt = args
             messages = []
             if system_prompts and system_prompts[idx]:
                 messages.append({"role": "system", "content": system_prompts[idx]})
             messages.append({"role": "user", "content": prompt})
-            return idx, self.chat(messages=messages, parameters=parameters)
+            try:
+                return idx, self.chat(messages=messages, parameters=parameters)
+            except Exception as exc:
+                logger.warning(
+                    "OpenRouter chat_batch skipped prompt due to error: %s",
+                    exc,
+                )
+                return idx, None
 
         results = [None] * len(prompts)
         max_workers = min(len(prompts), 16)
@@ -85,7 +92,7 @@ class OpenRouterBackend:
             for idx, resp in pool.map(run_one, enumerate(prompts)):
                 results[idx] = resp
 
-        return [r or {} for r in results]
+        return results
 
     def metrics(self) -> Dict[str, object]:
         return {}
