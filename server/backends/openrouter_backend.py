@@ -4,6 +4,9 @@ from typing import Dict, List, Any, Optional
 import os
 import logging
 from concurrent.futures import ThreadPoolExecutor
+import threading
+
+from tqdm.auto import tqdm
 
 from openai import OpenAI
 
@@ -69,6 +72,13 @@ class OpenRouterBackend:
         if not prompts:
             return []
 
+        progress = tqdm(
+            total=len(prompts),
+            desc="OpenRouter batch",
+            leave=False,
+        )
+        progress_lock = threading.Lock()
+
         def run_one(args: Any) -> tuple[int, Optional[Dict[str, Any]]]:
             idx, prompt = args
             messages = []
@@ -83,12 +93,18 @@ class OpenRouterBackend:
                     exc,
                 )
                 return idx, None
+            finally:
+                with progress_lock:
+                    progress.update(1)
 
         results = [None] * len(prompts)
         max_workers = min(len(prompts), 16)
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            for idx, resp in pool.map(run_one, enumerate(prompts)):
-                results[idx] = resp
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                for idx, resp in pool.map(run_one, enumerate(prompts)):
+                    results[idx] = resp
+        finally:
+            progress.close()
 
         return results
 
