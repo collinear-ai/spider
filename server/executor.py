@@ -743,7 +743,7 @@ def _tool_batch_worker(
         prompt = row["prompt"]
         system_prompt = row.get("system_prompt")
         try:
-            transcript, token_ids, logprobs, reward_mask = _run_prompt_with_tools(
+            transcript = _run_prompt_with_tools(
                 backend=backend,
                 job=job,
                 prompt=prompt,
@@ -751,12 +751,14 @@ def _tool_batch_worker(
                 tool_registry=tool_registry,
                 turn_limit=tool_turn_limit,
                 job_id=job_id,
-                include_logprobs=include_logprobs,
                 system_prompt=system_prompt,
             )
         except Exception as exc:
             logger.exception("Prompt worker crashed while handling `%s`.", prompt[:20])
             return {}
+        token_ids = []
+        logprobs = []
+        reward_mask = []
 
         if transcript and transcript[-1].get("role") == "assistant":
             final_content = transcript[-1].get("content", "")
