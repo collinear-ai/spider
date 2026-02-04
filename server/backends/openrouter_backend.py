@@ -5,7 +5,6 @@ import os
 import logging
 from concurrent.futures import ThreadPoolExecutor
 import threading
-import time
 
 from openai import OpenAI
 
@@ -71,10 +70,6 @@ class OpenRouterBackend:
         if not prompts:
             return []
 
-        total = len(prompts)
-        progress = {"done": 0}
-        log_every = max(1, total // 20)
-        last_log = {"ts": 0.0}
         progress_lock = threading.Lock()
 
         def run_one(args: Any) -> tuple[int, Optional[Dict[str, Any]]]:
@@ -93,13 +88,7 @@ class OpenRouterBackend:
                 return idx, None
             finally:
                 with progress_lock:
-                    progress["done"] += 1
-                    done = progress["done"]
-                    now = time.monotonic()
-                    if done == total or done % log_every == 0 or now - last_log["ts"] >= 5.0:
-                        bar = _render_progress_bar(done, total)
-                        logger.info("OpenRouter progress %s %d/%d", bar, done, total)
-                        last_log["ts"] = now
+                    pass
 
         results = [None] * len(prompts)
         max_workers = min(len(prompts), 8)
@@ -181,10 +170,3 @@ def _as_dict(value: Any) -> Dict[str, Any]:
     if hasattr(value, "dict"):
         return value.dict()
     return dict(value)
-
-def _render_progress_bar(done: int, total: int, width: int = 30) -> str:
-    if total <= 0:
-        return "[{}]".format("-" * width)
-    ratio = min(1.0, max(0.0, done / total))
-    filled = int(ratio * width)
-    return "[{}{}] {:3d}%".format("#" * filled, "-" * (width - filled), int(ratio * 100))
