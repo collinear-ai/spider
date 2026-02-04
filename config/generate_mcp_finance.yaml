@@ -3,11 +3,11 @@ server:
   request_timeout: 120
 job:
   model: 
-    provider: openai
-    name: gpt-5.2
+    provider: openrouter
+    name: moonshotai/kimi-k2-0905
   source:
-    dataset: "collinear-ai/zoho-1f-tool-finance"
-    max_examples: 50
+    dataset: collinear-ai/zoho-1f-tool-finance-gpt-5.2-prompts
+    max_examples: 70
     shuffle: true
     multi_turn: true
     user_simulation_prompt: |
@@ -15,13 +15,14 @@ job:
       You are given a conversation history where the assistant answers a financial question(s) by going through financial data via tools.
       Given the history, generate the next most plausible question that builds on the previous requests and tasks.
       Your prompt should ask exactly ONE question that can be answered in a single number, sentence, table, or json.
+      Your new question should NOT require the agent to use any tool at all.
       Only generate the user prompt, no explanation needed.
     user_model:
       name: "gpt-5.2"
       provider: openai
   generation:
-    max_tool_turns: 16
-    max_user_turns: 3
+    max_tool_turns: 5
+    max_user_turns: 2
     tokenize: true
     tokenizer: Qwen/Qwen3-8B
     parameters:
@@ -30,5 +31,5 @@ job:
   output:
     mode: "upload_hf"
     hf:
-      repo_id: collinear-ai/zoho-1f-tool-finance-gpt-5.2
+      repo_id: collinear-ai/zoho-1f-tool-finance-kimi-k2-0905
       private: true

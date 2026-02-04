@@ -102,7 +102,7 @@ class OpenRouterBackend:
                         last_log["ts"] = now
 
         results = [None] * len(prompts)
-        max_workers = min(len(prompts), 16)
+        max_workers = min(len(prompts), 8)
         try:
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 for idx, resp in pool.map(run_one, enumerate(prompts)):

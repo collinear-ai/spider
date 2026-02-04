@@ -33,7 +33,7 @@ def main() -> None:
 
         with SpiderClient(
             config=config, 
-            env=(MCP_URL_ENV, "MCP_HEADERS_JSON", "HF_TOKEN", "OPENAI_API_KEY"),
+            env=(MCP_URL_ENV, "MCP_HEADERS_JSON", "HF_TOKEN", "OPENAI_API_KEY", "OPENROUTER_API_KEY"),
         ) as client:
             submission = client.submit_job()
             status = client.poll_job(
