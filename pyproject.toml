@@ -36,6 +36,7 @@ client = [
     "requests",
     "typer",
     "rich",
+    "uv",
     "openai",
     "tqdm"
 ]
@@ -75,6 +76,7 @@ all = [
     "requests",
     "typer",
     "rich",
+    "uv",
     "datasets",
     "pyarrow",
     "pandas",

@@ -1,10 +1,12 @@
 # MCP support for spider workflow
 
-This directory contains helpers that will set up MCP servers and provide tools for a spider job to run. 
+This directory contains helpers that will set up MCP servers and provide tools for a spider job to run. Example domains:
 
-For off-policy distillation on jira, see [this script](../../scripts/generate_mcp_jira.py).
+- Jira [script](../../scripts/generate_mcp_jira.py)
 
-For off-policy distillation on Financial Datasets, see [this script](../../scripts/generate_mcp_finance.py).
+- Financial Datasets [script](../../scripts/generate_mcp_finance.py)
+
+- Expedia [script](../../scripts/generate_mcp_expedia.py)
 
 ## Set up
 
@@ -22,8 +24,14 @@ For Financial Datasets and the like which make calls to a streambale HTTP server
 
 ```bash
 pip install mcp anyio httpx
+
+# Financial Datasets
 export MCP_HEADERS_JSON='{"X-API-KEY": "YOUR_API_KEY"}' # auth
 python scripts/generate_mcp_finance.py
+
+# Expedia
+export EXPEDIA_API_KEY="YOUR_API_KEY"
+uvx expedia_travel_recommendations_mcp --protocol "streamable-http"
 ```
 
 Look up on the relevant MCP server doc for what headers and auth options to choose specifically.
