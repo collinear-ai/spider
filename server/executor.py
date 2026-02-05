@@ -284,6 +284,25 @@ def _run_batched_generation(
 
     payload = _base_metadata(job_id, job)
     tokenizer = _load_generation_tokenizer(job)
+    upload_every = job.generation.upload_every
+    upload_future = None
+    upload_error = None
+
+    def _drain_upload_future():
+        nonlocal upload_future, upload_error
+        if upload_future and upload_future.done():
+            try:
+                upload_future.result()
+                events.emit("Periodic upload completed.", code="upload.completed")
+            except Exception as exc:
+                upload_error = exc
+                events.emit(
+                    "Periodic upload failed.",
+                    level="warning",
+                    code="upload.failed",
+                    data={"error": str(exc)},
+                )
+            upload_future = None
 
     if job.runtime and job.runtime.packages:
         payload.setdefault("runtime", {})["packages"] = list(job.runtime.packages)
@@ -313,6 +332,29 @@ def _run_batched_generation(
                     )
                     future, batch_metrics = batch_worker(chunk)
                     pending[batch_index] = (future, batch_metrics)
+
+                    def _maybe_schedule_upload(completed_batch_index):
+                        nonlocal upload_future
+                        if upload_every and upload_every > 0 and (completed_batch_index + 1) % upload_every == 0:
+                            _drain_upload_future()
+
+                            if upload_future and not upload_future.done():
+                                return
+
+                            events.emit(
+                                "Periodic upload started.", 
+                                code="upload.started", 
+                                data={"batch_index": completed_batch_index}
+                            )
+
+                            upload_future = executor_context.submit(
+                                publish_to_hub,
+                                job_id=job_id,
+                                artifact=artifact_path,
+                                metadata=metadata_path,
+                                config=job.output.hf,
+                            )
+
                     next_index = _drain_ready_batches(
                         pending, 
                         next_index, 
@@ -324,6 +366,7 @@ def _run_batched_generation(
                         block=False,
                         batch_started=batch_index,
                         job_id=job_id,
+                        on_batch_complete=_maybe_schedule_upload,
                     )
                 next_index = _drain_ready_batches(
                     pending, 
@@ -336,10 +379,13 @@ def _run_batched_generation(
                     block=True,
                     batch_started=batch_index,
                     job_id=job_id,
+                    on_batch_complete=_maybe_schedule_upload,
                 )
             finally:
                 if executor_context:
                     executor_context.shutdown(wait=True)
+
+            _drain_upload_future()
             
             records_written = writer.count
 
@@ -603,6 +649,7 @@ def _drain_ready_batches(
     block: bool, 
     batch_started: Optional[int],
     job_id: str,
+    on_batch_complete: Optional[Callable[[int], None]] = None,
 ) -> int:
     while next_index in pending:
         future, batch_metrics = pending[next_index]
@@ -626,6 +673,9 @@ def _drain_ready_batches(
                 "records_in_batch": len(records),
             }
         )
+
+        if on_batch_complete:
+            on_batch_complete(next_index)
 
         for key, value in batch_metrics.items():
             if isinstance(value, (int, float)):

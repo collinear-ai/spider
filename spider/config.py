@@ -157,6 +157,11 @@ class GenerationConfig(BaseModel):
         default=None,
         description="HF tokenizer model id"
     )
+    upload_every: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="If set, upload artifacts to HF every N batches"
+    )
     on_policy: bool = Field(
         default=False,
         description="Enable on-policy training"
@@ -316,7 +321,15 @@ class JobConfig(BaseModel):
         return self.runtime
 
     @model_validator(mode="after")
-    def validate_on_policy_output(self) -> "JobConfig":
+    def validate_generation_output(self) -> "JobConfig":
+        if self.generation.upload_every is not None:
+            if self.generation.on_policy:
+                raise ValueError("`generation.upload_every` is only supported for off-policy generation")
+            if self.output.mode != OutputMode.HF_UPLOAD:
+                raise ValueError("`generation.upload_every` requires `output.mode` to be `upload_hf`")
+            if not self.output.hf or not self.output.hf.repo_id.strip():
+                raise ValueError("`output.hf.repo_id` is required when `generation.upload_every` is set")
+
         if not self.generation.on_policy:
             return self
         if self.output.mode != OutputMode.HF_UPLOAD:
