@@ -7,7 +7,7 @@ name = "spider"
 version = "0.0.1"
 description = "Lightweight synthetic data generation client"
 readme = "README.md"
-requires-python = ">=3.11,<=3.11.14"
+requires-python = ">=3.11"
 dependencies = [
     "datasets>=4.5.0",
     "deepspeed>=0.18.4",
