@@ -8,6 +8,8 @@ This directory contains helpers that will set up MCP servers and provide tools f
 
 - Expedia [script](../../scripts/generate_mcp_expedia.py)
 
+- Public MCP catalog (20 domains; includes read-only + API-key-authenticated endpoints): [research](./PUBLIC_READONLY_MCP_RESEARCH.md), [script](../../scripts/generate_mcp_public_readonly.py)
+
 ## Set up
 
 For each MCP server, two things need to be set up: the MCP server dependency and environmental variables needed for that server.
@@ -35,3 +37,23 @@ uvx expedia_travel_recommendations_mcp --protocol "streamable-http"
 ```
 
 Look up on the relevant MCP server doc for what headers and auth options to choose specifically.
+
+## Public read-only catalog quick start
+
+List available servers:
+
+```bash
+python scripts/generate_mcp_public_readonly.py --list
+```
+
+Run with one of the curated public read-only servers:
+
+```bash
+python scripts/generate_mcp_public_readonly.py \
+  --server openstreetmap \
+  --config config/generate_mcp_finance.yaml \
+  --output artifacts/generate_mcp_openstreetmap.json
+```
+
+The script resolves remote URL + env key from `workloads/mcp_support/public_readonly_servers.py`,
+then loads tools through `tool_config_from_server(...)` so no server-specific tool stubs are needed.

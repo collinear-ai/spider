@@ -20,6 +20,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--command", nargs=argparse.REMAINDER, required=True, help="Stdio MCP command")
+    parser.add_argument("--command-cwd", default=None, help="Working directory for the stdio MCP command.")
     parser.add_argument("--json-response", action="store_true", help="Use JSON responses over SSE.")
 
     return parser.parse_args()
@@ -31,7 +32,11 @@ async def _serve(args: argparse.Namespace) -> None:
     server = Server("mcp-stdio-proxy")
     lock = anyio.Lock()
 
-    server_params = StdioServerParameters(command=args.command[0], args=args.command[1:])
+    server_params = StdioServerParameters(
+        command=args.command[0],
+        args=args.command[1:],
+        cwd=args.command_cwd,
+    )
     async with stdio_client(server_params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()

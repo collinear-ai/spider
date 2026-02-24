@@ -17,7 +17,11 @@ from . import events
 from .sources import collect_prompts
 from .writers import JSONLBatchWriter
 from .hf_upload import HFUploadError, publish_to_hub
-from .on_policy import run_on_policy_job
+
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
 
 logger = logging.getLogger(__name__)
 if logger.level == logging.NOTSET:
@@ -76,6 +80,7 @@ def run_generation_job(
                 )
             
             else:
+                from .on_policy import run_on_policy_job
                 logger.info("Job %s: starting on-policy distillation", job_id)
                 events.emit("Launching on-policy distillation pipeline.", code="job.pipeline", data={"mode": "on_policy"})
                 result = run_on_policy_job(
@@ -222,6 +227,7 @@ def _run_tool_on_policy_job(
         )
 
     try:
+        from .on_policy import run_on_policy_job
         return run_on_policy_job(
             job_id,
             job,
@@ -314,12 +320,15 @@ def _run_batched_generation(
         pending = {}
         next_index = 0
         total_batches = (len(prompts) + batch_size -1) // batch_size
+        progress_bar = tqdm(total=len(prompts), desc="generation", unit="row") if tqdm else None
+        batch_prompt_sizes: Dict[int, int] = {}
 
         with JSONLBatchWriter(artifact_path) as writer:
             executor_context = ThreadPoolExecutor(max_workers=_processing_worker_count())
             try:
                 for batch_index, chunk_start in enumerate(range(0, len(prompts), batch_size)):
                     chunk = prompts[chunk_start : chunk_start + batch_size]
+                    batch_prompt_sizes[batch_index] = len(chunk)
                     events.emit(
                         "Batch started.",
                         code="batch.started",
@@ -355,6 +364,7 @@ def _run_batched_generation(
                                 config=job.output.hf,
                             )
 
+                    prev_index = next_index
                     next_index = _drain_ready_batches(
                         pending, 
                         next_index, 
@@ -368,6 +378,11 @@ def _run_batched_generation(
                         job_id=job_id,
                         on_batch_complete=_maybe_schedule_upload,
                     )
+                    if progress_bar and next_index > prev_index:
+                        progress_bar.update(
+                            sum(batch_prompt_sizes.get(i, 0) for i in range(prev_index, next_index))
+                        )
+                prev_index = next_index
                 next_index = _drain_ready_batches(
                     pending, 
                     next_index, 
@@ -381,9 +396,15 @@ def _run_batched_generation(
                     job_id=job_id,
                     on_batch_complete=_maybe_schedule_upload,
                 )
+                if progress_bar and next_index > prev_index:
+                    progress_bar.update(
+                        sum(batch_prompt_sizes.get(i, 0) for i in range(prev_index, next_index))
+                    )
             finally:
                 if executor_context:
                     executor_context.shutdown(wait=True)
+                if progress_bar:
+                    progress_bar.close()
 
             _drain_upload_future()
             
@@ -1613,7 +1634,10 @@ def _shutdown_backend(job_id: str, backend: Any) -> None:
             logger.warning("Job %s: backend shutdown raised %s", job_id, exc)
 
 def _is_tinker_backend(backend: Any) -> bool:
-    import tinker
+    try:
+        import tinker
+    except Exception:
+        return False
     return isinstance(backend, tinker.SamplingClient)
 
 def _as_dict(value: Any) -> Dict[str, Any]:

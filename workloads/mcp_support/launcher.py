@@ -69,12 +69,14 @@ def _start_server(spec: MCPServerSpec) -> MCPServerHandle:
 def use_mcp_remote_url(
     *,
     mcp_url_env: str,
-    remote_url: str,
+    mcp_url: Optional[str] = None,
+    remote_url: Optional[str] = None,
 ) -> Tuple[Optional[MCPServerHandle], str]:
-    if not remote_url:
-        raise ValueError("remote_url is required for direct MCP access.")
-    os.environ[mcp_url_env] = remote_url
-    return None, remote_url
+    value = mcp_url or remote_url
+    if not value:
+        raise ValueError("mcp_url is required for direct MCP access.")
+    os.environ[mcp_url_env] = value
+    return None, value
 
 def start_mcp_remote_proxy(
     *,

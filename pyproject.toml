@@ -38,7 +38,13 @@ client = [
     "rich",
     "uv",
     "openai",
-    "tqdm"
+    "tqdm",
+    "datasets",
+    "huggingface_hub",
+    "pandas",
+    "pyarrow",
+    "blobfile",
+    "tinker; python_version >= '3.11'",
 ]
 server = [
     "datasets",

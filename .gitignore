@@ -6,7 +6,7 @@ artifacts/
 .artifacts/
 *private.yaml
 *private.py
-.env
+**/.env
 
 **/tests/
 
@@ -16,3 +16,4 @@ CLAUDE.md
 
 wandb/
 workspace*/
+workloads/mcp_support/local_servers/

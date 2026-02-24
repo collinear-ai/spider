@@ -1,0 +1,357 @@
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+
+import anyio
+import httpx
+import pandas as pd
+from datasets import load_dataset
+from huggingface_hub import HfApi
+from mcp.client.session import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+from tqdm.auto import tqdm
+
+from spider.config import JobConfig, ModelConfig
+from server.backends.factory import create_backend
+from server.executor import _initial_chat_history, _run_tool_turn
+from workloads.mcp_support.public_readonly_servers import get_public_readonly_mcp_server
+
+
+BASE_DIR = Path(__file__).resolve().parent
+ENV_PATH = BASE_DIR / ".env"
+ARTIFACT_DIR = BASE_DIR / "artifacts"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+LOCAL_SERVER_ROOT = BASE_DIR / "local_servers"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset-in", required=True)
+    parser.add_argument("--dataset-out", required=True)
+    parser.add_argument("--split", default="train")
+    parser.add_argument("--config-name", default=None)
+    parser.add_argument("--max-examples", type=int, default=None)
+    parser.add_argument("--max-workers", type=int, default=1024)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    return parser.parse_args()
+
+
+def load_env(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ[key.strip()] = value.strip().strip("'").strip('"')
+
+
+def headers_for_server(server_key: str) -> Dict[str, str]:
+    if server_key == "google-maps":
+        key = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
+        return {"FORWARD_VAR_KEY": key} if key else {}
+    if server_key == "financialdatasets":
+        key = os.environ.get("FINANCIAL_API_KEY", "").strip()
+        return {"X-API-Key": key} if key else {}
+    if server_key == "tavily":
+        key = os.environ.get("TAVILY_API_KEY", "").strip()
+        return {"Authorization": f"Bearer {key}"} if key else {}
+    return {}
+
+
+def is_localhost_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def wait_for_port(host: str, port: int, timeout_s: float = 20.0) -> None:
+    deadline = time.time() + timeout_s
+    last_exc: Optional[Exception] = None
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=1.0):
+                return
+        except OSError as exc:
+            last_exc = exc
+            time.sleep(0.2)
+    raise RuntimeError(f"timed out waiting for {host}:{port}") from last_exc
+
+
+def port_open(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def stdio_cwd_for_server(server_key: str) -> Optional[Path]:
+    mapping = {
+        "clinicaltrials-mcp-server": LOCAL_SERVER_ROOT / "ClinicalTrials-MCP-Server",
+        "pubmed": LOCAL_SERVER_ROOT / "PubMed-MCP-Server",
+        "time-mcp": LOCAL_SERVER_ROOT / "mcp-server-http-time",
+        "wikipedia": LOCAL_SERVER_ROOT / "wikipedia-mcp-server",
+    }
+    return mapping.get(server_key)
+
+
+def start_stdio_proxy_if_needed(server: Any) -> tuple[Optional[subprocess.Popen[str]], str]:
+    url = server.mcp_url
+    if not (is_localhost_url(url) and server.stdio_command):
+        return None, url
+    parsed = urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port
+    if not port:
+        raise RuntimeError(f"missing port in mcp_url: {url}")
+    if port_open(host, port):
+        return None, f"http://{host}:{port}/mcp/"
+    cmd = [
+        sys.executable,
+        "-m",
+        "workloads.mcp_support.stdio_proxy",
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--command-cwd",
+        str(stdio_cwd_for_server(server.key) or REPO_ROOT),
+        "--command",
+        *list(server.stdio_command),
+    ]
+    proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), env=os.environ.copy(), text=True)
+    wait_for_port(host, port)
+    return proc, f"http://{host}:{port}/mcp/"
+
+
+def list_tools_from_server(server_url: str, headers: Dict[str, str]) -> List[Dict[str, Any]]:
+    async def _run() -> List[Dict[str, Any]]:
+        async with httpx.AsyncClient(headers=headers or None, timeout=60.0) as http_client:
+            async with streamable_http_client(server_url, http_client=http_client) as (read_stream, write_stream, _):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    result = await session.list_tools()
+                    return [t.model_dump() if hasattr(t, "model_dump") else dict(t) for t in result.tools]
+    return anyio.run(_run)
+
+
+def call_mcp_tool(server_url: str, headers: Dict[str, str], tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def _run() -> Dict[str, Any]:
+        async with httpx.AsyncClient(headers=headers or None, timeout=120.0) as http_client:
+            async with streamable_http_client(server_url, http_client=http_client) as (read_stream, write_stream, _):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    result = await session.call_tool(tool_name, arguments)
+                    return result.model_dump()
+    return anyio.run(_run)
+
+
+def parse_server_key(row: Dict[str, Any]) -> str:
+    server = row.get("server")
+    if isinstance(server, str):
+        try:
+            server = json.loads(server)
+        except json.JSONDecodeError:
+            server = {"key": server}
+    if isinstance(server, dict):
+        key = server.get("key")
+        if isinstance(key, str) and key:
+            return key
+    raise ValueError("row missing server key")
+
+
+def parse_tools(row: Dict[str, Any]) -> List[str]:
+    tools = row.get("tools")
+    if isinstance(tools, str):
+        try:
+            tools = json.loads(tools)
+        except json.JSONDecodeError:
+            tools = [tools]
+    if not isinstance(tools, list):
+        return []
+    return [str(t) for t in tools if str(t).strip()]
+
+
+def parse_questions(row: Dict[str, Any]) -> List[str]:
+    questions = row.get("generated_questions")
+    if isinstance(questions, str):
+        try:
+            questions = json.loads(questions)
+        except json.JSONDecodeError:
+            questions = [questions]
+    if not isinstance(questions, list):
+        return []
+    return [str(q).strip() for q in questions if str(q).strip()]
+
+
+def main() -> None:
+    args = parse_args()
+    load_env(ENV_PATH)
+
+    hf_token = os.environ.get("HF_TOKEN", "").strip()
+    if not hf_token:
+        raise SystemExit("HF_TOKEN is required.")
+    if not os.environ.get("OPENROUTER_API_KEY", "").strip():
+        raise SystemExit("OPENROUTER_API_KEY is required.")
+
+    ds_kwargs: Dict[str, Any] = {"path": args.dataset_in, "split": args.split}
+    if args.config_name:
+        ds_kwargs["name"] = args.config_name
+    dataset = load_dataset(**ds_kwargs)
+    rows = [dict(x) for x in dataset]
+    if args.max_examples is not None:
+        rows = rows[: args.max_examples]
+    if not rows:
+        raise SystemExit("No rows found.")
+
+    server_keys = sorted({parse_server_key(row) for row in rows})
+    server_ctx: Dict[str, Dict[str, Any]] = {}
+    procs: List[subprocess.Popen[str]] = []
+    for key in server_keys:
+        server = get_public_readonly_mcp_server(key)
+        proc, url = start_stdio_proxy_if_needed(server)
+        if proc:
+            procs.append(proc)
+        headers = headers_for_server(key)
+        tools = list_tools_from_server(url, headers)
+        tool_meta = {t.get("name"): t for t in tools if t.get("name")}
+        server_ctx[key] = {
+            "server": server,
+            "url": url,
+            "headers": headers,
+            "tool_meta": tool_meta,
+        }
+        print(f"[ok] {key}: tools={len(tool_meta)}")
+
+    backend = create_backend(ModelConfig(provider="openrouter", name="moonshotai/kimi-k2-0905"))
+    job = JobConfig.model_validate(
+        {
+            "model": {"provider": "openrouter", "name": "moonshotai/kimi-k2-0905"},
+            "source": {"dataset": "x"},
+            "generation": {
+                "max_tool_turns": 16,
+                "max_batch_size": 1,
+                "parameters": {"temperature": args.temperature},
+            },
+            "output": {"mode": "return"},
+        }
+    )
+
+    results: List[Optional[Dict[str, Any]]] = [None] * len(rows)
+
+    def run_one(index: int, row: Dict[str, Any]) -> Dict[str, Any]:
+        key = parse_server_key(row)
+        tool_names = parse_tools(row)
+        questions = parse_questions(row)
+        if not questions:
+            return {**row, "trajectory": []}
+
+        ctx = server_ctx[key]
+        tool_defs = []
+        tool_registry: Dict[str, Any] = {}
+        for name in tool_names:
+            meta = ctx["tool_meta"].get(name)
+            if not meta:
+                continue
+            schema = meta.get("inputSchema") or meta.get("input_schema") or {}
+            tool_defs.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": meta.get("description", ""),
+                        "parameters": schema,
+                    },
+                }
+            )
+
+            def make_tool(tool_name: str):
+                def _tool(**kwargs):
+                    return call_mcp_tool(ctx["url"], ctx["headers"], tool_name, kwargs)
+                return _tool
+            tool_registry[name] = make_tool(name)
+
+        history = _initial_chat_history(questions[0], system_prompt=None)
+        turn_limit = max(1, job.generation.max_tool_turns or 16)
+        for q_idx, question in enumerate(questions):
+            if q_idx > 0:
+                history.append({"role": "user", "content": question})
+            for turn_idx in range(turn_limit):
+                finished = _run_tool_turn(
+                    backend=backend,
+                    job=job,
+                    history=history,
+                    tool_defs=tool_defs,
+                    tool_registry=tool_registry,
+                    turn_idx=turn_idx,
+                    prompt=question,
+                )
+                if finished:
+                    break
+        return {**row, "tool_def": tool_defs, "trajectory": history}
+
+    workers = max(1, min(args.max_workers, len(rows)))
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_idx = {executor.submit(run_one, i, row): i for i, row in enumerate(rows)}
+            for future in tqdm(as_completed(future_to_idx), total=len(future_to_idx), desc="tool_calls", unit="row"):
+                idx = future_to_idx[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as exc:
+                    results[idx] = {**rows[idx], "trajectory": [], "error": str(exc)}
+    finally:
+        close = getattr(backend, "close", None)
+        if callable(close):
+            close()
+        for proc in procs:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+    final_rows = [r for r in results if r is not None]
+    final_rows = [
+        {"trajectory": row.get("trajectory"), **{k: v for k, v in row.items() if k != "trajectory"}}
+        for row in final_rows
+    ]
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    jsonl_path = ARTIFACT_DIR / "tool_calls.jsonl"
+    parquet_path = ARTIFACT_DIR / "train-00000-of-00001.parquet"
+    with jsonl_path.open("w", encoding="utf-8") as f:
+        for row in final_rows:
+            f.write(json.dumps(row, ensure_ascii=True) + "\n")
+    pd.DataFrame(final_rows).to_parquet(parquet_path, index=False)
+
+    api = HfApi(token=hf_token)
+    api.create_repo(repo_id=args.dataset_out, repo_type="dataset", private=True, exist_ok=True)
+    api.upload_file(
+        path_or_fileobj=str(parquet_path),
+        path_in_repo=parquet_path.name,
+        repo_id=args.dataset_out,
+        repo_type="dataset",
+    )
+    print(f"records={len(final_rows)}")
+    print(f"max_workers={workers}")
+    print(f"local_jsonl={jsonl_path}")
+    print(f"local_parquet={parquet_path}")
+    print(f"uploaded=hf://datasets/{args.dataset_out}/{parquet_path.name}")
+
+
+if __name__ == "__main__":
+    main()
