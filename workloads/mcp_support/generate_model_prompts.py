@@ -14,7 +14,13 @@ from urllib.parse import urlparse
 import pandas as pd
 from huggingface_hub import HfApi
 
-from workloads.mcp_support.public_readonly_servers import list_public_readonly_mcp_servers
+from workloads.mcp_support.public_readonly_servers import (
+    ensure_server_runtime_ready,
+    headers_for_server,
+    list_public_readonly_mcp_servers,
+    resolve_stdio_cwd,
+    server_requires_local_proxy,
+)
 from workloads.mcp_support.tool_schemas import tool_config_from_server
 
 
@@ -23,9 +29,6 @@ BASE_DIR = Path(__file__).resolve().parent
 PROMPT_TEMPLATE_PATH = BASE_DIR / "prompts" / "genq_from_tools_single_server_multi_tools.md"
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 OUTPUT_PATH = BASE_DIR / "artifacts" / "model_prompts.jsonl"
-LOCAL_SERVER_ROOT = REPO_ROOT / "workloads" / "mcp_support" / "local_servers"
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-examples", type=int, required=True)
@@ -50,19 +53,6 @@ def load_env(path: Path) -> None:
         os.environ[key] = value
 
 
-def headers_for_server(server_key: str) -> Dict[str, str]:
-    if server_key == "google-maps":
-        key = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
-        return {"FORWARD_VAR_KEY": key} if key else {}
-    if server_key == "financialdatasets":
-        key = os.environ.get("FINANCIAL_API_KEY", "").strip()
-        return {"X-API-Key": key} if key else {}
-    if server_key == "tavily":
-        key = os.environ.get("TAVILY_API_KEY", "").strip()
-        return {"Authorization": f"Bearer {key}"} if key else {}
-    return {}
-
-
 def format_tools_for_prompt(tools: List[object]) -> str:
     blocks: List[str] = []
     for t in tools:
@@ -85,16 +75,6 @@ def wait_for_port(host: str, port: int, timeout_s: float = 20.0) -> None:
     raise RuntimeError(f"timed out waiting for {host}:{port}") from last_exc
 
 
-def stdio_cwd_for_server(server_key: str) -> Optional[Path]:
-    mapping = {
-        "clinicaltrials-mcp-server": LOCAL_SERVER_ROOT / "ClinicalTrials-MCP-Server",
-        "pubmed": LOCAL_SERVER_ROOT / "PubMed-MCP-Server",
-        "time-mcp": LOCAL_SERVER_ROOT / "mcp-server-http-time",
-        "wikipedia": LOCAL_SERVER_ROOT / "wikipedia-mcp-server",
-    }
-    return mapping.get(server_key)
-
-
 def start_stdio_proxy(server: object) -> Tuple[subprocess.Popen[str], str]:
     if not server.stdio_command:
         raise RuntimeError("missing stdio_command")
@@ -115,18 +95,13 @@ def start_stdio_proxy(server: object) -> Tuple[subprocess.Popen[str], str]:
         "--port",
         str(port),
         "--command-cwd",
-        str(stdio_cwd_for_server(server.key) or REPO_ROOT),
+        str(resolve_stdio_cwd(server, REPO_ROOT) or REPO_ROOT),
         "--command",
         *stdio_cmd,
     ]
     proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), env=os.environ.copy(), text=True)
     wait_for_port(host, port)
     return proc, f"http://{host}:{port}/mcp/"
-
-
-def is_localhost_url(url: str) -> bool:
-    host = (urlparse(url).hostname or "").lower()
-    return host in {"127.0.0.1", "localhost", "::1"}
 
 
 def fetch_tool_cache() -> List[Tuple[object, List[object]]]:
@@ -136,13 +111,14 @@ def fetch_tool_cache() -> List[Tuple[object, List[object]]]:
     for server in servers:
         proc: Optional[subprocess.Popen[str]] = None
         try:
-            headers = headers_for_server(server.key)
+            ensure_server_runtime_ready(server, REPO_ROOT)
+            headers = headers_for_server(server)
             if headers:
                 os.environ["MCP_HEADERS_JSON"] = json.dumps(headers)
             else:
                 os.environ.pop("MCP_HEADERS_JSON", None)
             url = server.mcp_url
-            if is_localhost_url(url) and server.stdio_command:
+            if server_requires_local_proxy(server):
                 proc, url = start_stdio_proxy(server)
                 tools = tool_config_from_server(url, mcp_url_env=server.mcp_url_env)
             else:

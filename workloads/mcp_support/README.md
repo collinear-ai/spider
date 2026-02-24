@@ -1,59 +1,71 @@
-# MCP support for spider workflow
-
-This directory contains helpers that will set up MCP servers and provide tools for a spider job to run. Example domains:
-
-- Jira [script](../../scripts/generate_mcp_jira.py)
-
-- Financial Datasets [script](../../scripts/generate_mcp_finance.py)
-
-- Expedia [script](../../scripts/generate_mcp_expedia.py)
-
-- Public MCP catalog (20 domains; includes read-only + API-key-authenticated endpoints): [research](./PUBLIC_READONLY_MCP_RESEARCH.md), [script](../../scripts/generate_mcp_public_readonly.py)
+# MCP Support
 
 ## Set up
 
-For each MCP server, two things need to be set up: the MCP server dependency and environmental variables needed for that server.
-
-For jira and the like which make calls to a stdio server:
+From repo root, install the client package:
 
 ```bash
-pip install mcp anyio httpx starlette uvicorn sse-starlette
-npx -y mcp-remote https://mcp.atlassian.com/v1/mcp # auth
-python scripts/generate_mcp_jira.py
+pip install -e ".[client]"
 ```
 
-For Financial Datasets and the like which make calls to a streambale HTTP server:
+Required system tools: `python`,`pip`, `git`, `node`, `npm`, `npx`, `uvx`
+
+Create `workloads/mcp_support/.env`:
 
 ```bash
-pip install mcp anyio httpx
+# Required for Hugging Face dataset read/write
+HF_TOKEN=...
 
-# Financial Datasets
-export MCP_HEADERS_JSON='{"X-API-KEY": "YOUR_API_KEY"}' # auth
-python scripts/generate_mcp_finance.py
+# Required for generation with OpenRouter
+OPENROUTER_API_KEY=...
 
-# Expedia
-export EXPEDIA_API_KEY="YOUR_API_KEY"
-uvx expedia_travel_recommendations_mcp --protocol "streamable-http"
+# Server auth keys
+GOOGLE_MAPS_API_KEY=...  # google-maps
+FINANCIAL_API_KEY=...    # financialdatasets
+TAVILY_API_KEY=...       # tavily
+SMITHERY_API_KEY=...     # scientific-computation-mcp
 ```
 
-Look up on the relevant MCP server doc for what headers and auth options to choose specifically.
+## Workflow
 
-## Public read-only catalog quick start
+Three-step generation pipeline. There is no need to do extra manual server setup; stdio servers are auto-bootstrapped from `public_readonly_servers.py`.
 
-List available servers:
+1. Generate model-facing prompt templates from MCP servers/tools:
 
 ```bash
-python scripts/generate_mcp_public_readonly.py --list
+python workloads/mcp_support/generate_model_prompts.py --num-examples <N>
 ```
 
-Run with one of the curated public read-only servers:
+2. Generate user questions from those prompts:
 
 ```bash
-python scripts/generate_mcp_public_readonly.py \
-  --server openstreetmap \
-  --config config/generate_mcp_finance.yaml \
-  --output artifacts/generate_mcp_openstreetmap.json
+python workloads/mcp_support/generate_prompts.py --dataset-in <HF_DATASET> --dataset-out <HF_DATASET_OUT>
 ```
 
-The script resolves remote URL + env key from `workloads/mcp_support/public_readonly_servers.py`,
-then loads tools through `tool_config_from_server(...)` so no server-specific tool stubs are needed.
+3. Execute tool-calling trajectories against MCP servers:
+
+```bash
+python workloads/mcp_support/generate_tool_calls.py --dataset-in <HF_DATASET> --dataset-out <HF_DATASET_OUT>
+```
+
+## Servers
+
+Server definitions, auth env vars, runtime/bootstrap commands, and MCP URLs are documented in [servers.md](/Users/muyuhe/Documents/spider/workloads/mcp_support/servers.md) and [public_readonly_servers.py](/Users/muyuhe/Documents/spider/workloads/mcp_support/public_readonly_servers.py)
+
+| MCP server | # tools |
+|---|---:|
+| `arxiv-paper-mcp` | 4 |
+| `clinicaltrials-mcp-server` | 17 |
+| `context7` | 2 |
+| `deepwiki` | 3 |
+| `exa-search` | 3 |
+| `financialdatasets` | 13 |
+| `google-maps` | 18 |
+| `leetcode` | 9 |
+| `open-weather` | 2 |
+| `pubmed` | 16 |
+| `scientific-computation-mcp` | 26 |
+| `tavily` | 5 |
+| `time-mcp` | 6 |
+| `weather-mcp` | 8 |
+| `wikipedia` | 10 |

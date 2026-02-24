@@ -22,16 +22,19 @@ from tqdm.auto import tqdm
 from spider.config import JobConfig, ModelConfig
 from server.backends.factory import create_backend
 from server.executor import _initial_chat_history, _run_tool_turn
-from workloads.mcp_support.public_readonly_servers import get_public_readonly_mcp_server
+from workloads.mcp_support.public_readonly_servers import (
+    ensure_server_runtime_ready,
+    get_public_readonly_mcp_server,
+    headers_for_server,
+    resolve_stdio_cwd,
+    server_requires_local_proxy,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 ARTIFACT_DIR = BASE_DIR / "artifacts"
 REPO_ROOT = Path(__file__).resolve().parents[2]
-LOCAL_SERVER_ROOT = BASE_DIR / "local_servers"
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-in", required=True)
@@ -59,24 +62,6 @@ def load_env(path: Path) -> None:
         os.environ[key.strip()] = value.strip().strip("'").strip('"')
 
 
-def headers_for_server(server_key: str) -> Dict[str, str]:
-    if server_key == "google-maps":
-        key = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
-        return {"FORWARD_VAR_KEY": key} if key else {}
-    if server_key == "financialdatasets":
-        key = os.environ.get("FINANCIAL_API_KEY", "").strip()
-        return {"X-API-Key": key} if key else {}
-    if server_key == "tavily":
-        key = os.environ.get("TAVILY_API_KEY", "").strip()
-        return {"Authorization": f"Bearer {key}"} if key else {}
-    return {}
-
-
-def is_localhost_url(url: str) -> bool:
-    host = (urlparse(url).hostname or "").lower()
-    return host in {"127.0.0.1", "localhost", "::1"}
-
-
 def wait_for_port(host: str, port: int, timeout_s: float = 20.0) -> None:
     deadline = time.time() + timeout_s
     last_exc: Optional[Exception] = None
@@ -98,19 +83,9 @@ def port_open(host: str, port: int) -> bool:
         return False
 
 
-def stdio_cwd_for_server(server_key: str) -> Optional[Path]:
-    mapping = {
-        "clinicaltrials-mcp-server": LOCAL_SERVER_ROOT / "ClinicalTrials-MCP-Server",
-        "pubmed": LOCAL_SERVER_ROOT / "PubMed-MCP-Server",
-        "time-mcp": LOCAL_SERVER_ROOT / "mcp-server-http-time",
-        "wikipedia": LOCAL_SERVER_ROOT / "wikipedia-mcp-server",
-    }
-    return mapping.get(server_key)
-
-
 def start_stdio_proxy_if_needed(server: Any) -> tuple[Optional[subprocess.Popen[str]], str]:
     url = server.mcp_url
-    if not (is_localhost_url(url) and server.stdio_command):
+    if not server_requires_local_proxy(server):
         return None, url
     parsed = urlparse(url)
     host = parsed.hostname or "127.0.0.1"
@@ -128,7 +103,7 @@ def start_stdio_proxy_if_needed(server: Any) -> tuple[Optional[subprocess.Popen[
         "--port",
         str(port),
         "--command-cwd",
-        str(stdio_cwd_for_server(server.key) or REPO_ROOT),
+        str(resolve_stdio_cwd(server, REPO_ROOT) or REPO_ROOT),
         "--command",
         *list(server.stdio_command),
     ]
@@ -222,10 +197,11 @@ def main() -> None:
     procs: List[subprocess.Popen[str]] = []
     for key in server_keys:
         server = get_public_readonly_mcp_server(key)
+        ensure_server_runtime_ready(server, REPO_ROOT)
         proc, url = start_stdio_proxy_if_needed(server)
         if proc:
             procs.append(proc)
-        headers = headers_for_server(key)
+        headers = headers_for_server(server)
         tools = list_tools_from_server(url, headers)
         tool_meta = {t.get("name"): t for t in tools if t.get("name")}
         server_ctx[key] = {
