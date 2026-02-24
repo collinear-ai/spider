@@ -1,6 +1,4 @@
-# Public Read-Only MCP Research (Streamable HTTP/HTTPS)
-
-Date: 2026-02-23
+# Public Read-Only MCP servers
 
 ## Constraints
 
