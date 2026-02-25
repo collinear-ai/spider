@@ -201,7 +201,7 @@ def main() -> None:
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     with OUTPUT_PATH.open("w", encoding="utf-8") as f:
         for row in rows:
-            f.write(json.dumps(row, ensure_ascii=True) + "\n")
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     print(f"Wrote {len(rows)} rows to {OUTPUT_PATH}")
     if args.dataset_id:

@@ -366,7 +366,7 @@ def main() -> None:
     parquet_path = ARTIFACT_DIR / "train-00000-of-00001.parquet"
     with jsonl_path.open("w", encoding="utf-8") as f:
         for row in final_rows:
-            f.write(json.dumps(row, ensure_ascii=True) + "\n")
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
     pd.DataFrame(final_rows).to_parquet(parquet_path, index=False)
 
     api = HfApi(token=hf_token)
