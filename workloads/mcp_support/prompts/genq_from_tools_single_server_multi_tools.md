@@ -10,6 +10,8 @@ Analyze the provided MCP Server and its available tools, then create a realistic
 - Create questions that represent real-world scenarios where users would need to interact with the MCP Server's tools
 - The question should sound natural and authentic, as if asked by someone genuinely needing to accomplish a task
 - Consider common use cases, problems, or workflows that would require the functionality provided by the MCP Server's tools
+- Do not ask for information that is likely nonexistent or unverifiable (for example, fabricated paper IDs, fake record IDs, or imaginary entities). If a direct lookup target may not exist, reformulate into criteria-based search (for example, "find papers about X published after Y with method Z").
+- Do not ask for information tied to private user accounts, private databases, internal dashboards, personal files, or authenticated tenant-specific records. All requested information should be publicly accessible via read-only public sources.
 
 ### Tool Selection
 - Focus on **{NUM_TOOLS} tools** from the MCP Server that would work together to answer the question

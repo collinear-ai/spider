@@ -5,7 +5,7 @@ import socket
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -43,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config-name", default=None)
     parser.add_argument("--max-examples", type=int, default=None)
     parser.add_argument("--max-workers", type=int, default=1024)
+    parser.add_argument("--row-timeout-sec", type=float, default=480.0)
     parser.add_argument("--temperature", type=float, default=0.7)
     return parser.parse_args()
 
@@ -172,6 +173,15 @@ def parse_questions(row: Dict[str, Any]) -> List[str]:
     return [str(q).strip() for q in questions if str(q).strip()]
 
 
+def has_assistant_turn(history: Any) -> bool:
+    if not isinstance(history, list):
+        return False
+    for msg in history:
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            return True
+    return False
+
+
 def main() -> None:
     args = parse_args()
     load_env(ENV_PATH)
@@ -227,6 +237,9 @@ def main() -> None:
     )
 
     results: List[Optional[Dict[str, Any]]] = [None] * len(rows)
+    partial_histories: Dict[int, List[Dict[str, Any]]] = {}
+    partial_tool_defs: Dict[int, List[Dict[str, Any]]] = {}
+    start_times: Dict[int, float] = {}
 
     def run_one(index: int, row: Dict[str, Any]) -> Dict[str, Any]:
         key = parse_server_key(row)
@@ -259,12 +272,15 @@ def main() -> None:
                     return call_mcp_tool(ctx["url"], ctx["headers"], tool_name, kwargs)
                 return _tool
             tool_registry[name] = make_tool(name)
+        partial_tool_defs[index] = list(tool_defs)
 
         history = _initial_chat_history(questions[0], system_prompt=None)
+        partial_histories[index] = list(history)
         turn_limit = max(1, job.generation.max_tool_turns or 16)
         for q_idx, question in enumerate(questions):
             if q_idx > 0:
                 history.append({"role": "user", "content": question})
+                partial_histories[index] = list(history)
             for turn_idx in range(turn_limit):
                 finished = _run_tool_turn(
                     backend=backend,
@@ -275,21 +291,60 @@ def main() -> None:
                     turn_idx=turn_idx,
                     prompt=question,
                 )
+                partial_histories[index] = list(history)
                 if finished:
                     break
         return {**row, "tool_def": tool_defs, "trajectory": history}
 
     workers = max(1, min(args.max_workers, len(rows)))
+    executor: Optional[ThreadPoolExecutor] = None
     try:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_idx = {executor.submit(run_one, i, row): i for i, row in enumerate(rows)}
-            for future in tqdm(as_completed(future_to_idx), total=len(future_to_idx), desc="tool_calls", unit="row"):
-                idx = future_to_idx[future]
-                try:
-                    results[idx] = future.result()
-                except Exception as exc:
-                    results[idx] = {**rows[idx], "trajectory": [], "error": str(exc)}
+        executor = ThreadPoolExecutor(max_workers=workers)
+        future_to_idx = {executor.submit(run_one, i, row): i for i, row in enumerate(rows)}
+        active = dict(future_to_idx)
+        for future, idx in future_to_idx.items():
+            start_times[idx] = time.monotonic()
+        with tqdm(total=len(rows), desc="tool_calls", unit="row") as pbar:
+            while active:
+                done = [f for f in active if f.done()]
+                for future in done:
+                    idx = active.pop(future)
+                    try:
+                        row_result = future.result()
+                    except Exception as exc:
+                        row_result = {
+                            **rows[idx],
+                            "tool_def": partial_tool_defs.get(idx, []),
+                            "trajectory": partial_histories.get(idx, []),
+                            "error": str(exc),
+                        }
+                    if has_assistant_turn(row_result.get("trajectory")):
+                        results[idx] = row_result
+                    pbar.update(1)
+
+                now = time.monotonic()
+                timed_out: List[Any] = []
+                for future, idx in list(active.items()):
+                    if now - start_times[idx] > args.row_timeout_sec:
+                        timed_out.append(future)
+                for future in timed_out:
+                    idx = active.pop(future)
+                    partial = partial_histories.get(idx, [])
+                    if has_assistant_turn(partial):
+                        results[idx] = {
+                            **rows[idx],
+                            "tool_def": partial_tool_defs.get(idx, []),
+                            "trajectory": partial,
+                            "error": "timeout",
+                        }
+                    future.cancel()
+                    pbar.update(1)
+
+                if active:
+                    time.sleep(0.2)
     finally:
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
         close = getattr(backend, "close", None)
         if callable(close):
             close()

@@ -129,7 +129,7 @@ def main() -> None:
             "generation": {
                 "max_batch_size": max_batch_size,
                 "parameters": {
-                    "temperature": 0.7,
+                    "temperature": 1.0,
                 }
             },
             "output": {

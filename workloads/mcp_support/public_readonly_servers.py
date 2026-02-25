@@ -204,16 +204,13 @@ PUBLIC_READONLY_MCP_SERVERS: Dict[str, PublicReadonlyMCPServer] = {
         stdio_command=(
             "npx",
             "-y",
-            "@smithery/cli@latest",
-            "run",
-            "@Aman-Amith-Shastry/scientific_computation_mcp",
-            "--key",
-            "<SMITHERY_API_KEY>",
+            "mcp-remote@0.1.38",
+            "https://scientific_computation_mcp--aman-amith-shastry.run.tools",
         ),
-        stdio_install="npx -y @smithery/cli@latest run @Aman-Amith-Shastry/scientific_computation_mcp --key <SMITHERY_API_KEY>",
+        stdio_install="npx -y mcp-remote@0.1.38 https://scientific_computation_mcp--aman-amith-shastry.run.tools",
         required_env_vars=("SMITHERY_API_KEY",),
         runtime_packages=("node", "npx"),
-        bootstrap_commands=("npx -y @smithery/cli@latest run @Aman-Amith-Shastry/scientific_computation_mcp --key <SMITHERY_API_KEY>",),
+        bootstrap_commands=(),
         notes="Requires SMITHERY_API_KEY.",
         sources=("https://github.com/Aman-Amith-Shastry/scientific_computation_mcp",),
     ),
@@ -356,8 +353,6 @@ def ensure_server_runtime_ready(server: PublicReadonlyMCPServer, repo_root: Opti
         return
     root = repo_root if repo_root is not None else Path(__file__).resolve().parents[2]
     commands = tuple(cmd for cmd in server.bootstrap_commands if cmd.strip())
-    if not commands and server.stdio_install and server.stdio_install.strip():
-        commands = (server.stdio_install,)
     def expand(cmd: str) -> str:
         def repl(match: re.Match[str]) -> str:
             var = match.group(1)

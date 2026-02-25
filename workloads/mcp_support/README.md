@@ -30,6 +30,15 @@ SMITHERY_API_KEY=...     # scientific-computation-mcp
 
 Three-step generation pipeline. There is no need to do extra manual server setup; stdio servers are auto-bootstrapped from `public_readonly_servers.py`.
 
+Run end-to-end with one command:
+
+```bash
+cd workloads/mcp_support
+./run.sh <NUM_EXAMPLES>
+```
+
+Or run each stage manually:
+
 1. Generate model-facing prompt templates from MCP servers/tools:
 
 ```bash

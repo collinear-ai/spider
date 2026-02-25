@@ -8,11 +8,15 @@ import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+import anyio
+import httpx
 import pandas as pd
 from huggingface_hub import HfApi
+from mcp.client.session import ClientSession
+from mcp.client.streamable_http import streamable_http_client
 
 from workloads.mcp_support.public_readonly_servers import (
     ensure_server_runtime_ready,
@@ -21,7 +25,6 @@ from workloads.mcp_support.public_readonly_servers import (
     resolve_stdio_cwd,
     server_requires_local_proxy,
 )
-from workloads.mcp_support.tool_schemas import tool_config_from_server
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -53,12 +56,13 @@ def load_env(path: Path) -> None:
         os.environ[key] = value
 
 
-def format_tools_for_prompt(tools: List[object]) -> str:
+def format_tools_for_prompt(tools: List[Dict[str, Any]]) -> str:
     blocks: List[str] = []
     for t in tools:
-        schema = json.dumps(t.json_schema or {}, ensure_ascii=True, separators=(",", ":"))
-        desc = (t.description or "").strip()
-        blocks.append(f"- {t.name}\n  Description: {desc}\n  Signature: {schema}")
+        schema = json.dumps(t.get("inputSchema") or t.get("input_schema") or {}, ensure_ascii=True, separators=(",", ":"))
+        desc = str(t.get("description") or "").strip()
+        name = str(t.get("name") or "")
+        blocks.append(f"- {name}\n  Description: {desc}\n  Signature: {schema}")
     return "\n".join(blocks)
 
 
@@ -104,9 +108,20 @@ def start_stdio_proxy(server: object) -> Tuple[subprocess.Popen[str], str]:
     return proc, f"http://{host}:{port}/mcp/"
 
 
-def fetch_tool_cache() -> List[Tuple[object, List[object]]]:
+def list_tools_from_server(server_url: str, headers: Dict[str, str]) -> List[Dict[str, Any]]:
+    async def _run() -> List[Dict[str, Any]]:
+        async with httpx.AsyncClient(headers=headers or None, timeout=60.0) as http_client:
+            async with streamable_http_client(server_url, http_client=http_client) as (read_stream, write_stream, _):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    result = await session.list_tools()
+                    return [t.model_dump() if hasattr(t, "model_dump") else dict(t) for t in result.tools]
+    return anyio.run(_run)
+
+
+def fetch_tool_cache() -> List[Tuple[object, List[Dict[str, Any]]]]:
     servers = list_public_readonly_mcp_servers()
-    cache: List[Tuple[object, List[object]]] = []
+    cache: List[Tuple[object, List[Dict[str, Any]]]] = []
     original_headers = os.environ.get("MCP_HEADERS_JSON")
     for server in servers:
         proc: Optional[subprocess.Popen[str]] = None
@@ -120,9 +135,9 @@ def fetch_tool_cache() -> List[Tuple[object, List[object]]]:
             url = server.mcp_url
             if server_requires_local_proxy(server):
                 proc, url = start_stdio_proxy(server)
-                tools = tool_config_from_server(url, mcp_url_env=server.mcp_url_env)
+                tools = list_tools_from_server(url, headers)
             else:
-                tools = tool_config_from_server(url, mcp_url_env=server.mcp_url_env)
+                tools = list_tools_from_server(url, headers)
             if len(tools) >= 2:
                 cache.append((server, tools))
                 print(f"[ok] {server.key}: {len(tools)} tools")
@@ -144,7 +159,7 @@ def fetch_tool_cache() -> List[Tuple[object, List[object]]]:
     return cache
 
 
-def build_prompt(template: str, server: object, tools: List[object], num_turns: int) -> str:
+def build_prompt(template: str, server: object, tools: List[Dict[str, Any]], num_turns: int) -> str:
     tool_count = len(tools)
     return template.format(
         NUM_TOOLS=tool_count,
@@ -174,12 +189,12 @@ def main() -> None:
         desired = random.randint(2, 3)
         k = min(desired, len(all_tools))
         sampled = random.sample(all_tools, k)
-        num_turns = random.randint(1, 2)
+        num_turns = 1 if random.random() < 0.8 else 2
         rows.append(
             {
                 "prompt": build_prompt(template, server, sampled, num_turns),
                 "server": asdict(server),
-                "tools": [t.name for t in sampled],
+                "tools": [str(t.get("name") or "") for t in sampled if str(t.get("name") or "").strip()],
             }
         )
 
