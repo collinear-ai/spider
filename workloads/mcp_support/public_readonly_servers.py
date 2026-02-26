@@ -45,33 +45,11 @@ PUBLIC_READONLY_MCP_SERVERS: Dict[str, PublicReadonlyMCPServer] = {
         transport="stdio",
         auth="none",
         tool_count=4,
-        stdio_command=("uvx", "arxiv-paper-mcp"),
-        stdio_install="uvx arxiv-paper-mcp",
-        runtime_packages=("uv",),
-        bootstrap_commands=("uvx arxiv-paper-mcp",),
+        stdio_command=("arxiv-paper-mcp",),
+        stdio_install="python -m pip install arxiv-paper-mcp",
+        runtime_packages=(),
+        bootstrap_commands=("python -m pip install arxiv-paper-mcp",),
         sources=("https://github.com/daheepk/arxiv-paper-mcp",),
-    ),
-    "clinicaltrials-mcp-server": PublicReadonlyMCPServer(
-        key="clinicaltrials-mcp-server",
-        domain="clinical_data_retrieval",
-        display_name="ClinicalTrials MCP Server",
-        mcp_url="http://127.0.0.1:9803/mcp",
-        mcp_url_env="MCP_CLINICALTRIALS_URL",
-        description="ClinicalTrials public data retrieval endpoint (self-hostable/bridgeable).",
-        transport="stdio",
-        auth="none",
-        tool_count=17,
-        stdio_command=("node", "build/index.js"),
-        stdio_install="git clone https://github.com/Augmented-Nature/ClinicalTrials-MCP-Server.git && npm install && npm run build",
-        local_source_subdir="workloads/mcp_support/local_servers/ClinicalTrials-MCP-Server",
-        runtime_packages=("node", "npm"),
-        bootstrap_commands=(
-            "mkdir -p workloads/mcp_support/local_servers",
-            "cd workloads/mcp_support/local_servers && (test -d ClinicalTrials-MCP-Server || git clone https://github.com/Augmented-Nature/ClinicalTrials-MCP-Server.git)",
-            "cd workloads/mcp_support/local_servers/ClinicalTrials-MCP-Server && npm install && npm run build",
-        ),
-        notes="Must be cloned from source and built; no published npm package.",
-        sources=("https://github.com/Augmented-Nature/ClinicalTrials-MCP-Server",),
     ),
     "context7": PublicReadonlyMCPServer(
         key="context7",
@@ -96,19 +74,6 @@ PUBLIC_READONLY_MCP_SERVERS: Dict[str, PublicReadonlyMCPServer] = {
         auth="none",
         tool_count=3,
         sources=("https://docs.devin.ai/work-with-devin/deepwiki-mcp",),
-    ),
-    "exa-search": PublicReadonlyMCPServer(
-        key="exa-search",
-        domain="web_search_research",
-        display_name="Exa Search",
-        mcp_url="https://mcp.exa.ai/mcp",
-        mcp_url_env="MCP_EXA_SEARCH_URL",
-        description="Hosted web search/research endpoint; fully functional without auth.",
-        transport="remote_http",
-        auth="none",
-        tool_count=3,
-        notes="No auth required for listing or invocation. Validated read-only calls succeed.",
-        sources=("https://exa.ai/mcp",),
     ),
     "financialdatasets": PublicReadonlyMCPServer(
         key="financialdatasets",
@@ -152,9 +117,10 @@ PUBLIC_READONLY_MCP_SERVERS: Dict[str, PublicReadonlyMCPServer] = {
         auth="none",
         tool_count=9,
         stdio_command=("npx", "-y", "@jinzcdev/leetcode-mcp-server", "--site", "global"),
-        stdio_install="npx -y @jinzcdev/leetcode-mcp-server",
+        stdio_install="npx -y @jinzcdev/leetcode-mcp-server --site global",
         runtime_packages=("node", "npx"),
-        bootstrap_commands=("npx -y @jinzcdev/leetcode-mcp-server",),
+        bootstrap_commands=(),
+        notes="Uses npx for first-run install; no separate bootstrap to avoid blocking on a long-running server.",
         sources=("https://github.com/jinzcdev/leetcode-mcp-server",),
     ),
     "open-weather": PublicReadonlyMCPServer(
@@ -190,29 +156,6 @@ PUBLIC_READONLY_MCP_SERVERS: Dict[str, PublicReadonlyMCPServer] = {
         ),
         notes="Must be cloned from source and built; no published npm package.",
         sources=("https://github.com/Augmented-Nature/PubMed-MCP-Server",),
-    ),
-    "scientific-computation-mcp": PublicReadonlyMCPServer(
-        key="scientific-computation-mcp",
-        domain="scientific_compute",
-        display_name="Scientific Computation MCP",
-        mcp_url="http://127.0.0.1:9808/mcp",
-        mcp_url_env="MCP_SCI_COMP_URL",
-        description="Scientific computation endpoint (requires Smithery key).",
-        transport="stdio",
-        auth="smithery_key",
-        tool_count=26,
-        stdio_command=(
-            "npx",
-            "-y",
-            "mcp-remote@0.1.38",
-            "https://scientific_computation_mcp--aman-amith-shastry.run.tools",
-        ),
-        stdio_install="npx -y mcp-remote@0.1.38 https://scientific_computation_mcp--aman-amith-shastry.run.tools",
-        required_env_vars=("SMITHERY_API_KEY",),
-        runtime_packages=("node", "npx"),
-        bootstrap_commands=(),
-        notes="Requires SMITHERY_API_KEY.",
-        sources=("https://github.com/Aman-Amith-Shastry/scientific_computation_mcp",),
     ),
     "tavily": PublicReadonlyMCPServer(
         key="tavily",
@@ -351,6 +294,7 @@ def ensure_server_runtime_ready(server: PublicReadonlyMCPServer, repo_root: Opti
     if server.key in _RUNTIME_READY:
         validate_required_env_vars(server)
         return
+    print(f"[bootstrap] {server.key}: starting")
     root = repo_root if repo_root is not None else Path(__file__).resolve().parents[2]
     commands = tuple(cmd for cmd in server.bootstrap_commands if cmd.strip())
     def expand(cmd: str) -> str:
@@ -362,8 +306,11 @@ def ensure_server_runtime_ready(server: PublicReadonlyMCPServer, repo_root: Opti
             return value
         return _PLACEHOLDER_RE.sub(repl, cmd)
     for cmd in commands:
-        subprocess.run(expand(cmd), shell=True, check=True, cwd=str(root), env=os.environ.copy())
+        expanded = expand(cmd)
+        print(f"[bootstrap] {server.key}: {expanded}")
+        subprocess.run(expanded, shell=True, check=True, cwd=str(root), env=os.environ.copy())
     _RUNTIME_READY.add(server.key)
+    print(f"[bootstrap] {server.key}: done")
     validate_required_env_vars(server)
 
 

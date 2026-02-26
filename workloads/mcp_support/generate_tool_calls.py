@@ -3,6 +3,8 @@ import json
 import os
 import socket
 import subprocess
+import random
+import asyncio
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -30,6 +32,9 @@ from workloads.mcp_support.public_readonly_servers import (
     server_requires_local_proxy,
 )
 
+MAX_TOOL_CONTENT_CHARS = 40000
+MAX_TOOL_CONTENT_TOTAL_CHARS = 60000
+CHECKPOINT_EVERY = 2000
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -43,10 +48,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config-name", default=None)
     parser.add_argument("--max-examples", type=int, default=None)
     parser.add_argument("--max-workers", type=int, default=1024)
-    parser.add_argument("--row-timeout-sec", type=float, default=480.0)
+    parser.add_argument("--row-timeout-sec", type=float, default=0.0)
     parser.add_argument("--temperature", type=float, default=0.7)
     return parser.parse_args()
 
+def _truncate_and_cap_tool_message(history):
+    total = 0
+    for msg in reversed(history):
+        if msg.get("role") != "tool":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            if len(content) > MAX_TOOL_CONTENT_CHARS:
+                content = content[:MAX_TOOL_CONTENT_CHARS]
+            msg["content"] = content
+            total += len(content)
+            if total > MAX_TOOL_CONTENT_TOTAL_CHARS:
+                return True
+    return False
 
 def load_env(path: Path) -> None:
     if not path.exists():
@@ -123,15 +142,24 @@ def list_tools_from_server(server_url: str, headers: Dict[str, str]) -> List[Dic
                     return [t.model_dump() if hasattr(t, "model_dump") else dict(t) for t in result.tools]
     return anyio.run(_run)
 
-
 def call_mcp_tool(server_url: str, headers: Dict[str, str], tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     async def _run() -> Dict[str, Any]:
-        async with httpx.AsyncClient(headers=headers or None, timeout=120.0) as http_client:
-            async with streamable_http_client(server_url, http_client=http_client) as (read_stream, write_stream, _):
-                async with ClientSession(read_stream, write_stream) as session:
-                    await session.initialize()
-                    result = await session.call_tool(tool_name, arguments)
-                    return result.model_dump()
+        max_attempts = 5
+        base_delay = 1.0
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with httpx.AsyncClient(headers=headers or None, timeout=120.0) as http_client:
+                    async with streamable_http_client(server_url, http_client=http_client) as (read_stream, write_stream, _):
+                        async with ClientSession(read_stream, write_stream) as session:
+                            await session.initialize()
+                            result = await session.call_tool(tool_name, arguments)
+                            payload = result.model_dump()
+                            return payload
+            except Exception as exc:
+                if attempt >= max_attempts:
+                    raise
+                sleep_s = base_delay * (2 ** (attempt - 1)) * (0.5 + random.random())
+                await asyncio.sleep(sleep_s)
     return anyio.run(_run)
 
 
@@ -173,11 +201,22 @@ def parse_questions(row: Dict[str, Any]) -> List[str]:
     return [str(q).strip() for q in questions if str(q).strip()]
 
 
-def has_assistant_turn(history: Any) -> bool:
+def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    for key in ("server", "tools", "generated_questions"):
+        value = row.get(key)
+        if isinstance(value, str):
+            try:
+                row[key] = json.loads(value)
+            except json.JSONDecodeError:
+                pass
+    return row
+
+
+def has_tool_turn(history: Any) -> bool:
     if not isinstance(history, list):
         return False
     for msg in history:
-        if isinstance(msg, dict) and msg.get("role") == "assistant":
+        if isinstance(msg, dict) and msg.get("role") == "tool":
             return True
     return False
 
@@ -196,7 +235,7 @@ def main() -> None:
     if args.config_name:
         ds_kwargs["name"] = args.config_name
     dataset = load_dataset(**ds_kwargs)
-    rows = [dict(x) for x in dataset]
+    rows = [normalize_row(dict(x)) for x in dataset]
     if args.max_examples is not None:
         rows = rows[: args.max_examples]
     if not rows:
@@ -291,6 +330,9 @@ def main() -> None:
                     turn_idx=turn_idx,
                     prompt=question,
                 )
+                force_finish = _truncate_and_cap_tool_message(history)
+                if force_finish:
+                    finished = True
                 partial_histories[index] = list(history)
                 if finished:
                     break
@@ -300,48 +342,90 @@ def main() -> None:
     executor: Optional[ThreadPoolExecutor] = None
     try:
         executor = ThreadPoolExecutor(max_workers=workers)
-        future_to_idx = {executor.submit(run_one, i, row): i for i, row in enumerate(rows)}
-        active = dict(future_to_idx)
-        for future, idx in future_to_idx.items():
-            start_times[idx] = time.monotonic()
+        api = HfApi(token=hf_token)
+        
+        def _checkpoint_upload():
+            final_rows = [r for r in results if r is not None]
+            final_rows = [
+                {"trajectory": row.get("trajectory"), **{k: v for k, v in row.items() if k != "trajectory"}}
+                for row in final_rows
+            ]
+
+            ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+            jsonl_path = ARTIFACT_DIR / "tool_calls.jsonl"
+            parquet_path = ARTIFACT_DIR / "train-00000-of-00001.parquet"
+            with jsonl_path.open("w", encoding="utf-8") as f:
+                for row in final_rows:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            pd.DataFrame(final_rows).to_parquet(parquet_path, index=False)
+
+            api.create_repo(repo_id=args.dataset_out, repo_type="dataset", private=True, exist_ok=True)
+            api.upload_file(
+                path_or_fileobj=str(parquet_path),
+                path_in_repo=parquet_path.name,
+                repo_id=args.dataset_out,
+                repo_type="dataset",
+            )
+
         with tqdm(total=len(rows), desc="tool_calls", unit="row") as pbar:
-            while active:
-                done = [f for f in active if f.done()]
-                for future in done:
-                    idx = active.pop(future)
-                    try:
-                        row_result = future.result()
-                    except Exception as exc:
-                        row_result = {
-                            **rows[idx],
-                            "tool_def": partial_tool_defs.get(idx, []),
-                            "trajectory": partial_histories.get(idx, []),
-                            "error": str(exc),
-                        }
-                    if has_assistant_turn(row_result.get("trajectory")):
+            last_checkpoint = 0
+            for batch_start in range(0, len(rows), workers):
+                batch = list(enumerate(rows[batch_start:batch_start + workers], start=batch_start))
+                future_to_idx = {executor.submit(run_one, i, row): i for i, row in batch}
+                active = dict(future_to_idx)
+                for future, idx in future_to_idx.items():
+                    start_times[idx] = time.monotonic()
+
+                while active:
+                    done = [f for f in active if f.done()]
+                    for future in done:
+                        idx = active.pop(future)
+                        try:
+                            row_result = future.result()
+                        except Exception as exc:
+                            row_result = {
+                                **rows[idx],
+                                "tool_def": partial_tool_defs.get(idx, []),
+                                "trajectory": partial_histories.get(idx, []),
+                                "error": str(exc),
+                            }
+                        if not has_tool_turn(row_result.get("trajectory")):
+                            results[idx] = None
+                            pbar.update(1)
+                            continue
                         results[idx] = row_result
-                    pbar.update(1)
+                        pbar.update(1)
 
-                now = time.monotonic()
-                timed_out: List[Any] = []
-                for future, idx in list(active.items()):
-                    if now - start_times[idx] > args.row_timeout_sec:
-                        timed_out.append(future)
-                for future in timed_out:
-                    idx = active.pop(future)
-                    partial = partial_histories.get(idx, [])
-                    if has_assistant_turn(partial):
-                        results[idx] = {
-                            **rows[idx],
-                            "tool_def": partial_tool_defs.get(idx, []),
-                            "trajectory": partial,
-                            "error": "timeout",
-                        }
-                    future.cancel()
-                    pbar.update(1)
+                        if pbar.n - last_checkpoint >= CHECKPOINT_EVERY:
+                            _checkpoint_upload()
+                            last_checkpoint = pbar.n
 
-                if active:
-                    time.sleep(0.2)
+                    if args.row_timeout_sec and args.row_timeout_sec > 0:
+                        now = time.monotonic()
+                        timed_out: List[Any] = []
+                        for future, idx in list(active.items()):
+                            if now - start_times[idx] > args.row_timeout_sec:
+                                timed_out.append(future)
+                        for future in timed_out:
+                            idx = active.pop(future)
+                            partial = partial_histories.get(idx, [])
+                            if not has_tool_turn(partial):
+                                results[idx] = None
+                            else: 
+                                results[idx] = {
+                                    **rows[idx],
+                                    "tool_def": partial_tool_defs.get(idx, []),
+                                    "trajectory": partial,
+                                    "error": "timeout",
+                                }
+                            future.cancel()
+                            pbar.update(1)
+                            if pbar.n - last_checkpoint >= CHECKPOINT_EVERY:
+                                _checkpoint_upload()
+                                last_checkpoint = pbar.n
+
+                    if active:
+                        time.sleep(0.2)
     finally:
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)

@@ -3,14 +3,16 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
 from datasets import load_dataset
 from huggingface_hub import HfApi
 
-from spider.config import JobConfig
-from server.executor import run_generation_job
+from spider.config import ModelConfig
+from server.backends.factory import create_backend
+from tqdm.auto import tqdm
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -25,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="train")
     parser.add_argument("--config-name", default=None)
     parser.add_argument("--max-examples", type=int, default=None)
-    parser.add_argument("--max-batch-size", type=int, default=None)
+    parser.add_argument("--max-workers", type=int, default=1024)
     return parser.parse_args()
 
 
@@ -76,23 +78,6 @@ def extract_generated_questions(text: str) -> list[str]:
     return [m.strip() for m in matches if m.strip()]
 
 
-def infer_batch_size(
-    dataset: str,
-    *,
-    split: str,
-    config_name: str | None,
-    max_examples: int | None,
-) -> int:
-    kwargs = {"path": dataset, "split": split}
-    if config_name:
-        kwargs["name"] = config_name
-    ds = load_dataset(**kwargs)
-    size = len(ds)
-    if max_examples:
-        size = min(size, max_examples)
-    return max(1, size)
-
-
 def main() -> None:
     args = parse_args()
     load_env(ENV_PATH)
@@ -103,54 +88,65 @@ def main() -> None:
     if not os.environ.get("OPENROUTER_API_KEY", "").strip():
         raise SystemExit("OPENROUTER_API_KEY is required.")
 
-    source = {
-        "dataset": args.dataset_in,
-        "split": args.split,
-        "field": "prompt",
-    }
+    ds_kwargs = {"path": args.dataset_in, "split": args.split}
     if args.config_name:
-        source["config_name"] = args.config_name
-    if args.max_examples:
-        source["max_examples"] = args.max_examples
-    max_batch_size = args.max_batch_size or infer_batch_size(
-        args.dataset_in,
-        split=args.split,
-        config_name=args.config_name,
-        max_examples=args.max_examples,
-    )
+        ds_kwargs["name"] = args.config_name
+    dataset = load_dataset(**ds_kwargs)
+    rows = [dict(x) for x in dataset]
+    if args.max_examples is not None:
+        rows = rows[: args.max_examples]
 
-    job = JobConfig.model_validate(
+    model = ModelConfig.model_validate(
         {
-            "model": {
-                "provider": "openrouter",
-                "name": "moonshotai/kimi-k2-0905",
-            },
-            "source": source,
-            "generation": {
-                "max_batch_size": max_batch_size,
-                "parameters": {
-                    "temperature": 1.0,
-                }
-            },
-            "output": {
-                "mode": "return",
-            },
+            "provider": "openrouter",
+            "name": "moonshotai/kimi-k2-0905",
         }
     )
+    backend = create_backend(model)
+    parameters = {"temperature": 1.0}
+
+    def run_one(row: dict) -> dict | None:
+        messages = []
+        system_prompt = row.get("system_prompt")
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": row["prompt"]})
+        try:
+            resp = backend.chat(messages=messages, parameters=parameters)
+        except Exception:
+            return None
+        record = {"prompt": row["prompt"]}
+        if resp.get("content"):
+            record["content"] = resp["content"]
+        if resp.get("reasoning"):
+            record["reasoning"] = resp["reasoning"]
+        for key, value in row.items():
+            if key in {"prompt", "content", "reasoning", "trajectory"}:
+                continue
+            record[key] = value
+        return record
+
+    max_workers = max(1, min(args.max_workers, len(rows)))
+    results: list[dict] = []
+    skipped = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(run_one, row) for row in rows]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="generation", unit="row"):
+            record = future.result()
+            if record is None:
+                skipped += 1
+                continue
+            results.append(record)
 
     job_id = f"generate_prompts_{int(time.time())}"
     workspace = ARTIFACT_DIR / job_id
-    result = run_generation_job(
-        job_id=job_id,
-        job=job,
-        workspace=workspace,
-        job_env={
-            "HF_TOKEN": token,
-            "OPENROUTER_API_KEY": os.environ["OPENROUTER_API_KEY"],
-        },
-    )
+    workspace.mkdir(parents=True, exist_ok=True)
+    result_path = workspace / "result.jsonl"
+    with result_path.open("w", encoding="utf-8") as f:
+        for row in results:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    rows = read_jsonl(result.artifacts_path)
+    rows = results
     rows = [
         {
             **row,
@@ -170,8 +166,8 @@ def main() -> None:
         repo_type="dataset",
     )
     print(f"records={len(rows)}")
-    print(f"max_batch_size={max_batch_size}")
-    print(f"local_jsonl={result.artifacts_path}")
+    print(f"skipped={skipped}")
+    print(f"local_jsonl={result_path}")
     print(f"local_parquet={parquet_path}")
     print(f"uploaded=hf://datasets/{args.dataset_out}/{parquet_path.name}")
 

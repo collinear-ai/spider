@@ -17,6 +17,7 @@ import pandas as pd
 from huggingface_hub import HfApi
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from tqdm import tqdm
 
 from workloads.mcp_support.public_readonly_servers import (
     ensure_server_runtime_ready,
@@ -126,6 +127,7 @@ def fetch_tool_cache() -> List[Tuple[object, List[Dict[str, Any]]]]:
     for server in servers:
         proc: Optional[subprocess.Popen[str]] = None
         try:
+            print(f"[server] {server.key}: initializing")
             ensure_server_runtime_ready(server, REPO_ROOT)
             headers = headers_for_server(server)
             if headers:
@@ -134,10 +136,10 @@ def fetch_tool_cache() -> List[Tuple[object, List[Dict[str, Any]]]]:
                 os.environ.pop("MCP_HEADERS_JSON", None)
             url = server.mcp_url
             if server_requires_local_proxy(server):
+                print(f"[server] {server.key}: starting stdio proxy")
                 proc, url = start_stdio_proxy(server)
-                tools = list_tools_from_server(url, headers)
-            else:
-                tools = list_tools_from_server(url, headers)
+            print(f"[server] {server.key}: listing tools")
+            tools = list_tools_from_server(url, headers)
             if len(tools) >= 2:
                 cache.append((server, tools))
                 print(f"[ok] {server.key}: {len(tools)} tools")
@@ -184,7 +186,7 @@ def main() -> None:
         raise SystemExit("No reachable remote MCP servers with >=2 tools.")
 
     rows = []
-    for _ in range(args.num_examples):
+    for _ in tqdm(range(args.num_examples), desc="building prompts", unit="ex"):
         server, all_tools = random.choice(cache)
         desired = random.randint(2, 3)
         k = min(desired, len(all_tools))
@@ -193,7 +195,7 @@ def main() -> None:
         rows.append(
             {
                 "prompt": build_prompt(template, server, sampled, num_turns),
-                "server": asdict(server),
+                "server": json.dumps(asdict(server), ensure_ascii=False),
                 "tools": [str(t.get("name") or "") for t in sampled if str(t.get("name") or "").strip()],
             }
         )

@@ -47,15 +47,6 @@ This section consolidates the earlier iteration filters (former Iteration 1/2/3)
   - Details: Research-paper retrieval over arXiv for literature discovery, metadata lookup, and abstract-driven evidence gathering tasks.
   - Source: `https://github.com/daheepk/arxiv-paper-mcp`
 
-- `clinicaltrials-mcp-server`
-  - URL: `http://127.0.0.1:9803/mcp`
-  - Auth: No auth
-  - Tool count: 17
-  - Probe status: OK (via `node build/index.js` + stdio_proxy)
-  - Tools: `search_studies`, `get_study_details`, `search_by_location`, `search_by_condition`, `get_trial_statistics`, `search_by_sponsor`, `search_by_intervention`, `get_recruiting_studies`, `search_by_date_range`, `get_studies_with_results`, `search_rare_diseases`, `get_pediatric_studies`, `get_similar_studies`, `search_by_primary_outcome`, `search_by_eligibility_criteria`, `get_study_timeline`, `search_international_studies`
-  - Details: Clinical trial record retrieval for biomedical evidence collection and trial-comparison tasks without local database wiring.
-  - Source: `https://github.com/Augmented-Nature/ClinicalTrials-MCP-Server`
-
 - `context7`
   - URL: `https://mcp.context7.com/mcp`
   - Auth: No auth
@@ -73,15 +64,6 @@ This section consolidates the earlier iteration filters (former Iteration 1/2/3)
   - Tools: `read_wiki_structure`, `read_wiki_contents`, `ask_question`
   - Details: Repository-centric analysis endpoint that exposes structural exploration plus content retrieval and question answering over code/wiki context. Useful for onboarding, architecture mapping, and answering “where/how is X implemented?” tasks in unfamiliar codebases.
   - Source: `https://docs.devin.ai/work-with-devin/deepwiki-mcp`
-
-- `exa-search`
-  - URL: `https://mcp.exa.ai/mcp`
-  - Auth: No auth (fully functional without credentials)
-  - Tool count: 3
-  - Probe status: OK (direct streamable HTTP probe; tool invocation validated without auth)
-  - Tools: `web_search_exa`, `company_research_exa`, `get_code_context_exa`
-  - Details: Web search and research retrieval endpoint designed for high-quality source grounding in agentic QA and synthesis tasks.
-  - Source: `https://exa.ai/mcp`
 
 - `financialdatasets`
   - URL: `https://mcp.financialdatasets.ai/api`
@@ -127,14 +109,6 @@ This section consolidates the earlier iteration filters (former Iteration 1/2/3)
   - Tools: `search_articles`, `advanced_search`, `search_by_author`, `search_by_journal`, `search_by_mesh_terms`, `get_trending_articles`, `get_article_details`, `get_abstract`, `get_full_text`, `batch_article_lookup`, `get_cited_by`, `get_references`, `get_similar_articles`, `export_citation`, `validate_pmid`, `convert_identifiers`
   - Details: Biomedical literature retrieval over PubMed for evidence-backed medical/scientific information tasks.
   - Source: `https://github.com/Augmented-Nature/PubMed-MCP-Server`
-
-- `scientific-computation-mcp`
-  - URL: `http://127.0.0.1:9808/mcp`
-  - Auth: Smithery API key (required for install/run via `@smithery/cli`)
-  - Tool count: Unknown
-  - Probe status: SKIPPED — requires Smithery API key; no standalone install/run path documented
-  - Details: Scientific-computation tool surface for symbolic/numeric workflows supporting advanced reasoning and reproducible calculations.
-  - Source: `https://github.com/Aman-Amith-Shastry/scientific_computation_mcp`
 
 - `tavily`
   - URL: `https://mcp.tavily.com/mcp/`

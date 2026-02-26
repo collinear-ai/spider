@@ -64,10 +64,8 @@ Server definitions, auth env vars, runtime/bootstrap commands, and MCP URLs are 
 | MCP server | # tools |
 |---|---:|
 | `arxiv-paper-mcp` | 4 |
-| `clinicaltrials-mcp-server` | 17 |
 | `context7` | 2 |
 | `deepwiki` | 3 |
-| `exa-search` | 3 |
 | `financialdatasets` | 13 |
 | `google-maps` | 18 |
 | `leetcode` | 9 |
