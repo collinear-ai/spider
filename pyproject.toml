@@ -14,7 +14,7 @@ dependencies = [
     "mpi4py>=4.1.1",
     "pydantic",
     "pyYAML",
-    "vllm>=0.13.0",
+    "vllm>=0.23.0",
 ]
 authors = [
     { name = "Muyu He", email = "muyu@collinear.ai" }
@@ -53,7 +53,7 @@ server = [
     "fastapi",
     "uvicorn[standard]",
     "python-multipart",
-    "vllm>=0.10.2",
+    "vllm>=0.23.0",
     "huggingface_hub",
     "chz",
     "numpy",
@@ -89,7 +89,7 @@ all = [
     "fastapi",
     "uvicorn[standard]",
     "python-multipart",
-    "vllm>=0.10.2",
+    "vllm>=0.23.0",
     "huggingface_hub",
     "chz",
     "numpy",
